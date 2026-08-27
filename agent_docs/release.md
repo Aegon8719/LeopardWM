@@ -69,21 +69,15 @@ The section header is `## X.Y.Z` without a `v` prefix; brackets are also accepte
 
 Any candidate change after verification or review requires rerunning the complete gate and review before publication.
 
-## Post-Release Scoop Manifest Refresh
+## Scoop Extras Contract
 
-After the tag-triggered Release workflow has published the GitHub Release, refresh the checked-in Scoop manifest:
+Scoop package metadata is maintained outside this repository. The Scoop Extras manifest depends on the tag-triggered GitHub Release preserving:
 
-1. Update `dist/scoop/leopardwm.json` with the released version, ZIP URL, and `extract_dir`.
-2. Copy the ZIP SHA-256 from the published `checksums.txt` into the manifest. The ZIP and checksums do not exist until the Release workflow finishes; do not refresh the manifest during pre-release preparation.
-3. Run both manifest checks:
-   ```powershell
-   pwsh -NoProfile -File .github/verify-scoop-manifest.ps1
-   powershell.exe -NoProfile -File .github/verify-scoop-manifest.ps1
-   ```
-4. Verify the public ZIP is available and its root directory matches the manifest `extract_dir`.
-5. Commit the refresh through the normal reviewed flow.
+- URL template: `https://github.com/jcardama/LeopardWM/releases/download/v$version/LeopardWM-$version-x86_64-windows.zip`
+- Archive root: `LeopardWM-$version-x86_64-windows`
+- Shim targets: `leopardwm.exe`, `leopardwm-cli.exe`, and `lwm.exe`
 
-This checked-in manifest refresh is separate from Scoop Extras accepting or making the package available.
+Coordinate any change to this release contract with the Scoop Extras manifest before publishing a release.
 
 ## Branch Protection (`main`)
 

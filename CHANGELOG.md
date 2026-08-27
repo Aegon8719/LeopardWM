@@ -2,6 +2,15 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.9
+
+### Internal
+
+- **Scoop manifest maintenance now lives outside this repository.** The checked-in
+  manifest, dedicated validator, and post-release refresh process are removed
+  while the GitHub Release archive contract used by Scoop Extras remains
+  unchanged.
+
 ## 0.2.8
 
 ### Features
