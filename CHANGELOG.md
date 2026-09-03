@@ -17,7 +17,7 @@ All notable changes to LeopardWM will be documented in this file.
 - **Recording a hotkey in Settings now captures Windows shortcuts.** While a hotkey field is
   recording, LeopardWM keeps its keyboard hook active and swallows the pressed combo before
   Windows sees it, so `Win+Home`, `Win+Arrow`, and similar chords are recorded instead of
-  triggering the shell. Finishing a recording no longer reloads the whole configuration.
+  triggering the shell. Cancelling a recording no longer reloads the configuration.
 
 ### Internal
 
