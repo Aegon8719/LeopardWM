@@ -68,6 +68,8 @@ static HOOK_FN_HELD: std::sync::Mutex<u16> = std::sync::Mutex::new(0);
 static HOOK_RECORDING_FN_HELD: std::sync::Mutex<u16> = std::sync::Mutex::new(0);
 /// The singleton hook's Settings capture mode.
 static HOOK_RECORDING: AtomicBool = AtomicBool::new(false);
+/// Recorded key whose auto-repeat remains swallowed until its key-up arrives.
+static HOOK_RECORDED_PENDING: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
 
 // Modifier virtual-key codes (both the generic and left/right variants the
 // low-level hook reports).
@@ -143,6 +145,8 @@ enum Action {
     },
 }
 
+// While recording, bare Esc/Tab/Backspace/Delete pass through; representable chords
+// are captured, and unrepresentable chords are swallowed while capture remains armed.
 fn is_recording_control(vk: u32, modifiers: Modifiers) -> bool {
     modifiers == Modifiers::default() && matches!(vk, VK_ESCAPE | VK_TAB | VK_BACK | VK_DELETE)
 }
@@ -163,8 +167,12 @@ fn decide(
     recording_fn_held: u16,
     is_new_press: bool,
     alt_gr: bool,
+    pending_recorded_vk: Option<u32>,
 ) -> Action {
     if msg == KeyMsg::Up {
+        if pending_recorded_vk == Some(vk) {
+            return Action::Pass;
+        }
         if recording && fn_mod_bit(vk).is_some_and(|bit| recording_fn_held & bit != 0) {
             return Action::PassRecorded {
                 modifiers: Modifiers::default(),
@@ -186,6 +194,10 @@ fn decide(
         return Action::Pass;
     }
 
+    if pending_recorded_vk == Some(vk) {
+        return Action::Swallow;
+    }
+
     if recording {
         if fn_mod_bit(vk).is_some() {
             return Action::Swallow;
@@ -193,7 +205,7 @@ fn decide(
         if is_recording_control(vk, held) {
             return Action::RecordingControl;
         }
-        return if is_new_press {
+        return if is_new_press && crate::format_hotkey(held, vk).is_some() {
             Action::SwallowRecorded {
                 modifiers: held,
                 vk,
@@ -231,6 +243,10 @@ pub fn set_recording(enabled: bool) {
             .lock()
             .unwrap_or_else(recover_poisoned_mutex);
         *held = 0;
+        let mut pending = HOOK_RECORDED_PENDING
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        *pending = None;
     }
 }
 
@@ -277,6 +293,11 @@ impl Drop for KeyboardHookHandle {
             .lock()
             .unwrap_or_else(recover_poisoned_mutex);
         *recording_fn_held = 0;
+        drop(recording_fn_held);
+        let mut pending = HOOK_RECORDED_PENDING
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        *pending = None;
         tracing::debug!("Keyboard hook stopped");
     }
 }
@@ -333,6 +354,12 @@ pub fn install_keyboard_hook(
             Win32Error::HookInstallFailed("Recording fn-held mutex poisoned".to_string())
         })?;
         *recording_fn_held = 0;
+    }
+    {
+        let mut pending = HOOK_RECORDED_PENDING.lock().map_err(|_| {
+            Win32Error::HookInstallFailed("Recorded-pending mutex poisoned".to_string())
+        })?;
+        *pending = None;
     }
     HOOK_RECORDING.store(false, Ordering::SeqCst);
 
@@ -432,6 +459,9 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
         let recording_fn_held = *HOOK_RECORDING_FN_HELD
             .lock()
             .unwrap_or_else(recover_poisoned_mutex);
+        let pending_recorded_vk = *HOOK_RECORDED_PENDING
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
         let action = decide(
             msg,
             vk,
@@ -443,7 +473,14 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
             recording_fn_held,
             false,
             false,
+            pending_recorded_vk,
         );
+        if pending_recorded_vk == Some(vk) {
+            let mut pending = HOOK_RECORDED_PENDING
+                .lock()
+                .unwrap_or_else(recover_poisoned_mutex);
+            *pending = None;
+        }
         if let Some(bit) = fn_mod_bit(vk) {
             let mut held = HOOK_FN_HELD.lock().unwrap_or_else(recover_poisoned_mutex);
             *held &= !bit;
@@ -515,6 +552,9 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
         fn_mods: fn_held | recording_fn_held,
     };
     let binds = HOOK_BINDS.lock().unwrap_or_else(recover_poisoned_mutex);
+    let pending_recorded_vk = *HOOK_RECORDED_PENDING
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex);
     let action = decide(
         msg,
         vk,
@@ -526,6 +566,7 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
         recording_fn_held,
         is_new_press,
         GetAsyncKeyState(VK_RMENU) < 0,
+        pending_recorded_vk,
     );
     drop(binds);
 
@@ -557,6 +598,11 @@ unsafe fn apply_action(action: Action, ncode: i32, wparam: WPARAM, lparam: LPARA
             send_event(KeyboardHookEvent::Recorded { modifiers, vk });
             // One-shot capture closes the swallow window before JS posts its stop event.
             set_recording(false);
+            let mut pending = HOOK_RECORDED_PENDING
+                .lock()
+                .unwrap_or_else(recover_poisoned_mutex);
+            *pending = Some(vk);
+            drop(pending);
             if start_menu_mask {
                 send_start_menu_mask();
             }
@@ -698,7 +744,19 @@ mod tests {
         let binds = vec![bind(win_ctrl(), 0x48)];
         let held = win_ctrl();
         assert_eq!(
-            decide(KeyMsg::Down, 0x48, held, true, &binds, 0, 0, 0, true, false,),
+            decide(
+                KeyMsg::Down,
+                0x48,
+                held,
+                true,
+                &binds,
+                0,
+                0,
+                0,
+                true,
+                false,
+                None,
+            ),
             Action::SwallowRecorded {
                 modifiers: held,
                 vk: 0x48,
@@ -717,6 +775,7 @@ mod tests {
                 0,
                 false,
                 false,
+                None,
             ),
             Action::Swallow
         );
@@ -736,13 +795,26 @@ mod tests {
                 0,
                 0,
                 false,
-                false
+                false,
+                None
             ),
             Action::Pass
         );
         for vk in [VK_ESCAPE, VK_TAB, VK_BACK, VK_DELETE] {
             assert_eq!(
-                decide(KeyMsg::Down, vk, empty, true, &[], 0, 0, 0, true, false),
+                decide(
+                    KeyMsg::Down,
+                    vk,
+                    empty,
+                    true,
+                    &[],
+                    0,
+                    0,
+                    0,
+                    true,
+                    false,
+                    None,
+                ),
                 Action::RecordingControl
             );
         }
@@ -751,7 +823,19 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            decide(KeyMsg::Down, VK_TAB, shift, true, &[], 0, 0, 0, true, false),
+            decide(
+                KeyMsg::Down,
+                VK_TAB,
+                shift,
+                true,
+                &[],
+                0,
+                0,
+                0,
+                true,
+                false,
+                None,
+            ),
             Action::SwallowRecorded { .. }
         ));
         let ctrl = Modifiers {
@@ -759,8 +843,20 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            decide(KeyMsg::Down, VK_BACK, ctrl, true, &[], 0, 0, 0, true, false),
-            Action::SwallowRecorded { .. }
+            decide(
+                KeyMsg::Down,
+                VK_BACK,
+                ctrl,
+                true,
+                &[],
+                0,
+                0,
+                0,
+                true,
+                false,
+                None,
+            ),
+            Action::Swallow
         ));
     }
 
@@ -768,7 +864,19 @@ mod tests {
     fn recording_win_only_chord_masks_start_menu() {
         let held = Modifiers::win();
         assert_eq!(
-            decide(KeyMsg::Down, 0x24, held, true, &[], 0, 0, 0, true, true),
+            decide(
+                KeyMsg::Down,
+                0x24,
+                held,
+                true,
+                &[],
+                0,
+                0,
+                0,
+                true,
+                true,
+                None,
+            ),
             Action::SwallowRecorded {
                 modifiers: held,
                 vk: 0x24,
@@ -785,7 +893,19 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            decide(KeyMsg::Down, 0x48, held, true, &[], 0, 0, f13, true, false),
+            decide(
+                KeyMsg::Down,
+                0x48,
+                held,
+                true,
+                &[],
+                0,
+                0,
+                f13,
+                true,
+                false,
+                None,
+            ),
             Action::SwallowRecorded {
                 modifiers: held,
                 vk: 0x48,
@@ -793,11 +913,92 @@ mod tests {
             }
         );
         assert_eq!(
-            decide(KeyMsg::Up, 0x7C, held, true, &[], 0, 0, f13, false, false),
+            decide(
+                KeyMsg::Up,
+                0x7C,
+                held,
+                true,
+                &[],
+                0,
+                0,
+                f13,
+                false,
+                false,
+                None,
+            ),
             Action::PassRecorded {
                 modifiers: Modifiers::default(),
                 vk: 0x7C,
             }
+        );
+    }
+
+    #[test]
+    fn recorded_key_repeat_stays_swallowed_until_key_up() {
+        let held = Modifiers::win();
+        assert_eq!(
+            decide(
+                KeyMsg::Down,
+                0x24,
+                held,
+                false,
+                &[],
+                0,
+                0,
+                0,
+                false,
+                false,
+                Some(0x24),
+            ),
+            Action::Swallow
+        );
+        assert_eq!(
+            decide(
+                KeyMsg::Down,
+                0x23,
+                held,
+                false,
+                &[],
+                0,
+                0,
+                0,
+                true,
+                false,
+                Some(0x24),
+            ),
+            Action::Pass
+        );
+        assert_eq!(
+            decide(
+                KeyMsg::Up,
+                0x24,
+                Modifiers::default(),
+                false,
+                &[],
+                0,
+                0,
+                0,
+                false,
+                false,
+                Some(0x24),
+            ),
+            Action::Pass
+        );
+        assert_eq!(
+            decide(
+                KeyMsg::Down,
+                0x24,
+                held,
+                false,
+                &[],
+                0,
+                0,
+                0,
+                true,
+                false,
+                None,
+            ),
+            Action::Pass
         );
     }
 
@@ -815,7 +1016,8 @@ mod tests {
                 0,
                 0,
                 true,
-                true
+                true,
+                None
             ),
             Action::Pass
         );
@@ -830,7 +1032,8 @@ mod tests {
                 0,
                 0,
                 true,
-                false
+                false,
+                None
             ),
             Action::SwallowHotkey { .. }
         ));

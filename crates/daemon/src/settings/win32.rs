@@ -127,14 +127,17 @@ pub fn push_failed_binds(failed_binds: &[String]) {
 
 /// Deliver a captured hotkey chord to the open Settings window, if one is open.
 pub fn push_recorded_chord(chord: &str) {
-    let thread_id = match SETTINGS_THREAD.lock() {
-        Ok(g) => *g,
+    let settings_thread = match SETTINGS_THREAD.lock() {
+        Ok(g) => g,
         Err(_) => return,
     };
-    let Some(thread_id) = thread_id else { return };
+    let Some(thread_id) = *settings_thread else {
+        return;
+    };
     if let Ok(mut pending) = PENDING_RECORDED.lock() {
         pending.push(chord.to_string());
     }
+    drop(settings_thread);
     unsafe {
         let _ = PostThreadMessageW(thread_id, WM_SETTINGS_PUSH_RECORDED, WPARAM(0), LPARAM(0));
     }
@@ -249,6 +252,9 @@ pub fn run_settings_window(
         // window's message queue (see push_failed_binds).
         if let Ok(mut g) = SETTINGS_THREAD.lock() {
             *g = Some(GetCurrentThreadId());
+            if let Ok(mut pending) = PENDING_RECORDED.lock() {
+                pending.clear();
+            }
         }
 
         // Apply Windows 11 DWM theming (Mica backdrop, dark title bar, rounded corners)
@@ -376,6 +382,9 @@ pub fn run_settings_window(
         // The window is gone; stop the daemon from posting to a dead thread.
         if let Ok(mut g) = SETTINGS_THREAD.lock() {
             *g = None;
+            if let Ok(mut pending) = PENDING_RECORDED.lock() {
+                pending.clear();
+            }
         }
         // Let the daemon resume hotkeys if the window closed mid-recording.
         let _ = close_tx.send(SettingsEvent::Closed);

@@ -1783,11 +1783,12 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
     }
 }
 
-fn handle_recorded_hotkey(hotkey_state: &HotkeyState, modifiers: Modifiers, vk: u32) {
+fn handle_recorded_hotkey(hotkey_state: &mut HotkeyState, modifiers: Modifiers, vk: u32) {
     if !hotkey_state.recording {
         debug!("Dropping recorded hotkey after Settings recording ended");
     } else if let Some(chord) = format_hotkey(modifiers, vk) {
         settings::push_recorded_chord(&chord);
+        hotkey_state.recording = false;
     } else {
         debug!(
             "Dropping recorded hotkey with unsupported virtual key {:#X}",
