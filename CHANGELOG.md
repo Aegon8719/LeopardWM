@@ -4,6 +4,10 @@ All notable changes to LeopardWM will be documented in this file.
 
 ## 0.2.9
 
+### Documentation
+
+- **The README now includes the official Scoop installation and update commands.**
+
 ### Internal
 
 - **Scoop manifest maintenance now lives outside this repository.** The checked-in

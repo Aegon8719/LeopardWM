@@ -87,9 +87,12 @@ A few deliberate **non-features**, so you know what you're getting:
 
 ```powershell
 winget install jcardama.LeopardWM         # Windows Package Manager
+
+scoop bucket add extras                   # Scoop (first time only)
+scoop install extras/leopardwm
 ```
 
-This installs LeopardWM and puts `leopardwm`, `leopardwm-cli`, and `lwm` on your PATH. Use `winget upgrade` to install the latest release.
+This installs LeopardWM and puts `leopardwm`, `leopardwm-cli`, and `lwm` on your PATH. Use `winget upgrade jcardama.LeopardWM` or `scoop update leopardwm` to install the latest release.
 
 ### Via MSI installer
 
