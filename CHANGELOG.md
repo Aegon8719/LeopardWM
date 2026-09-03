@@ -8,6 +8,10 @@ All notable changes to LeopardWM will be documented in this file.
 
 - **The README now includes the official Scoop installation and update commands.**
 
+### Improvements
+
+- **The default width preset selector matches the other Settings dropdowns.** The "Default preset for new windows" control now uses the same custom combobox as Centering mode, keeping its dynamic preset list, selection tracking, and disabled empty state.
+
 ### Fixes
 
 - **Recording a hotkey in Settings now captures Windows shortcuts.** While a hotkey field is

@@ -401,7 +401,6 @@ select:focus {
 }
 input[type="number"] { width: 100px; }
 input[type="text"] { width: 180px; }
-select { width: 140px; }
 
 /* Hide native number spinners */
 input[type="number"]::-webkit-inner-spin-button,
@@ -453,6 +452,8 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 2px; }
   transition: background 0.08s;
 }
 .combobox-trigger:hover { background: var(--ctrl-fill-secondary); }
+.combobox.disabled .combobox-trigger { opacity: 0.5; cursor: default; }
+.combobox.disabled .combobox-trigger:hover { background: var(--ctrl-fill); }
 .combobox-text { flex: 1; }
 .combobox-chevron {
   width: 12px; height: 12px;
@@ -990,7 +991,7 @@ input[type="range"]::-webkit-slider-thumb {
         <div class="card" id="default-width-preset-card">
           <div class="field">
             <div class="field-info"><div class="field-label">Default preset for new windows</div><div class="field-desc">Which configured width preset new windows use</div></div>
-            <select id="layout-default_width_preset" aria-label="Default width preset for new windows"></select>
+            <div class="combobox" id="cb-layout-default_width_preset" aria-label="Default width preset for new windows"></div>
           </div>
         </div>
         <h3 class="section-subtitle">Height presets</h3>
@@ -1450,7 +1451,7 @@ function readPresets(kind) {
   return readPresetEntries(kind).map(function(entry) { return entry.value; });
 }
 function refreshDefaultWidthPresetOptions(selectedValue) {
-  var select = document.getElementById('layout-default_width_preset');
+  var cb = document.getElementById('cb-layout-default_width_preset');
   var entries = readPresetEntries('width');
   var selectedIndex = entries.findIndex(function(entry) { return entry.row === selectedWidthPresetRow; });
   var trackedRowIsInvalid = selectedWidthPresetRow && selectedWidthPresetRow.isConnected && selectedIndex === -1;
@@ -1464,37 +1465,46 @@ function refreshDefaultWidthPresetOptions(selectedValue) {
     if (!trackedRowIsInvalid) selectedWidthPresetRow = selectedIndex >= 0 ? entries[selectedIndex].row : null;
   }
 
-  select.innerHTML = '';
-  entries.forEach(function(entry, index) {
-    var option = document.createElement('option');
-    option.value = String(index + 1);
-    option.textContent = 'Preset ' + (index + 1) + ' (' + (entry.value * 100).toFixed(1).replace(/\.0$/, '') + '%)';
-    option.presetRow = entry.row;
-    select.appendChild(option);
-  });
+  var chevron = '<svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg>';
+  var triggerText = 'No valid presets';
+  var options = '';
   if (selectedIndex >= 0) {
-    select.selectedIndex = selectedIndex;
-    select.disabled = false;
+    entries.forEach(function(entry, index) {
+      var label = 'Preset ' + (index + 1) + ' (' + (entry.value * 100).toFixed(1).replace(/\.0$/, '') + '%)';
+      if (index === selectedIndex) triggerText = label;
+      options += '<div class="combobox-option' + (index === selectedIndex ? ' selected' : '') + '" data-value="' + (index + 1) + '">' + label + '</div>';
+    });
     lastValidWidthPresets = entries.map(function(entry) { return entry.value; });
     lastValidDefaultWidthPreset = selectedIndex + 1;
-  } else {
-    var emptyOption = document.createElement('option');
-    emptyOption.textContent = 'No valid presets';
-    select.appendChild(emptyOption);
-    select.disabled = true;
   }
+  cb.classList.remove('open');
+  cb.innerHTML = '<button class="combobox-trigger" type="button"><span class="combobox-text">' + triggerText + '</span>' + chevron + '</button>' +
+    '<div class="combobox-popup">' + options + '</div>';
+  var trigger = cb.querySelector('.combobox-trigger');
+  if (selectedIndex >= 0) {
+    cb.dataset.value = String(selectedIndex + 1);
+    cb.classList.remove('disabled');
+    trigger.disabled = false;
+  } else {
+    cb.dataset.value = '';
+    cb.classList.add('disabled');
+    trigger.disabled = true;
+  }
+  initCombobox(cb);
+  cb.querySelectorAll('.combobox-option').forEach(function(opt, index) {
+    var entry = entries[index];
+    opt.presetRow = entry.row;
+    opt.addEventListener('click', function() {
+      selectedWidthPresetRow = opt.presetRow;
+      lastValidDefaultWidthPreset = parseInt(opt.dataset.value, 10);
+    });
+  });
 
   var onlyValidRow = entries.length === 1 ? entries[0].row : null;
   document.querySelectorAll('#width-presets-body tr').forEach(function(row) {
     row.querySelector('.row-delete').disabled = row === onlyValidRow;
   });
 }
-document.getElementById('layout-default_width_preset').addEventListener('change', function(e) {
-  var option = e.target.options[e.target.selectedIndex];
-  selectedWidthPresetRow = option ? option.presetRow : null;
-  lastValidDefaultWidthPreset = e.target.selectedIndex + 1;
-  autoSave(0);
-});
 function checked(id) { return document.getElementById(id).checked; }
 function setVal(id, v) { document.getElementById(id).value = v; }
 function setChecked(id, v) { document.getElementById(id).checked = !!v; }
@@ -2165,7 +2175,7 @@ function escAttr(s) { return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;'
 
 function readConfig() {
   var widthPresets = readPresets('width');
-  var defaultWidthPreset = num('layout-default_width_preset');
+  var defaultWidthPreset = parseInt(cbVal('cb-layout-default_width_preset'), 10) || lastValidDefaultWidthPreset;
   if (!widthPresets.length) {
     widthPresets = lastValidWidthPresets.slice();
     defaultWidthPreset = lastValidDefaultWidthPreset;
@@ -2383,20 +2393,23 @@ mod tests {
     }
 
     #[test]
-    fn default_width_preset_is_a_bounded_dynamic_select() {
+    fn default_width_preset_uses_custom_combobox() {
         assert!(SETTINGS_HTML.contains("class=\"card\" id=\"default-width-preset-card\""));
-        assert!(SETTINGS_HTML
-            .contains("<select id=\"layout-default_width_preset\" aria-label=\"Default width preset for new windows\"></select>"));
+        assert!(SETTINGS_HTML.contains(
+            "<div class=\"combobox\" id=\"cb-layout-default_width_preset\" aria-label=\"Default width preset for new windows\"></div>"
+        ));
+        assert!(!SETTINGS_HTML.contains("<select id=\"layout-default_width_preset\""));
         assert!(
             !SETTINGS_HTML.contains("<input type=\"number\" id=\"layout-default_width_preset\"")
         );
         assert!(SETTINGS_HTML
             .contains("refreshDefaultWidthPresetOptions(cfg.layout.default_width_preset || 1);"));
-        assert!(SETTINGS_HTML.contains("option.presetRow = entry.row;"));
+        assert!(SETTINGS_HTML.contains("presetRow = entry.row"));
         assert!(SETTINGS_HTML.contains("'Preset ' + (index + 1) + ' ('"));
         assert!(SETTINGS_HTML
             .contains("row.querySelector('.row-delete').disabled = row === onlyValidRow;"));
         assert!(SETTINGS_HTML.contains("widthPresets = lastValidWidthPresets.slice();"));
+        assert!(SETTINGS_HTML.contains("parseInt(cbVal('cb-layout-default_width_preset'), 10)"));
         assert!(SETTINGS_HTML.contains("default_width_preset: defaultWidthPreset"));
     }
 
