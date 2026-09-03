@@ -2690,9 +2690,9 @@ async fn handle_settings_event(
             ctx.hotkey_state.recording = true;
         }
         settings::SettingsEvent::SetRecording(false) | settings::SettingsEvent::Closed => {
+            set_recording(false);
             if ctx.hotkey_state.recording {
                 debug!("Settings: recording ended, resuming hotkey matching");
-                set_recording(false);
                 ctx.hotkey_state.recording = false;
             }
         }
