@@ -96,6 +96,7 @@ const DARK_BG: u32 = 0x00202020;
 /// warning. Carries no payload; the new list is read from `PENDING_FAILED_BINDS`
 /// on the window's own thread (the only thread that may touch the webview).
 const WM_SETTINGS_PUSH_BINDS: u32 = WM_APP + 1;
+const WM_SETTINGS_PUSH_RECORDED: u32 = WM_APP + 2;
 
 /// Thread id of the open settings window's message loop, or `None` when closed.
 /// We target the thread queue (not the HWND) so a destroyed or recycled window
@@ -103,6 +104,8 @@ const WM_SETTINGS_PUSH_BINDS: u32 = WM_APP + 1;
 static SETTINGS_THREAD: Mutex<Option<u32>> = Mutex::new(None);
 /// Latest rejected-bind list as a JSON array, staged for the next push.
 static PENDING_FAILED_BINDS: Mutex<Option<String>> = Mutex::new(None);
+/// Recorded chords awaiting evaluation on the Settings window thread.
+static PENDING_RECORDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Push an updated rejected-hotkey list to the open settings window, if one is
 /// open. Safe to call from any thread and no-ops when no window is open; the
@@ -119,6 +122,21 @@ pub fn push_failed_binds(failed_binds: &[String]) {
     }
     unsafe {
         let _ = PostThreadMessageW(thread_id, WM_SETTINGS_PUSH_BINDS, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Deliver a captured hotkey chord to the open Settings window, if one is open.
+pub fn push_recorded_chord(chord: &str) {
+    let thread_id = match SETTINGS_THREAD.lock() {
+        Ok(g) => *g,
+        Err(_) => return,
+    };
+    let Some(thread_id) = thread_id else { return };
+    if let Ok(mut pending) = PENDING_RECORDED.lock() {
+        pending.push(chord.to_string());
+    }
+    unsafe {
+        let _ = PostThreadMessageW(thread_id, WM_SETTINGS_PUSH_RECORDED, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -330,6 +348,22 @@ pub fn run_settings_window(
                     let js = format!(
                         "window._failedHotkeys = {}; if (typeof renderFailedHotkeys === 'function') renderFailedHotkeys();",
                         json
+                    );
+                    let _ = webview.evaluate_script(&js);
+                }
+                continue;
+            }
+            if msg_buf.message == WM_SETTINGS_PUSH_RECORDED {
+                let chords = PENDING_RECORDED
+                    .lock()
+                    .map(|mut pending| std::mem::take(&mut *pending))
+                    .unwrap_or_default();
+                for chord in chords {
+                    let chord =
+                        serde_json::to_string(&chord).unwrap_or_else(|_| "\"\"".to_string());
+                    let js = format!(
+                        "if (typeof onRecordedChord === 'function') onRecordedChord({});",
+                        chord
                     );
                     let _ = webview.evaluate_script(&js);
                 }

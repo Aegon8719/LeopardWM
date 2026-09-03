@@ -1723,8 +1723,10 @@ function chordParts(mods) {
   if (mods.shift) parts.push('Shift');
   return parts;
 }
-/* Tell the daemon to suspend/resume global hotkeys around recording, so the
+/* Tell the daemon to start/stop keyboard-hook capture around recording, so the
    combo being captured doesn't also fire its bound action. */
+var activeRecorder = null;
+var activeRecorderState = null;
 function postRecording(active) {
   try { window.ipc.postMessage(JSON.stringify({ action: 'set_recording', recording: active })); } catch (e) {}
 }
@@ -1732,7 +1734,19 @@ function exitRecording(input) {
   var wasRecording = input.classList.contains('recording');
   input.classList.remove('recording');
   input.placeholder = 'e.g. Ctrl+Alt+H';
+  if (activeRecorder === input) { activeRecorder = null; activeRecorderState = null; }
   if (wasRecording) { postRecording(false); }
+}
+function onRecordedChord(chord) {
+  var input = activeRecorder;
+  if (!input || !input.classList.contains('recording')) return;
+  if (activeRecorderState) activeRecorderState.chorded = true;
+  input.value = chord;
+  exitRecording(input);
+  var wb = document.getElementById('hotkey-warn-bar');
+  if (wb) wb.hidden = true;
+  refreshDuplicateWarnings();
+  autoSave(0);
 }
 /* F13–F24 may act as modifiers (held while another key completes the chord).
    Kept sorted F13..F24 so equivalent combos render identically. */
@@ -1748,9 +1762,8 @@ function attachRecorder(input) {
   /* F13–F24 currently held as modifiers this session, and whether a real key
      completed a chord while they were held (so a bare F-key release records the
      F-key itself rather than a combo). */
-  var extraMods = new Set();
-  var chorded = false;
-  function resetExtra() { extraMods.clear(); chorded = false; }
+  var recorderState = { extraMods: new Set(), chorded: false };
+  function resetExtra() { recorderState.extraMods.clear(); recorderState.chorded = false; }
   function startRecording() {
     if (input.classList.contains('recording')) return;
     prevValue = input.value;
@@ -1758,6 +1771,8 @@ function attachRecorder(input) {
     input.placeholder = 'Press shortcut, Esc to cancel';
     input.value = '';
     resetExtra();
+    activeRecorder = input;
+    activeRecorderState = recorderState;
     postRecording(true);
   }
   input.addEventListener('mousedown', function(e) { if (e.button === 0) startRecording(); });
@@ -1769,9 +1784,9 @@ function attachRecorder(input) {
      trigger; otherwise it was only a modifier and is dropped from the held set. */
   input.addEventListener('keyup', function(e) {
     if (!input.classList.contains('recording')) return;
-    if (!/^F(1[3-9]|2[0-4])$/.test(e.code) || !extraMods.has(e.code)) return;
-    extraMods.delete(e.code);
-    if (extraMods.size === 0 && !chorded) {
+    if (!/^F(1[3-9]|2[0-4])$/.test(e.code) || !recorderState.extraMods.has(e.code)) return;
+    recorderState.extraMods.delete(e.code);
+    if (recorderState.extraMods.size === 0 && !recorderState.chorded) {
       e.preventDefault();
       input.value = e.code;
       exitRecording(input);
@@ -1779,7 +1794,7 @@ function attachRecorder(input) {
       autoSave(0);
     } else {
       var mods = { ctrl: e.ctrlKey, alt: e.altKey, win: e.metaKey, shift: e.shiftKey };
-      input.value = chordParts(mods).concat(fnModList(extraMods)).join('+') + '+…';
+      input.value = chordParts(mods).concat(fnModList(recorderState.extraMods)).join('+') + '+…';
     }
   });
   input.addEventListener('keydown', function(e) {
@@ -1793,15 +1808,15 @@ function attachRecorder(input) {
     /* A modifier on its own: show the in-progress chord, keep recording. */
     if (/^(Control|Alt|Shift|Meta)(Left|Right)$/.test(e.code)) {
       e.preventDefault();
-      input.value = chordParts(mods).concat(fnModList(extraMods)).join('+') + '+…';
+      input.value = chordParts(mods).concat(fnModList(recorderState.extraMods)).join('+') + '+…';
       return;
     }
     /* F13–F24: hold as a modifier in progress; a bare press is finalized on
        key-up if no real key follows. */
     if (/^F(1[3-9]|2[0-4])$/.test(e.code)) {
       e.preventDefault();
-      extraMods.add(e.code);
-      input.value = chordParts(mods).concat(fnModList(extraMods)).join('+') + '+…';
+      recorderState.extraMods.add(e.code);
+      input.value = chordParts(mods).concat(fnModList(recorderState.extraMods)).join('+') + '+…';
       return;
     }
     /* Bare Esc/Tab are control gestures, not binds. */
@@ -1820,8 +1835,8 @@ function attachRecorder(input) {
     if (!token) return; /* unmapped key: keep waiting */
     e.preventDefault();
     e.stopPropagation();
-    chorded = true;
-    input.value = chordParts(mods).concat(fnModList(extraMods)).concat(token).join('+');
+    recorderState.chorded = true;
+    input.value = chordParts(mods).concat(fnModList(recorderState.extraMods)).concat(token).join('+');
     exitRecording(input);
     var wb = document.getElementById('hotkey-warn-bar');
     if (wb) wb.hidden = true; /* the warning is snapshot-stale once a bind is fixed */
@@ -2410,6 +2425,13 @@ mod tests {
         assert!(SETTINGS_HTML.contains("return el ? (el.dataset.value || '') : '';"));
         assert!(SETTINGS_HTML.contains("swipe_left: cbVal('cb-gestures-swipe_left')"));
         assert!(SETTINGS_HTML.contains("scroll_down: cbVal('cb-gestures-scroll_down')"));
+    }
+
+    #[test]
+    fn recorder_accepts_hook_delivered_chords() {
+        assert!(SETTINGS_HTML.contains("function onRecordedChord(chord) {"));
+        assert!(SETTINGS_HTML.contains("activeRecorder = input;"));
+        assert!(SETTINGS_HTML.contains("action: 'set_recording', recording: active"));
     }
 
     #[test]

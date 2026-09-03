@@ -48,12 +48,12 @@ use config::Config;
 use leopardwm_core_layout::Rect;
 use leopardwm_ipc::{pipe_name_candidates, preferred_pipe_name, IpcCommand, IpcResponse};
 use leopardwm_platform_win32::{
-    cascade_windows, enumerate_monitors, enumerate_windows, install_event_hooks,
+    cascade_windows, enumerate_monitors, enumerate_windows, format_hotkey, install_event_hooks,
     install_keyboard_hook, install_mouse_hook, overlay::OverlayWindow, register_gestures,
     register_system_events, restore_windows_moved_offscreen, set_display_change_sender,
-    set_dpi_awareness, set_power_state_sender, set_session_end_handler,
-    uncloak_all_visible_windows, GestureEvent, HotkeyBind, HotkeyId, KeyboardHookHandle, Modifiers,
-    MonitorId, MonitorInfo, MouseHookHandle, WindowEvent,
+    set_dpi_awareness, set_power_state_sender, set_recording, set_session_end_handler,
+    uncloak_all_visible_windows, GestureEvent, HotkeyBind, HotkeyId, KeyboardHookEvent,
+    KeyboardHookHandle, Modifiers, MonitorId, MonitorInfo, MouseHookHandle, WindowEvent,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -306,9 +306,8 @@ struct HotkeyState {
     /// System-event window (display/work-area/power/session-end); kept alive for
     /// its message pump. Independent of hotkeys.
     handle: Option<leopardwm_platform_win32::SystemEventHandle>,
-    /// Low-level keyboard hook: LeopardWM's sole hotkey matcher. `None` when
-    /// there are no binds, the hook failed to install, or matching is
-    /// suspended for the Settings recorder.
+    /// Low-level keyboard hook: LeopardWM's sole hotkey matcher. `None` only
+    /// when installation failed.
     hook: Option<KeyboardHookHandle>,
     /// Mapping of hotkey IDs to commands.
     mapping: HashMap<HotkeyId, IpcCommand>,
@@ -365,6 +364,7 @@ async fn reload_config_and_hotkeys(
     // Drop both handles BEFORE setup_hotkeys rebuilds them: assignment drops the
     // old HotkeyState last, so an unhook-then-reinstall must happen here or the
     // keyboard hook's double-install guard would reject the new one.
+    let was_recording = hotkey_state.recording;
     hotkey_state.handle = None;
     hotkey_state.hook = None;
     let new_config = {
@@ -372,6 +372,10 @@ async fn reload_config_and_hotkeys(
         state.config.clone()
     };
     *hotkey_state = setup_hotkeys(&new_config, event_tx.clone());
+    if was_recording {
+        set_recording(true);
+        hotkey_state.recording = true;
+    }
     // Apply a focus-follows-mouse change from the reloaded config (e.g. the
     // Settings toggle) without waiting for a restart.
     sync_mouse_hook(
@@ -413,9 +417,8 @@ fn protected_binds(bind_labels: &[BindInfo]) -> Vec<String> {
         .collect()
 }
 
-/// Install the keyboard hook for the given binds and forward matched binds into
-/// the daemon loop as `DaemonEvent::Hotkey`. Returns `None` if the hook fails to
-/// install.
+/// Install the keyboard hook for the given binds and forward hook events into
+/// the daemon loop. Returns `None` if the hook fails to install.
 fn install_hotkey_hook(
     binds: Vec<HotkeyBind>,
     event_tx: mpsc::Sender<DaemonEvent>,
@@ -426,7 +429,13 @@ fn install_hotkey_hook(
                 .name("hotkey-fwd".to_string())
                 .spawn(move || {
                     while let Ok(event) = rx.recv() {
-                        if event_tx.blocking_send(DaemonEvent::Hotkey(event)).is_err() {
+                        let event = match event {
+                            KeyboardHookEvent::Hotkey(event) => DaemonEvent::Hotkey(event),
+                            KeyboardHookEvent::Recorded { modifiers, vk } => {
+                                DaemonEvent::RecordedHotkey { modifiers, vk }
+                            }
+                        };
+                        if event_tx.blocking_send(event).is_err() {
                             break;
                         }
                     }
@@ -484,16 +493,9 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
     let handle = setup_system_event_handle();
 
     if binds.is_empty() {
-        info!("No hotkeys configured");
-        return HotkeyState {
-            handle,
-            hook: None,
-            mapping,
-            requested_count: 0,
-            registered_count: 0,
-            failed_binds: Vec::new(),
-            recording: false,
-        };
+        info!(
+            "No hotkeys configured; installing pass-through keyboard hook for Settings recording"
+        );
     }
 
     let failed_binds = protected_binds(&bind_labels);
@@ -506,7 +508,9 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
 
     let hook = install_hotkey_hook(binds, event_tx);
     let registered_count = if hook.is_some() { requested_count } else { 0 };
-    if hook.is_some() {
+    if hook.is_some() && requested_count == 0 {
+        info!("Keyboard hook installed in pass-through mode for Settings recording");
+    } else if hook.is_some() {
         info!(
             "Matching {} global hotkeys via the keyboard hook",
             requested_count
@@ -1779,6 +1783,19 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
     }
 }
 
+fn handle_recorded_hotkey(hotkey_state: &HotkeyState, modifiers: Modifiers, vk: u32) {
+    if !hotkey_state.recording {
+        debug!("Dropping recorded hotkey after Settings recording ended");
+    } else if let Some(chord) = format_hotkey(modifiers, vk) {
+        settings::push_recorded_chord(&chord);
+    } else {
+        debug!(
+            "Dropping recorded hotkey with unsupported virtual key {:#X}",
+            vk
+        );
+    }
+}
+
 /// Handle a global hotkey press; returns true when the daemon should shut down.
 async fn handle_hotkey_event(
     ctx: &mut EventLoopCtx<'_>,
@@ -2667,27 +2684,15 @@ async fn handle_settings_event(
             }
         }
         settings::SettingsEvent::SetRecording(true) => {
-            // Suspend hotkey matching while the user records a combo, so pressing
-            // it doesn't also fire its action (and so the key reaches the webview).
-            // Drop only the hook (the matcher); the system-event window stays up.
-            debug!("Settings: recording started, suspending hotkeys");
-            ctx.hotkey_state.hook = None;
+            debug!("Settings: recording started, capturing hotkeys");
+            set_recording(true);
             ctx.hotkey_state.recording = true;
         }
         settings::SettingsEvent::SetRecording(false) | settings::SettingsEvent::Closed => {
-            // Resume only if we suspended for recording. A normal close with the
-            // hook still installed is a no-op.
             if ctx.hotkey_state.recording {
-                debug!("Settings: recording ended, resuming hotkeys");
-                reload_config_and_hotkeys(
-                    ctx.state,
-                    ctx.hotkey_state,
-                    ctx.event_tx,
-                    ctx.tray_manager,
-                    ctx.snap_hint_overlay,
-                    ctx.mouse_hook_handle,
-                )
-                .await;
+                debug!("Settings: recording ended, resuming hotkey matching");
+                set_recording(false);
+                ctx.hotkey_state.recording = false;
             }
         }
     }
@@ -3193,6 +3198,9 @@ async fn main() -> Result<()> {
                 if handle_hotkey_event(&mut ctx, hotkey_event).await {
                     break;
                 }
+            }
+            DaemonEvent::RecordedHotkey { modifiers, vk } => {
+                handle_recorded_hotkey(ctx.hotkey_state, modifiers, vk);
             }
             DaemonEvent::Gesture(gesture_event) => {
                 if handle_gesture_event(&mut ctx, gesture_event).await {

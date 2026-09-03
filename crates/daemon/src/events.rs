@@ -1,6 +1,6 @@
 use leopardwm_platform_win32::overview::OverviewEvent;
 use leopardwm_platform_win32::tab_strip::TabAction;
-use leopardwm_platform_win32::{GestureEvent, HotkeyEvent, WindowEvent};
+use leopardwm_platform_win32::{GestureEvent, HotkeyEvent, Modifiers, WindowEvent};
 use std::collections::BTreeSet;
 use tokio::sync::{broadcast, oneshot};
 
@@ -43,6 +43,8 @@ pub(crate) enum DaemonEvent {
     WindowEvent(WindowEvent),
     /// A global hotkey was pressed.
     Hotkey(HotkeyEvent),
+    /// Settings recorded a chord through the global keyboard hook.
+    RecordedHotkey { modifiers: Modifiers, vk: u32 },
     /// A touchpad gesture was detected.
     Gesture(GestureEvent),
     /// A tray menu event.

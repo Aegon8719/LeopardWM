@@ -137,7 +137,7 @@ impl Hotkey {
 }
 
 /// Event emitted when a hotkey is matched by the keyboard hook.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HotkeyEvent {
     /// The ID of the hotkey that was pressed.
     pub id: HotkeyId,
@@ -715,6 +715,65 @@ pub fn parse_hotkey_string(s: &str) -> Option<(Modifiers, u32)> {
     Some((modifiers, vk))
 }
 
+/// Format a hotkey in the canonical form accepted by [`parse_hotkey_string`].
+pub fn format_hotkey(modifiers: Modifiers, vk: u32) -> Option<String> {
+    if modifiers.fn_mods & !0x0FFF != 0 {
+        return None;
+    }
+
+    let key = match vk {
+        0x41..=0x5A => char::from_u32(vk)?.to_string(),
+        0x30..=0x39 => char::from_u32(vk)?.to_string(),
+        0x70..=0x87 => format!("F{}", vk - 0x6F),
+        0x60..=0x69 => format!("Numpad{}", vk - vk::NUMPAD0),
+        vk::NUMPAD_ADD => "NumpadAdd".to_string(),
+        vk::NUMPAD_SUBTRACT => "NumpadSubtract".to_string(),
+        vk::NUMPAD_MULTIPLY => "NumpadMultiply".to_string(),
+        vk::NUMPAD_DIVIDE => "NumpadDivide".to_string(),
+        vk::NUMPAD_DECIMAL => "NumpadDecimal".to_string(),
+        vk::LEFT => "Left".to_string(),
+        vk::RIGHT => "Right".to_string(),
+        vk::UP => "Up".to_string(),
+        vk::DOWN => "Down".to_string(),
+        vk::HOME => "Home".to_string(),
+        vk::END => "End".to_string(),
+        vk::PAGE_UP => "PageUp".to_string(),
+        vk::PAGE_DOWN => "PageDown".to_string(),
+        vk::TAB => "Tab".to_string(),
+        vk::SPACE => "Space".to_string(),
+        vk::ENTER => "Enter".to_string(),
+        vk::ESCAPE => "Escape".to_string(),
+        vk::MINUS => "-".to_string(),
+        vk::EQUALS => "=".to_string(),
+        vk::COMMA => ",".to_string(),
+        vk::PERIOD => ".".to_string(),
+        vk::BRACKET_LEFT => "[".to_string(),
+        vk::BRACKET_RIGHT => "]".to_string(),
+        _ => return None,
+    };
+
+    let mut parts = Vec::new();
+    if modifiers.ctrl {
+        parts.push("Ctrl".to_string());
+    }
+    if modifiers.alt {
+        parts.push("Alt".to_string());
+    }
+    if modifiers.win {
+        parts.push("Win".to_string());
+    }
+    if modifiers.shift {
+        parts.push("Shift".to_string());
+    }
+    for offset in 0..12 {
+        if modifiers.fn_mods & (1 << offset) != 0 {
+            parts.push(format!("F{}", 13 + offset));
+        }
+    }
+    parts.push(key);
+    Some(parts.join("+"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,5 +1138,58 @@ mod tests {
         let (mods, vk) = parse_hotkey_string("F13").unwrap();
         assert_eq!(mods.fn_mods, 0);
         assert_eq!(vk, 0x7C);
+    }
+
+    #[test]
+    fn format_hotkey_round_trips_all_supported_keys() {
+        let mut keys: Vec<u32> = (0x41..=0x5A).chain(0x30..=0x39).collect();
+        keys.extend(0x70..=0x87);
+        keys.extend(0x60..=0x69);
+        keys.extend([
+            vk::NUMPAD_ADD,
+            vk::NUMPAD_SUBTRACT,
+            vk::NUMPAD_MULTIPLY,
+            vk::NUMPAD_DIVIDE,
+            vk::NUMPAD_DECIMAL,
+            vk::LEFT,
+            vk::RIGHT,
+            vk::UP,
+            vk::DOWN,
+            vk::HOME,
+            vk::END,
+            vk::PAGE_UP,
+            vk::PAGE_DOWN,
+            vk::TAB,
+            vk::SPACE,
+            vk::ENTER,
+            vk::ESCAPE,
+            vk::MINUS,
+            vk::EQUALS,
+            vk::COMMA,
+            vk::PERIOD,
+            vk::BRACKET_LEFT,
+            vk::BRACKET_RIGHT,
+        ]);
+        let modifiers = [
+            Modifiers::default(),
+            Modifiers {
+                ctrl: true,
+                alt: true,
+                ..Default::default()
+            },
+            Modifiers {
+                win: true,
+                shift: true,
+                fn_mods: fn_mod_bit(0x7C).unwrap() | fn_mod_bit(0x7F).unwrap(),
+                ..Default::default()
+            },
+        ];
+
+        for modifiers in modifiers {
+            for &key in &keys {
+                let formatted = format_hotkey(modifiers, key).unwrap();
+                assert_eq!(parse_hotkey_string(&formatted), Some((modifiers, key)));
+            }
+        }
     }
 }
