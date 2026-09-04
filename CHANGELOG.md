@@ -14,6 +14,9 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Fixes
 
+- **Activating a minimized tab restores it without stealing focus early.** The tab is restored
+  before layout and foreground synchronization, while stale tab-click actions are discarded
+  instead of being redirected to a changed workspace or column.
 - **Recording a hotkey in Settings now captures Windows shortcuts.** While a hotkey field is
   recording, LeopardWM keeps its keyboard hook active and swallows the pressed combo before
   Windows sees it, so `Win+Home`, `Win+Arrow`, and similar chords are recorded instead of

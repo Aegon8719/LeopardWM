@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::hotkey_resolution::resolve_hotkeys;
 use crate::state::{validate_set_width_fraction, AppState, PendingWorkspaceSwitchFocus};
-use leopardwm_core_layout::{Rect, Workspace};
+use leopardwm_core_layout::{LayoutError, Rect, Workspace};
 use leopardwm_ipc::{HotkeyBindingInfo, IpcCommand, IpcResponse};
 use leopardwm_platform_win32::{
     enumerate_windows, get_process_executable, monitor_above, monitor_below, monitor_to_left,
@@ -1523,27 +1523,78 @@ impl AppState {
 
     /// Handle `IpcCommand::SetActiveTab`.
     fn handle_set_active_tab(&mut self, column: usize, tab: usize) -> IpcResponse {
-        // Pre-arm the same-column-suppression bypass so the
-        // synthesized SetForegroundWindow that follows doesn't get
-        // squashed as redundant intra-column churn.
-        let monitor = self.focused_monitor;
-        let ws_idx = self.active_workspace_idx(monitor);
-        self.pending_tab_focus = Some(crate::state::PendingTabFocus {
-            monitor,
-            workspace_idx: ws_idx,
-            column_idx: column,
-            tab_idx: tab,
-            set_at: std::time::Instant::now(),
-        });
-        let Some(workspace) = self.focused_workspace_mut() else {
-            return IpcResponse::error("No focused workspace");
+        self.handle_set_active_tab_with_restore(
+            column,
+            tab,
+            leopardwm_platform_win32::restore_window_no_activate,
+        )
+    }
+
+    fn handle_set_active_tab_with_restore(
+        &mut self,
+        column: usize,
+        tab: usize,
+        restore: impl FnOnce(u64) -> Result<(), leopardwm_platform_win32::Win32Error>,
+    ) -> IpcResponse {
+        let (target, was_minimized) = match self.focused_workspace() {
+            None => return IpcResponse::error("No focused workspace"),
+            Some(workspace) => {
+                let Some(target_column) = workspace.column(column) else {
+                    return IpcResponse::error(format!(
+                        "set_active_tab failed: {}",
+                        LayoutError::ColumnOutOfBounds(
+                            column,
+                            workspace.column_count().saturating_sub(1)
+                        )
+                    ));
+                };
+                let target = match target_column.get(tab) {
+                    Some(target) if target_column.is_tabbed() => target,
+                    _ => {
+                        return IpcResponse::error(format!(
+                            "set_active_tab failed: {}",
+                            LayoutError::WindowIndexOutOfBounds(
+                                tab,
+                                column,
+                                target_column.len().saturating_sub(1)
+                            )
+                        ));
+                    }
+                };
+                (target, workspace.is_minimized(target))
+            }
         };
-        if let Err(e) = workspace.set_active_tab(column, tab) {
-            self.pending_tab_focus = None;
-            return IpcResponse::error(format!("set_active_tab failed: {}", e));
+
+        if was_minimized {
+            if let Err(e) = restore(target) {
+                return IpcResponse::error(format!("restore minimized tab failed: {}", e));
+            }
         }
+
+        let should_sync_target = {
+            let Some(workspace) = self.focused_workspace_mut() else {
+                return IpcResponse::error("No focused workspace");
+            };
+            if was_minimized {
+                workspace.mark_restored(target);
+            }
+            if let Err(e) = workspace.set_active_tab(column, tab) {
+                return IpcResponse::error(format!("set_active_tab failed: {}", e));
+            }
+            workspace.focused_column_index() == column && workspace.focused_window() == Some(target)
+        };
+
         if let Err(e) = self.apply_layout() {
             return IpcResponse::error(format!("apply_layout failed: {}", e));
+        }
+        if should_sync_target {
+            self.pending_tab_focus = Some(crate::state::PendingTabFocus {
+                monitor: self.focused_monitor,
+                workspace_idx: self.active_workspace_idx(self.focused_monitor),
+                column_idx: column,
+                tab_idx: tab,
+                set_at: std::time::Instant::now(),
+            });
         }
         self.sync_foreground_window();
         info!("Set active tab: column={}, tab={}", column, tab);
@@ -1597,5 +1648,157 @@ mod focus_nav_tests {
                 "{cmd:?} should not warp the cursor"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod set_active_tab_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::state::{PendingTabFocus, TestApplyPlacementsBehavior};
+    use leopardwm_core_layout::Rect;
+    use leopardwm_platform_win32::{MonitorInfo, Win32Error, WindowEvent};
+    use std::time::{Duration, Instant};
+
+    fn tabbed_state() -> AppState {
+        let mut state = AppState::new_with_config(
+            Config::default(),
+            vec![MonitorInfo {
+                id: 1,
+                rect: Rect::new(0, 0, 1920, 1080),
+                work_area: Rect::new(0, 0, 1920, 1040),
+                is_primary: true,
+                device_name: "DISPLAY1".to_string(),
+                scale_factor: 1.0,
+            }],
+        );
+        let workspace = state.focused_workspace_mut().unwrap();
+        workspace.insert_window(100, None).unwrap();
+        workspace.insert_window_in_column(200, 0).unwrap();
+        workspace.set_focus(0, 0).unwrap();
+        workspace.toggle_focused_column_tabbed_mode();
+        state
+    }
+
+    #[test]
+    fn set_active_tab_restores_minimized_target_before_activation() {
+        let mut state = tabbed_state();
+        state.focused_workspace_mut().unwrap().mark_minimized(200);
+        let mut restored = None;
+
+        let response = state.handle_set_active_tab_with_restore(0, 1, |hwnd| {
+            restored = Some(hwnd);
+            Ok(())
+        });
+
+        assert!(matches!(response, IpcResponse::Ok));
+        assert_eq!(restored, Some(200));
+        let workspace = state.focused_workspace().unwrap();
+        assert!(!workspace.is_minimized(200));
+        assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(1));
+        assert_eq!(workspace.focused_window(), Some(200));
+        assert_eq!(state.previous_focused_hwnd, Some(200));
+        assert!(state.pending_tab_focus.is_some());
+    }
+
+    #[test]
+    fn set_active_tab_restore_failure_preserves_state() {
+        let mut state = tabbed_state();
+        let (active_before, focus_before) = {
+            let workspace = state.focused_workspace_mut().unwrap();
+            workspace.mark_minimized(200);
+            (
+                workspace.column(0).unwrap().active_tab_idx(),
+                (workspace.focused_column_index(), workspace.focused_window()),
+            )
+        };
+        state.previous_focused_hwnd = Some(100);
+        state.pending_tab_focus = Some(PendingTabFocus {
+            monitor: 1,
+            workspace_idx: 0,
+            column_idx: 0,
+            tab_idx: 0,
+            set_at: Instant::now(),
+        });
+
+        let response = state
+            .handle_set_active_tab_with_restore(0, 1, |_| Err(Win32Error::WindowNotFound(200)));
+
+        assert!(matches!(response, IpcResponse::Error { .. }));
+        let workspace = state.focused_workspace().unwrap();
+        assert!(workspace.is_minimized(200));
+        assert_eq!(workspace.column(0).unwrap().active_tab_idx(), active_before);
+        assert_eq!(
+            (workspace.focused_column_index(), workspace.focused_window()),
+            focus_before
+        );
+        assert_eq!(state.previous_focused_hwnd, Some(100));
+        assert!(state.last_placed_layout_rects.is_empty());
+        assert_eq!(state.pending_tab_focus.unwrap().tab_idx, 0);
+    }
+
+    #[test]
+    fn set_active_tab_does_not_restore_model_visible_target_when_os_state_is_stale() {
+        let mut state = tabbed_state();
+        let response = state.handle_set_active_tab_with_restore(0, 1, |_| {
+            panic!("model-visible target must not be restored")
+        });
+
+        assert!(matches!(response, IpcResponse::Ok));
+        let workspace = state.focused_workspace().unwrap();
+        assert!(!workspace.is_minimized(200));
+        assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(1));
+    }
+
+    #[test]
+    fn set_active_tab_validates_target_before_restoring() {
+        let mut state = tabbed_state();
+        state.focused_workspace_mut().unwrap().mark_minimized(200);
+
+        let response = state.handle_set_active_tab_with_restore(0, 2, |_| {
+            panic!("invalid tab must not be restored")
+        });
+
+        assert!(matches!(response, IpcResponse::Error { .. }));
+        let workspace = state.focused_workspace().unwrap();
+        assert!(workspace.is_minimized(200));
+        assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(0));
+        assert_eq!(workspace.focused_window(), Some(100));
+        assert!(state.pending_tab_focus.is_none());
+    }
+
+    #[test]
+    fn delayed_restored_event_after_tab_activation_is_idempotent() {
+        let mut state = tabbed_state();
+        state.focused_workspace_mut().unwrap().mark_minimized(200);
+        assert!(matches!(
+            state.handle_set_active_tab_with_restore(0, 1, |_| Ok(())),
+            IpcResponse::Ok
+        ));
+
+        state.handle_window_event(WindowEvent::Restored(200));
+
+        let workspace = state.focused_workspace().unwrap();
+        assert!(!workspace.is_minimized(200));
+        assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(1));
+        assert_eq!(workspace.focused_window(), Some(200));
+    }
+
+    #[test]
+    fn layout_failure_keeps_successfully_restored_tab_visible() {
+        let mut state = tabbed_state();
+        state.focused_workspace_mut().unwrap().mark_minimized(200);
+        state.paused = false;
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::SleepAndFail(Duration::ZERO));
+
+        let response = state.handle_set_active_tab_with_restore(0, 1, |_| Ok(()));
+
+        assert!(matches!(response, IpcResponse::Error { .. }));
+        let workspace = state.focused_workspace().unwrap();
+        assert!(!workspace.is_minimized(200));
+        assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(1));
+        assert_eq!(workspace.focused_window(), Some(200));
+        assert!(state.pending_tab_focus.is_none());
     }
 }

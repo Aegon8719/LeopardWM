@@ -8,7 +8,7 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic,
     IsWindow, PostMessageW, SetCursorPos, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_TOP,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, SW_SHOWNOACTIVATE,
 };
 
 /// The current OS foreground window as a `WindowId`, if any. This is
@@ -68,6 +68,47 @@ pub fn warp_cursor_to_window(hwnd: WindowId) {
         let cy = rect.top + (rect.bottom - rect.top) / 2;
         let _ = SetCursorPos(cx, cy);
     }
+}
+
+/// Restore a minimized window without activating it.
+///
+/// The operation is idempotent: visible windows are left untouched. `ShowWindow`
+/// reports the previous visibility state rather than restore success, so success
+/// is determined by checking whether the window remains minimized afterward.
+pub fn restore_window_no_activate(window_id: WindowId) -> Result<(), Win32Error> {
+    let hwnd = window_id_to_hwnd(window_id)?;
+    unsafe {
+        restore_window_no_activate_with(
+            window_id,
+            || IsWindow(Some(hwnd)).as_bool(),
+            || IsIconic(hwnd).as_bool(),
+            || {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            },
+        )
+    }
+}
+
+fn restore_window_no_activate_with(
+    window_id: WindowId,
+    is_window: impl FnOnce() -> bool,
+    is_iconic: impl Fn() -> bool,
+    show_window: impl FnOnce(),
+) -> Result<(), Win32Error> {
+    if !is_window() {
+        return Err(Win32Error::WindowNotFound(window_id));
+    }
+    if !is_iconic() {
+        return Ok(());
+    }
+    show_window();
+    if is_iconic() {
+        return Err(Win32Error::SetPositionFailed(format!(
+            "Failed to restore minimized window {} without activation",
+            window_id
+        )));
+    }
+    Ok(())
 }
 
 /// Set the foreground window using Win32 SetForegroundWindow.
@@ -242,6 +283,51 @@ pub fn close_window(hwnd: WindowId) -> Result<(), Win32Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_without_activation_skips_visible_window() {
+        let show_calls = std::cell::Cell::new(0);
+        restore_window_no_activate_with(
+            42,
+            || true,
+            || false,
+            || show_calls.set(show_calls.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(show_calls.get(), 0);
+    }
+
+    #[test]
+    fn restore_without_activation_verifies_restored_state() {
+        let iconic = std::cell::Cell::new(true);
+        restore_window_no_activate_with(42, || true, || iconic.get(), || iconic.set(false))
+            .unwrap();
+        assert!(!iconic.get());
+    }
+
+    #[test]
+    fn restore_without_activation_rejects_dead_window() {
+        let result = restore_window_no_activate_with(42, || false, || false, || {});
+        assert!(matches!(result, Err(Win32Error::WindowNotFound(42))));
+    }
+
+    #[test]
+    fn restore_without_activation_reports_window_that_stays_minimized() {
+        let result = restore_window_no_activate_with(42, || true, || true, || {});
+        assert!(matches!(result, Err(Win32Error::SetPositionFailed(_))));
+    }
+
+    #[test]
+    fn restore_without_activation_zero_fails() {
+        let result = restore_window_no_activate(0);
+        assert!(matches!(result, Err(Win32Error::WindowNotFound(0))));
+    }
+
+    #[test]
+    fn restore_without_activation_invalid_hwnd_fails() {
+        let result = restore_window_no_activate(u64::MAX);
+        assert!(matches!(result, Err(Win32Error::WindowNotFound(u64::MAX))));
+    }
 
     #[test]
     fn test_set_foreground_window_zero_fails() {

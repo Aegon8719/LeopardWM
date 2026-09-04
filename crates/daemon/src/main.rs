@@ -2356,26 +2356,32 @@ async fn handle_tab_action(
     use leopardwm_platform_win32::tab_strip::TabAction;
     match action {
         TabAction::Activate => {
-            // Trust the strip's captured identity over current
-            // focus — focus may have changed between click and
-            // dispatch, and we want the click to apply to the
-            // column the user saw, not whatever is focused now.
+            // The overlay captured this identity when it rendered. A delayed click
+            // must never activate a tab on a workspace that has since changed.
             let mut s = state.lock().await;
-            let needs_focus_switch = s.focused_monitor != monitor
-                || s.active_workspace_idx(monitor) != workspace_idx
-                || s.focused_workspace()
-                    .is_none_or(|ws| ws.focused_column_index() != column_idx);
-            if needs_focus_switch {
-                s.focused_monitor = monitor;
-                if let Some(ws) = s.focused_workspace_mut() {
-                    let _ = ws.set_focus(column_idx, 0);
-                }
+            if s.active_workspace_idx(monitor) != workspace_idx {
+                return;
             }
-            let resp = s.handle_command(IpcCommand::SetActiveTab {
+            let focused =
+                s.workspaces
+                    .get_mut(&monitor)
+                    .and_then(|workspaces| workspaces.get_mut(workspace_idx))
+                    .is_some_and(|workspace| {
+                        workspace.column(column_idx).is_some_and(|column| {
+                            column.is_tabbed() && column.get(tab_idx).is_some()
+                        }) && workspace.set_focus(column_idx, 0).is_ok()
+                    });
+            if !focused {
+                return;
+            }
+            // The captured workspace is still active and its captured column was
+            // focused successfully, so this remains the intended target even when
+            // the click originated on another monitor.
+            s.focused_monitor = monitor;
+            if let IpcResponse::Error { message } = s.handle_command(IpcCommand::SetActiveTab {
                 column: column_idx,
                 tab: tab_idx,
-            });
-            if let IpcResponse::Error { message } = resp {
+            }) {
                 warn!("SetActiveTab from tab click failed: {}", message);
             }
         }
@@ -2531,6 +2537,78 @@ async fn handle_tab_action(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tab_action_tests {
+    use super::*;
+    use leopardwm_platform_win32::TabAction;
+
+    fn monitor(id: isize, primary: bool) -> MonitorInfo {
+        MonitorInfo {
+            id,
+            rect: Rect::new((id - 1) as i32 * 1920, 0, 1920, 1080),
+            work_area: Rect::new((id - 1) as i32 * 1920, 0, 1920, 1040),
+            is_primary: primary,
+            device_name: format!("DISPLAY{id}"),
+            scale_factor: 1.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_activation_drops_stale_captured_workspace() {
+        let mut app = AppState::new_with_config(Config::default(), vec![monitor(1, true)]);
+        app.ensure_workspace_exists(1, 1);
+        let state = Arc::new(Mutex::new(app));
+
+        handle_tab_action(&state, 1, 1, 0, 0, TabAction::Activate).await;
+
+        let app = state.lock().await;
+        assert_eq!(app.focused_monitor, 1);
+        assert_eq!(app.active_workspace_idx(1), 0);
+        assert!(app.pending_tab_focus.is_none());
+    }
+
+    #[tokio::test]
+    async fn tab_activation_applies_valid_captured_monitor_and_column() {
+        let mut app =
+            AppState::new_with_config(Config::default(), vec![monitor(1, true), monitor(2, false)]);
+        let workspace = app.workspaces.get_mut(&2).unwrap().first_mut().unwrap();
+        workspace.insert_window(100, None).unwrap();
+        workspace.insert_window_in_column(200, 0).unwrap();
+        workspace.set_focus(0, 0).unwrap();
+        workspace.toggle_focused_column_tabbed_mode();
+        let state = Arc::new(Mutex::new(app));
+
+        handle_tab_action(&state, 2, 0, 0, 1, TabAction::Activate).await;
+
+        let app = state.lock().await;
+        assert_eq!(app.focused_monitor, 2);
+        let workspace = &app.workspaces[&2][0];
+        assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(1));
+        assert_eq!(workspace.focused_window(), Some(200));
+    }
+
+    #[tokio::test]
+    async fn tab_activation_drops_invalid_captured_column() {
+        let mut app =
+            AppState::new_with_config(Config::default(), vec![monitor(1, true), monitor(2, false)]);
+        let workspace = app.workspaces.get_mut(&2).unwrap().first_mut().unwrap();
+        workspace.insert_window(100, None).unwrap();
+        workspace.insert_window_in_column(200, 0).unwrap();
+        workspace.set_focus(0, 1).unwrap();
+        workspace.toggle_focused_column_tabbed_mode();
+        let state = Arc::new(Mutex::new(app));
+
+        handle_tab_action(&state, 2, 0, 1, 0, TabAction::Activate).await;
+
+        let app = state.lock().await;
+        assert_eq!(app.focused_monitor, 1);
+        let workspace = &app.workspaces[&2][0];
+        assert_eq!(workspace.focused_window(), Some(200));
+        assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(1));
+        assert!(app.pending_tab_focus.is_none());
     }
 }
 
