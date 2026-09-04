@@ -2588,7 +2588,7 @@ mod tab_action_tests {
         workspace.toggle_focused_column_tabbed_mode();
         let state = Arc::new(Mutex::new(app));
 
-        handle_tab_action(&state, 2, 0, 0, 1, TabAction::Activate).await;
+        handle_tab_action_with_restore(&state, 2, 0, 0, 1, TabAction::Activate, |_| Ok(())).await;
 
         let app = state.lock().await;
         assert_eq!(app.focused_monitor, 2);

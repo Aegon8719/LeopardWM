@@ -1565,10 +1565,8 @@ impl AppState {
             }
         };
 
-        if was_minimized {
-            if let Err(e) = restore(target) {
-                return IpcResponse::error(format!("restore minimized tab failed: {}", e));
-            }
+        if let Err(e) = restore(target) {
+            return IpcResponse::error(format!("restore tab failed: {}", e));
         }
 
         self.commit_active_tab_after_restore(column, tab, target, was_minimized)
@@ -1594,13 +1592,8 @@ impl AppState {
             (target, workspace.is_minimized(target))
         };
 
-        if was_minimized {
-            if let Err(e) = restore(target) {
-                return Some(IpcResponse::error(format!(
-                    "restore minimized tab failed: {}",
-                    e
-                )));
-            }
+        if let Err(e) = restore(target) {
+            return Some(IpcResponse::error(format!("restore tab failed: {}", e)));
         }
 
         let workspace = self.workspaces.get_mut(&monitor)?.get_mut(workspace_idx)?;
@@ -1755,8 +1748,7 @@ mod set_active_tab_tests {
     fn set_active_tab_restore_failure_preserves_state() {
         let mut state = tabbed_state();
         let (active_before, focus_before) = {
-            let workspace = state.focused_workspace_mut().unwrap();
-            workspace.mark_minimized(200);
+            let workspace = state.focused_workspace().unwrap();
             (
                 workspace.column(0).unwrap().active_tab_idx(),
                 (workspace.focused_column_index(), workspace.focused_window()),
@@ -1771,12 +1763,16 @@ mod set_active_tab_tests {
             set_at: Instant::now(),
         });
 
-        let response = state
-            .handle_set_active_tab_with_restore(0, 1, |_| Err(Win32Error::WindowNotFound(200)));
+        let mut restored = None;
+        let response = state.handle_set_active_tab_with_restore(0, 1, |hwnd| {
+            restored = Some(hwnd);
+            Err(Win32Error::WindowNotFound(hwnd))
+        });
 
         assert!(matches!(response, IpcResponse::Error { .. }));
+        assert_eq!(restored, Some(200));
         let workspace = state.focused_workspace().unwrap();
-        assert!(workspace.is_minimized(200));
+        assert!(!workspace.is_minimized(200));
         assert_eq!(workspace.column(0).unwrap().active_tab_idx(), active_before);
         assert_eq!(
             (workspace.focused_column_index(), workspace.focused_window()),
@@ -1788,16 +1784,39 @@ mod set_active_tab_tests {
     }
 
     #[test]
-    fn set_active_tab_does_not_restore_model_visible_target_when_os_state_is_stale() {
+    fn set_active_tab_restores_model_visible_target_when_os_state_is_stale() {
         let mut state = tabbed_state();
-        let response = state.handle_set_active_tab_with_restore(0, 1, |_| {
-            panic!("model-visible target must not be restored")
+        let mut restored = None;
+
+        let response = state.handle_set_active_tab_with_restore(0, 1, |hwnd| {
+            restored = Some(hwnd);
+            Ok(())
         });
 
         assert!(matches!(response, IpcResponse::Ok));
+        assert_eq!(restored, Some(200));
         let workspace = state.focused_workspace().unwrap();
         assert!(!workspace.is_minimized(200));
         assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(1));
+        assert_eq!(workspace.focused_window(), Some(200));
+    }
+
+    #[test]
+    fn tab_click_restores_model_visible_target_when_os_state_is_stale() {
+        let mut state = tabbed_state();
+        let mut restored = None;
+
+        let response = state.handle_tab_action_activation_with_restore(1, 0, 0, 1, |hwnd| {
+            restored = Some(hwnd);
+            Ok(())
+        });
+
+        assert!(matches!(response, Some(IpcResponse::Ok)));
+        assert_eq!(restored, Some(200));
+        let workspace = state.focused_workspace().unwrap();
+        assert!(!workspace.is_minimized(200));
+        assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(1));
+        assert_eq!(workspace.focused_window(), Some(200));
     }
 
     #[test]
