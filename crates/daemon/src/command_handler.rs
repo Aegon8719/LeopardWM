@@ -1571,6 +1571,56 @@ impl AppState {
             }
         }
 
+        self.commit_active_tab_after_restore(column, tab, target, was_minimized)
+    }
+
+    pub(crate) fn handle_tab_action_activation_with_restore(
+        &mut self,
+        monitor: isize,
+        workspace_idx: usize,
+        column: usize,
+        tab: usize,
+        restore: impl FnOnce(u64) -> Result<(), leopardwm_platform_win32::Win32Error>,
+    ) -> Option<IpcResponse> {
+        if self.active_workspace_idx(monitor) != workspace_idx {
+            return None;
+        }
+        let (target, was_minimized) = {
+            let workspace = self.workspaces.get(&monitor)?.get(workspace_idx)?;
+            let target_column = workspace.column(column)?;
+            let target = target_column
+                .get(tab)
+                .filter(|_| target_column.is_tabbed())?;
+            (target, workspace.is_minimized(target))
+        };
+
+        if was_minimized {
+            if let Err(e) = restore(target) {
+                return Some(IpcResponse::error(format!(
+                    "restore minimized tab failed: {}",
+                    e
+                )));
+            }
+        }
+
+        let workspace = self.workspaces.get_mut(&monitor)?.get_mut(workspace_idx)?;
+        if let Err(e) = workspace.set_focus(column, 0) {
+            return Some(IpcResponse::error(format!(
+                "set focus for tab click failed: {}",
+                e
+            )));
+        }
+        self.focused_monitor = monitor;
+        Some(self.commit_active_tab_after_restore(column, tab, target, was_minimized))
+    }
+
+    fn commit_active_tab_after_restore(
+        &mut self,
+        column: usize,
+        tab: usize,
+        target: u64,
+        was_minimized: bool,
+    ) -> IpcResponse {
         let should_sync_target = {
             let Some(workspace) = self.focused_workspace_mut() else {
                 return IpcResponse::error("No focused workspace");

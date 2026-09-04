@@ -2353,35 +2353,40 @@ async fn handle_tab_action(
     tab_idx: usize,
     action: leopardwm_platform_win32::tab_strip::TabAction,
 ) {
+    handle_tab_action_with_restore(
+        state,
+        monitor,
+        workspace_idx,
+        column_idx,
+        tab_idx,
+        action,
+        leopardwm_platform_win32::restore_window_no_activate,
+    )
+    .await;
+}
+
+async fn handle_tab_action_with_restore(
+    state: &Arc<Mutex<AppState>>,
+    monitor: isize,
+    workspace_idx: usize,
+    column_idx: usize,
+    tab_idx: usize,
+    action: leopardwm_platform_win32::tab_strip::TabAction,
+    restore: impl FnOnce(u64) -> Result<(), leopardwm_platform_win32::Win32Error>,
+) {
     use leopardwm_platform_win32::tab_strip::TabAction;
     match action {
         TabAction::Activate => {
-            // The overlay captured this identity when it rendered. A delayed click
-            // must never activate a tab on a workspace that has since changed.
             let mut s = state.lock().await;
-            if s.active_workspace_idx(monitor) != workspace_idx {
-                return;
-            }
-            let focused =
-                s.workspaces
-                    .get_mut(&monitor)
-                    .and_then(|workspaces| workspaces.get_mut(workspace_idx))
-                    .is_some_and(|workspace| {
-                        workspace.column(column_idx).is_some_and(|column| {
-                            column.is_tabbed() && column.get(tab_idx).is_some()
-                        }) && workspace.set_focus(column_idx, 0).is_ok()
-                    });
-            if !focused {
-                return;
-            }
-            // The captured workspace is still active and its captured column was
-            // focused successfully, so this remains the intended target even when
-            // the click originated on another monitor.
-            s.focused_monitor = monitor;
-            if let IpcResponse::Error { message } = s.handle_command(IpcCommand::SetActiveTab {
-                column: column_idx,
-                tab: tab_idx,
-            }) {
+            if let Some(IpcResponse::Error { message }) = s
+                .handle_tab_action_activation_with_restore(
+                    monitor,
+                    workspace_idx,
+                    column_idx,
+                    tab_idx,
+                    restore,
+                )
+            {
                 warn!("SetActiveTab from tab click failed: {}", message);
             }
         }
@@ -2543,7 +2548,9 @@ async fn handle_tab_action(
 #[cfg(test)]
 mod tab_action_tests {
     use super::*;
-    use leopardwm_platform_win32::TabAction;
+    use crate::state::PendingTabFocus;
+    use leopardwm_platform_win32::{TabAction, Win32Error};
+    use std::time::Instant;
 
     fn monitor(id: isize, primary: bool) -> MonitorInfo {
         MonitorInfo {
@@ -2588,6 +2595,59 @@ mod tab_action_tests {
         let workspace = &app.workspaces[&2][0];
         assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(1));
         assert_eq!(workspace.focused_window(), Some(200));
+    }
+
+    #[tokio::test]
+    async fn tab_activation_restore_failure_preserves_routing_state() {
+        let mut app =
+            AppState::new_with_config(Config::default(), vec![monitor(1, true), monitor(2, false)]);
+        let workspace = app.workspaces.get_mut(&2).unwrap().first_mut().unwrap();
+        workspace.insert_window(100, None).unwrap();
+        workspace.insert_window_in_column(200, 0).unwrap();
+        workspace.set_focus(0, 0).unwrap();
+        workspace.toggle_focused_column_tabbed_mode();
+        workspace.insert_window(300, None).unwrap();
+        workspace.set_focus(1, 0).unwrap();
+        workspace.mark_minimized(200);
+        app.previous_focused_hwnd = Some(100);
+        app.last_placed_layout_rects
+            .insert(100, Rect::new(1, 2, 3, 4));
+        app.pending_tab_focus = Some(PendingTabFocus {
+            monitor: 1,
+            workspace_idx: 0,
+            column_idx: 0,
+            tab_idx: 0,
+            set_at: Instant::now(),
+        });
+        let state = Arc::new(Mutex::new(app));
+
+        handle_tab_action_with_restore(&state, 2, 0, 0, 1, TabAction::Activate, |_| {
+            Err(Win32Error::WindowNotFound(200))
+        })
+        .await;
+
+        let app = state.lock().await;
+        assert_eq!(app.focused_monitor, 1);
+        assert_eq!(app.previous_focused_hwnd, Some(100));
+        assert_eq!(
+            app.last_placed_layout_rects.get(&100),
+            Some(&Rect::new(1, 2, 3, 4))
+        );
+        let pending = app.pending_tab_focus.unwrap();
+        assert_eq!(
+            (
+                pending.monitor,
+                pending.workspace_idx,
+                pending.column_idx,
+                pending.tab_idx
+            ),
+            (1, 0, 0, 0)
+        );
+        let workspace = &app.workspaces[&2][0];
+        assert!(workspace.is_minimized(200));
+        assert_eq!(workspace.column(0).unwrap().active_tab_idx(), Some(0));
+        assert_eq!(workspace.focused_column_index(), 1);
+        assert_eq!(workspace.focused_window(), Some(300));
     }
 
     #[tokio::test]

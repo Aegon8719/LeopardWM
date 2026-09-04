@@ -91,7 +91,7 @@ pub fn restore_window_no_activate(window_id: WindowId) -> Result<(), Win32Error>
 
 fn restore_window_no_activate_with(
     window_id: WindowId,
-    is_window: impl FnOnce() -> bool,
+    is_window: impl Fn() -> bool,
     is_iconic: impl Fn() -> bool,
     show_window: impl FnOnce(),
 ) -> Result<(), Win32Error> {
@@ -102,6 +102,9 @@ fn restore_window_no_activate_with(
         return Ok(());
     }
     show_window();
+    if !is_window() {
+        return Err(Win32Error::WindowNotFound(window_id));
+    }
     if is_iconic() {
         return Err(Win32Error::SetPositionFailed(format!(
             "Failed to restore minimized window {} without activation",
@@ -315,6 +318,23 @@ mod tests {
     fn restore_without_activation_reports_window_that_stays_minimized() {
         let result = restore_window_no_activate_with(42, || true, || true, || {});
         assert!(matches!(result, Err(Win32Error::SetPositionFailed(_))));
+    }
+
+    #[test]
+    fn restore_without_activation_rejects_window_destroyed_during_restore() {
+        let alive = std::cell::Cell::new(true);
+        let iconic = std::cell::Cell::new(true);
+        let result = restore_window_no_activate_with(
+            42,
+            || alive.get(),
+            || iconic.get(),
+            || {
+                iconic.set(false);
+                alive.set(false);
+            },
+        );
+
+        assert!(matches!(result, Err(Win32Error::WindowNotFound(42))));
     }
 
     #[test]
