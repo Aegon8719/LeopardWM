@@ -7,6 +7,28 @@ use leopardwm_platform_win32::{MonitorId, MonitorInfo};
 use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
+fn apply_reconciled_geometry(
+    workspaces: &mut [Workspace],
+    params: &ScaledLayoutParams,
+    source_viewport_width: i32,
+    destination_viewport_width: i32,
+) {
+    for workspace in workspaces {
+        let old_gap = workspace.gap();
+        let (old_ol, old_or, _, _) = workspace.outer_gaps();
+        params.apply_to(workspace);
+        if workspace.rescale_column_widths(
+            old_gap,
+            old_ol,
+            old_or,
+            source_viewport_width,
+            destination_viewport_width,
+        ) {
+            workspace.ensure_focused_visible(destination_viewport_width);
+        }
+    }
+}
+
 impl AppState {
     /// Reconcile workspaces after monitor configuration change.
     ///
@@ -16,6 +38,19 @@ impl AppState {
     pub(crate) fn reconcile_monitors(&mut self, new_monitors: Vec<MonitorInfo>) {
         let new_ids: HashSet<MonitorId> = new_monitors.iter().map(|m| m.id).collect();
         let old_ids: HashSet<MonitorId> = self.monitors.keys().copied().collect();
+        let old_viewport_widths: HashMap<MonitorId, i32> = self
+            .monitors
+            .iter()
+            .map(|(&id, monitor)| (id, monitor.work_area.width))
+            .collect();
+        let mut source_viewport_widths: HashMap<MonitorId, i32> = new_monitors
+            .iter()
+            .filter_map(|monitor| {
+                old_viewport_widths
+                    .get(&monitor.id)
+                    .map(|&width| (monitor.id, width))
+            })
+            .collect();
 
         // Detect HMONITOR handle changes without physical topology change
         // (e.g., contrast theme switch). Match old→new by device_name and
@@ -44,6 +79,9 @@ impl AppState {
                     remap.len()
                 );
                 for (&old_id, &new_id) in &remap {
+                    if let Some(&source_width) = old_viewport_widths.get(&old_id) {
+                        source_viewport_widths.insert(new_id, source_width);
+                    }
                     if old_id != new_id {
                         if let Some(ws) = self.workspaces.remove(&old_id) {
                             self.workspaces.insert(new_id, ws);
@@ -76,12 +114,16 @@ impl AppState {
                         scale,
                         viewport_width,
                     );
-                    for workspace in ws_vec.iter_mut() {
-                        let old_gap = workspace.gap();
-                        let (old_ol, old_or, _, _) = workspace.outer_gaps();
-                        params.apply_to(workspace);
-                        workspace.rescale_column_widths(old_gap, old_ol, old_or, viewport_width);
-                    }
+                    let source_viewport_width = source_viewport_widths
+                        .get(&monitor_id)
+                        .copied()
+                        .unwrap_or(viewport_width);
+                    apply_reconciled_geometry(
+                        ws_vec,
+                        &params,
+                        source_viewport_width,
+                        viewport_width,
+                    );
                 }
                 return;
             }
@@ -102,9 +144,18 @@ impl AppState {
                 // returning (e.g. it woke from sleep or was re-docked). Restore its
                 // saved layout instead of a fresh one, and pull its windows back off
                 // whatever monitor they were migrated to while it was gone.
-                if let Some((stashed_ws, active_idx)) =
-                    self.stashed_monitor_layouts.remove(&monitor.device_name)
+                if let Some(StashedMonitorLayout {
+                    workspaces: mut stashed_ws,
+                    active_workspace: active_idx,
+                    source_viewport_width,
+                }) = self.stashed_monitor_layouts.remove(&monitor.device_name)
                 {
+                    source_viewport_widths.insert(monitor.id, source_viewport_width);
+                    for workspace in &mut stashed_ws {
+                        workspace.set_centering_mode(self.config.layout.centering_mode.into());
+                        workspace.set_center_past_edges(self.config.layout.center_past_edges);
+                        workspace.ensure_focused_visible(source_viewport_width);
+                    }
                     let returning: HashSet<u64> =
                         stashed_ws.iter().flat_map(|w| w.all_window_ids()).collect();
                     for ws_vec in self.workspaces.values_mut() {
@@ -141,6 +192,9 @@ impl AppState {
                 });
                 if let Some(old_id) = adopt_from {
                     if let Some(ws) = self.workspaces.remove(&old_id) {
+                        if let Some(&source_width) = old_viewport_widths.get(&old_id) {
+                            source_viewport_widths.insert(monitor.id, source_width);
+                        }
                         let idx = self.active_workspace.remove(&old_id).unwrap_or(0);
                         let clamped = idx.min(ws.len().saturating_sub(1));
                         if self.focused_monitor == old_id {
@@ -155,6 +209,7 @@ impl AppState {
                         continue;
                     }
                 }
+                source_viewport_widths.insert(monitor.id, monitor.work_area.width);
                 let params = ScaledLayoutParams::from_config(
                     &self.config.layout,
                     &self.config.appearance,
@@ -188,6 +243,7 @@ impl AppState {
             // The stable device_name and active index, captured before the
             // monitor info is dropped, so a reconnect can restore this layout.
             let device_name = self.monitors.get(removed_id).map(|m| m.device_name.clone());
+            let source_viewport_width = old_viewport_widths[removed_id];
             let active_idx = self.active_workspace.get(removed_id).copied().unwrap_or(0);
             if let Some(old_ws_vec) = self.workspaces.remove(removed_id) {
                 // Collect tiled and floating windows separately to preserve their type
@@ -262,8 +318,14 @@ impl AppState {
                 // primary meanwhile and are pulled back when it returns.
                 if let Some(name) = device_name {
                     if !tiled_window_ids.is_empty() || !floating_windows.is_empty() {
-                        self.stashed_monitor_layouts
-                            .insert(name, (old_ws_vec, active_idx));
+                        self.stashed_monitor_layouts.insert(
+                            name,
+                            StashedMonitorLayout {
+                                workspaces: old_ws_vec,
+                                active_workspace: active_idx,
+                                source_viewport_width,
+                            },
+                        );
                     }
                 }
             }
@@ -295,12 +357,11 @@ impl AppState {
                 viewport_width,
             );
 
-            for workspace in ws_vec.iter_mut() {
-                let old_gap = workspace.gap();
-                let (old_ol, old_or, _, _) = workspace.outer_gaps();
-                params.apply_to(workspace);
-                workspace.rescale_column_widths(old_gap, old_ol, old_or, viewport_width);
-            }
+            let source_viewport_width = source_viewport_widths
+                .get(&monitor_id)
+                .copied()
+                .unwrap_or(viewport_width);
+            apply_reconciled_geometry(ws_vec, &params, source_viewport_width, viewport_width);
         }
 
         // Update focused monitor if it was removed

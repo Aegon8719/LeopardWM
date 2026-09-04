@@ -328,6 +328,12 @@ impl LayoutTransition {
     }
 }
 
+pub(crate) struct StashedMonitorLayout {
+    pub(crate) workspaces: Vec<Workspace>,
+    pub(crate) active_workspace: usize,
+    pub(crate) source_viewport_width: i32,
+}
+
 /// Application state supporting multiple monitors.
 pub(crate) struct AppState {
     /// Per-monitor workspace lists (multiple workspaces per monitor).
@@ -524,7 +530,7 @@ pub(crate) struct AppState {
     /// restored, so a screen powering off overnight or an undock/redock no
     /// longer flattens the layout. Windows are migrated to primary while the
     /// monitor is gone and pulled back on return. Session-only, never persisted.
-    pub(crate) stashed_monitor_layouts: HashMap<String, (Vec<Workspace>, usize)>,
+    pub(crate) stashed_monitor_layouts: HashMap<String, StashedMonitorLayout>,
     /// Tracks when each managed window was added to a workspace. Used to
     /// distinguish transient popups (managed briefly) from real windows
     /// (managed for a long time, e.g., close-to-tray apps).

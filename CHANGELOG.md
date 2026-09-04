@@ -14,6 +14,8 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Fixes
 
+- **Runtime display changes preserve proportional column sizing.** Resolution and work-area
+  changes recalculate column widths against the new viewport and keep the focused column in view.
 - **Activating a minimized tab restores it without stealing focus early.** The tab is restored
   before layout and foreground synchronization, while stale tab-click actions are discarded
   instead of being redirected to a changed workspace or column.

@@ -5154,12 +5154,79 @@ fn test_reconcile_no_change() {
 }
 
 #[test]
+fn test_reconcile_no_change_preserves_manual_scroll() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+    for id in 1..=4 {
+        workspace.insert_window(id, Some(600)).unwrap();
+    }
+    workspace.set_scroll_offset(250.0);
+
+    state.reconcile_monitors(test_monitors());
+
+    assert_eq!(state.workspaces[&1][0].scroll_offset(), 250.0);
+}
+
+#[test]
+fn test_reconcile_stable_monitor_rescales_for_work_area_change() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(945))
+        .unwrap();
+    let mut resized = test_monitors();
+    resized[0].rect.width = 1280;
+    resized[0].work_area.width = 1280;
+
+    state.reconcile_monitors(resized);
+
+    assert_eq!(state.workspaces[&1][0].columns()[0].width(), 625);
+}
+
+#[test]
+fn test_reconcile_shrink_keeps_focused_column_visible() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+    for id in 1..=3 {
+        workspace.insert_window(id, Some(945)).unwrap();
+    }
+    workspace.set_scroll_offset(0.0);
+    let mut resized = test_monitors();
+    resized[0].rect.width = 1280;
+    resized[0].work_area.width = 1280;
+
+    state.reconcile_monitors(resized);
+
+    let placements = state.workspaces[&1][0].compute_placements(Rect::new(0, 0, 1280, 1040));
+    let focused = placements
+        .iter()
+        .find(|placement| placement.window_id == 3)
+        .unwrap();
+    assert!(focused.rect.x >= 0);
+    assert!(focused.rect.x + focused.rect.width <= 1280);
+}
+
+#[test]
 fn test_reconcile_add_monitor() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     assert_eq!(state.workspaces.len(), 1);
     state.reconcile_monitors(two_monitors());
     assert_eq!(state.workspaces.len(), 2);
     assert!(state.workspaces.contains_key(&2));
+}
+
+#[test]
+fn test_reconcile_new_monitor_keeps_destination_default_width() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mut monitors = two_monitors();
+    monitors[1].rect.width = 2560;
+    monitors[1].work_area.width = 2560;
+    state.reconcile_monitors(monitors);
+
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(200, None)
+        .unwrap();
+
+    assert_eq!(state.workspaces[&2][0].columns()[0].width(), 839);
 }
 
 #[test]
@@ -5225,6 +5292,48 @@ fn test_reconcile_restores_stashed_layout_on_monitor_return() {
 }
 
 #[test]
+fn test_reconcile_restores_stash_at_changed_width_and_active_workspace() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    let second_workspace = state.workspaces[&2][0].clone();
+    state.workspaces.get_mut(&2).unwrap().push(second_workspace);
+    state.active_workspace.insert(2, 1);
+    state.workspaces.get_mut(&2).unwrap()[1]
+        .insert_window(100, Some(500))
+        .unwrap();
+
+    state.reconcile_monitors(test_monitors());
+
+    let mut returned = two_monitors();
+    returned[1].id = 99;
+    returned[1].rect.width = 1280;
+    returned[1].work_area.width = 1280;
+    state.reconcile_monitors(returned);
+
+    assert_eq!(state.active_workspace_idx(99), 1);
+    assert_eq!(state.workspaces[&99][1].columns()[0].width(), 329);
+}
+
+#[test]
+fn test_reconcile_restored_stash_uses_current_centering_policy() {
+    let mut config = test_config();
+    config.layout.center_past_edges = true;
+    let mut state = AppState::new_with_config(config.clone(), two_monitors());
+    let workspace = &mut state.workspaces.get_mut(&2).unwrap()[0];
+    workspace.insert_window(100, Some(500)).unwrap();
+    workspace.set_scroll_offset(-100.0);
+
+    state.reconcile_monitors(test_monitors());
+    config.layout.center_past_edges = false;
+    state.apply_config(config);
+
+    let mut returned = two_monitors();
+    returned[1].id = 99;
+    state.reconcile_monitors(returned);
+
+    assert_eq!(state.workspaces[&99][0].scroll_offset(), 0.0);
+}
+
+#[test]
 fn test_reconcile_adopts_layout_on_same_pass_handle_change() {
     // A single reconcile where a monitor's HMONITOR changes AND the count
     // changes (e.g. a dock event) must preserve the layout, not flatten it.
@@ -5263,6 +5372,49 @@ fn test_reconcile_adopts_layout_on_same_pass_handle_change() {
     );
     // Adopted live, so nothing was stashed or flattened onto another monitor.
     assert!(state.stashed_monitor_layouts.is_empty());
+}
+
+#[test]
+fn test_reconcile_adoption_maps_source_width_to_new_monitor_id() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(100, Some(500))
+        .unwrap();
+
+    let mut next = two_monitors();
+    next[1].id = 99;
+    next[1].rect.width = 1280;
+    next[1].work_area.width = 1280;
+    next.push(MonitorInfo {
+        id: 3,
+        rect: Rect::new(3200, 0, 1920, 1080),
+        work_area: Rect::new(3200, 0, 1920, 1040),
+        is_primary: false,
+        device_name: "DISPLAY3".to_string(),
+        scale_factor: 1.0,
+    });
+
+    state.reconcile_monitors(next);
+
+    assert_eq!(state.workspaces[&99][0].columns()[0].width(), 329);
+}
+
+#[test]
+fn test_reconcile_handle_rekey_rescales_changed_width() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(945))
+        .unwrap();
+    let mut rekeyed = test_monitors();
+    rekeyed[0].id = 99;
+    rekeyed[0].rect.width = 1280;
+    rekeyed[0].work_area.width = 1280;
+
+    state.reconcile_monitors(rekeyed);
+
+    assert!(!state.workspaces.contains_key(&1));
+    assert_eq!(state.workspaces[&99][0].columns()[0].width(), 625);
+    assert_eq!(state.focused_monitor, 99);
 }
 
 #[test]

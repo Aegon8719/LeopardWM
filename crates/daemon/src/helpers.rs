@@ -200,12 +200,17 @@ impl AppState {
                 let (old_ol, old_or, _, _) = workspace.outer_gaps();
 
                 params.apply_to(workspace);
-
-                // Rescale column widths to preserve fractions under new gap values
-                workspace.rescale_column_widths(old_gap, old_ol, old_or, viewport_width);
-
                 workspace.set_centering_mode(self.config.layout.centering_mode.into());
                 workspace.set_center_past_edges(self.config.layout.center_past_edges);
+
+                // Rescale column widths to preserve fractions under new gap values
+                workspace.rescale_column_widths(
+                    old_gap,
+                    old_ol,
+                    old_or,
+                    viewport_width,
+                    viewport_width,
+                );
                 workspace.set_scroll_animation(
                     self.config.animation.scroll_duration_ms,
                     self.config.animation.easing,

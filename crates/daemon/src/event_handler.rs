@@ -916,16 +916,17 @@ impl AppState {
             leopardwm_platform_win32::clear_suspected_oversize(hwnd);
             // Scrub a window that dies while its monitor is stashed (disconnected),
             // so it isn't resurrected as a ghost column when the monitor returns.
-            for (ws_vec, _) in self.stashed_monitor_layouts.values_mut() {
-                for ws in ws_vec.iter_mut() {
+            for layout in self.stashed_monitor_layouts.values_mut() {
+                for ws in &mut layout.workspaces {
                     let _ = ws.remove_window(hwnd);
                     ws.remove_floating(hwnd);
                 }
             }
             // Drop a stash emptied by window deaths so the map stays bounded when
             // a disconnected monitor never returns.
-            self.stashed_monitor_layouts.retain(|_, (ws_vec, _)| {
-                ws_vec
+            self.stashed_monitor_layouts.retain(|_, layout| {
+                layout
+                    .workspaces
                     .iter()
                     .any(|ws| ws.window_count() > 0 || !ws.floating_windows().is_empty())
             });

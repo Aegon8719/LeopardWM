@@ -2477,6 +2477,101 @@ mod tests {
     }
 
     #[test]
+    fn test_rescale_column_widths_for_viewport_change() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.insert_window(1, Some(945)).unwrap();
+
+        assert!(ws.rescale_column_widths(10, 10, 10, 1920, 1280));
+        assert_eq!(ws.columns()[0].width(), 625);
+
+        assert!(ws.rescale_column_widths(10, 10, 10, 1280, 1920));
+        assert_eq!(ws.columns()[0].width(), 945);
+    }
+
+    #[test]
+    fn test_rescale_column_widths_round_trip_tolerates_rounding() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.insert_window(1, Some(626)).unwrap();
+        let original = ws.columns()[0].width();
+
+        ws.rescale_column_widths(10, 10, 10, 1920, 1365);
+        ws.rescale_column_widths(10, 10, 10, 1365, 1920);
+
+        assert!((ws.columns()[0].width() - original).abs() <= 1);
+    }
+
+    #[test]
+    fn test_rescale_column_widths_combines_viewport_and_gap_changes() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.insert_window(1, Some(945)).unwrap();
+        ws.set_gap(20);
+        ws.set_outer_gaps(20, 20, 10, 10);
+
+        assert!(ws.rescale_column_widths(10, 10, 10, 1920, 1280));
+        assert_eq!(ws.columns()[0].width(), 610);
+    }
+
+    #[test]
+    fn test_rescale_column_widths_noop_preserves_scroll_animation() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        for id in 1..=4 {
+            ws.insert_window(id, Some(400)).unwrap();
+        }
+        ws.set_scroll_offset(100.0);
+        ws.start_scroll_animation(500.0, 800, Some(100), Some(Easing::Linear));
+        ws.tick_animation(50);
+        let effective_before = ws.effective_scroll_offset();
+        let stored_before = ws.scroll_offset();
+
+        assert!(!ws.rescale_column_widths(10, 10, 10, 800, 800));
+        assert!(ws.is_animating());
+        assert_eq!(ws.scroll_offset(), stored_before);
+        assert!((ws.effective_scroll_offset() - effective_before).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_rescale_column_widths_clamps_minimum_and_scroll() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.insert_window(1, Some(100)).unwrap();
+        ws.insert_window(2, Some(100)).unwrap();
+        ws.set_scroll_offset(1000.0);
+
+        assert!(ws.rescale_column_widths(10, 10, 10, 1920, 500));
+        assert_eq!(ws.columns()[0].width(), MIN_COLUMN_WIDTH);
+        assert_eq!(ws.columns()[1].width(), MIN_COLUMN_WIDTH);
+        assert_eq!(ws.scroll_offset(), 0.0);
+    }
+
+    #[test]
+    fn test_rescale_column_widths_preserves_maximized_restore_fraction() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.insert_window(1, Some(600)).unwrap();
+        assert!(ws.toggle_maximize_column(1920));
+        assert_eq!(ws.columns()[0].width(), 1900);
+
+        assert!(ws.rescale_column_widths(10, 10, 10, 1920, 1280));
+        assert_eq!(ws.columns()[0].width(), 1260);
+
+        assert!(!ws.toggle_maximize_column(1280));
+        assert_eq!(ws.columns()[0].width(), 396);
+    }
+
+    #[test]
+    fn test_rescale_column_widths_cancels_animation_at_current_position() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        for id in 1..=3 {
+            ws.insert_window(id, Some(400)).unwrap();
+        }
+        ws.start_scroll_animation(700.0, 500, Some(100), Some(Easing::Linear));
+        ws.tick_animation(50);
+        let current = ws.effective_scroll_offset();
+
+        assert!(ws.rescale_column_widths(10, 10, 10, 500, 300));
+        assert!(!ws.is_animating());
+        assert!((ws.scroll_offset() - current).abs() < 1.0);
+    }
+
+    #[test]
     fn test_unfloat_nonexistent() {
         let mut ws = Workspace::new();
         assert!(!ws.unfloat_window(999));
