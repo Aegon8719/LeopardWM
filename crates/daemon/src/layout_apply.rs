@@ -3,11 +3,20 @@
 use crate::animation_worker;
 use crate::state::*;
 use anyhow::{anyhow, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
 
 const MAX_TIMEOUT_DIAGNOSTIC_CHARS: usize = 256;
+
+fn effective_column_widths(
+    workspace: &leopardwm_core_layout::Workspace,
+) -> impl Iterator<Item = i32> + '_ {
+    workspace
+        .columns()
+        .iter()
+        .map(|column| workspace.effective_column_width(column))
+}
 
 pub(crate) fn should_dispatch_visible_tiled_placement(
     maximized: bool,
@@ -371,11 +380,7 @@ impl AppState {
         // matching the invariant maintained by apply_layout. Without this, a
         // composition change occurring during an active animation would leave
         // stale per-sibling constraints in effect for the remaining frames.
-        for ws_vec in self.workspaces.values_mut() {
-            for ws in ws_vec.iter_mut() {
-                ws.commit_pending_min_size_clears();
-            }
-        }
+        self.commit_pending_min_size_clears();
         let mut all_placements = Vec::new();
         for (monitor_id, ws_vec) in &self.workspaces {
             let idx = self.active_workspace_idx(*monitor_id);
@@ -511,11 +516,7 @@ impl AppState {
         // composition changes (add_window / insert_at / remove_window). Done
         // here rather than eagerly at the mutation site so that a timed-out /
         // paused apply path cannot leave constraints cleared indefinitely.
-        for ws_vec in self.workspaces.values_mut() {
-            for ws in ws_vec.iter_mut() {
-                ws.commit_pending_min_size_clears();
-            }
-        }
+        self.commit_pending_min_size_clears();
 
         let mut all_placements = self.collect_apply_placements();
 
@@ -924,14 +925,54 @@ impl AppState {
         }
     }
 
-    /// Feed worker-reported size violations back to the layout engine; returns whether constraints changed.
+    fn commit_pending_min_size_clears(&mut self) {
+        self.clear_min_size_constraints(|workspace| {
+            workspace.commit_pending_min_size_clears();
+        });
+    }
+
+    pub(crate) fn clear_min_size_constraints(
+        &mut self,
+        clear: impl Fn(&mut leopardwm_core_layout::Workspace),
+    ) {
+        let monitor_ids: Vec<_> = self.workspaces.keys().copied().collect();
+        let structural_transition_active = self.layout_transition.is_some();
+        for monitor_id in monitor_ids {
+            let viewport_width = self.viewport_width_for(monitor_id);
+            let active_idx = self.active_workspace_idx(monitor_id);
+            for (idx, workspace) in self
+                .workspaces
+                .get_mut(&monitor_id)
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
+                if idx != active_idx {
+                    clear(workspace);
+                    continue;
+                }
+                let before: Vec<_> = effective_column_widths(workspace).collect();
+                clear(workspace);
+                if !effective_column_widths(workspace).eq(before) {
+                    if workspace.is_animating() || structural_transition_active {
+                        workspace.ensure_focused_visible_animated(viewport_width);
+                    } else {
+                        workspace.ensure_focused_visible(viewport_width);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Feed worker-reported size violations back to the layout engine.
+    /// Requests correction for changed effective widths or any accepted height feedback.
     pub(crate) fn propagate_size_violations(
         &mut self,
         width_violations: &[leopardwm_platform_win32::WidthViolation],
         height_violations: &[leopardwm_platform_win32::HeightViolation],
     ) -> bool {
         let mut constraints_changed = false;
-        let mut accepted_width_workspaces = HashSet::new();
+        let mut prior_widths = HashMap::new();
 
         for violation in width_violations {
             let Some((monitor_id, workspace_idx)) = self.find_window_workspace(violation.window_id)
@@ -956,14 +997,15 @@ impl AppState {
                 .get_mut(&monitor_id)
                 .and_then(|workspaces| workspaces.get_mut(workspace_idx))
             {
+                prior_widths
+                    .entry((monitor_id, workspace_idx))
+                    .or_insert_with(|| effective_column_widths(workspace).collect::<Vec<_>>());
                 workspace.set_window_min_width(violation.window_id, violation.min_width);
-                accepted_width_workspaces.insert((monitor_id, workspace_idx));
-                constraints_changed = true;
             }
         }
 
         let structural_transition_active = self.layout_transition.is_some();
-        for (monitor_id, workspace_idx) in accepted_width_workspaces {
+        for ((monitor_id, workspace_idx), before) in prior_widths {
             let viewport_width = self.viewport_width_for(monitor_id);
             let is_active_workspace = self.active_workspace_idx(monitor_id) == workspace_idx;
             let Some(workspace) = self
@@ -973,7 +1015,7 @@ impl AppState {
             else {
                 continue;
             };
-            if !workspace.apply_min_width_constraints() {
+            if effective_column_widths(workspace).eq(before) {
                 continue;
             }
             constraints_changed = true;

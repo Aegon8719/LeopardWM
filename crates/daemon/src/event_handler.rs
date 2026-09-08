@@ -1365,6 +1365,15 @@ impl AppState {
         old_placements.retain(|(wid, _)| !self.is_application_fullscreen(*wid));
 
         self.active_workspace.insert(monitor_id, ws_idx);
+        let viewport_width = self.viewport_width_for(monitor_id);
+        if let Some(workspace) = self
+            .workspaces
+            .get_mut(&monitor_id)
+            .and_then(|v| v.get_mut(ws_idx))
+        {
+            workspace.commit_pending_min_size_clears();
+            workspace.reconcile_scroll_bounds(viewport_width);
+        }
 
         // Compute new workspace's final placements for enter animation.
         let mut new_placements: Vec<(u64, leopardwm_core_layout::Rect)> = self

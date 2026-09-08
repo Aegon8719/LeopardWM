@@ -1109,6 +1109,12 @@ impl AppState {
         // now-active workspace.
         self.rehome_sticky_windows();
 
+        let viewport_width = self.viewport_width_for(monitor);
+        if let Some(workspace) = self.focused_workspace_mut() {
+            workspace.commit_pending_min_size_clears();
+            workspace.reconcile_scroll_bounds(viewport_width);
+        }
+
         // Compute new workspace's final placements.
         let mut new_placements = self.workspace_placements(monitor, idx);
 

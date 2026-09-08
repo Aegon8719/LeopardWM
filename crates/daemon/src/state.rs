@@ -1007,7 +1007,7 @@ impl AppState {
             ws.focused_column_index().hash(&mut hasher);
             ws.columns().len().hash(&mut hasher);
             for col in ws.columns() {
-                col.width().hash(&mut hasher);
+                ws.effective_column_width(col).hash(&mut hasher);
                 col.windows().len().hash(&mut hasher);
                 for &w in col.windows() {
                     w.hash(&mut hasher);
@@ -1046,7 +1046,7 @@ impl AppState {
                     .iter()
                     .map(|col| leopardwm_ipc::ColumnSummary {
                         window_ids: col.windows().to_vec(),
-                        width_px: col.width(),
+                        width_px: ws.effective_column_width(col),
                         height_weights: col.height_weights().to_vec(),
                         mode: match col.mode() {
                             leopardwm_core_layout::ColumnMode::Vertical => {
@@ -1241,14 +1241,12 @@ impl AppState {
     }
 
     pub(crate) fn invalidate_display_change_constraints(&mut self, needs_full: bool) {
-        for workspaces in self.workspaces.values_mut() {
-            for workspace in workspaces {
-                if needs_full {
-                    workspace.clear_all_min_widths();
-                }
-                workspace.clear_all_min_heights();
+        self.clear_min_size_constraints(|workspace| {
+            if needs_full {
+                workspace.clear_all_min_widths();
             }
-        }
+            workspace.clear_all_min_heights();
+        });
     }
 
     /// Get the focused monitor's viewport.

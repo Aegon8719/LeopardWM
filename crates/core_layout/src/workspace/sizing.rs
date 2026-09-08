@@ -38,6 +38,11 @@ impl Workspace {
             .unwrap_or(0)
     }
 
+    /// Native minima affect strip geometry, never the requested/persisted width.
+    pub fn effective_column_width(&self, column: &Column) -> i32 {
+        column.width.max(self.column_effective_min_width(column))
+    }
+
     // ========================================================================
     // Minimum Height Methods
     // ========================================================================
@@ -77,31 +82,6 @@ impl Workspace {
             self.window_min_heights.remove(&wid);
         }
         true
-    }
-
-    /// Adjust stored column widths to respect known min-width constraints.
-    /// Columns containing min-width windows are widened to their minimum.
-    /// Flexible columns keep their original widths — the total strip may grow,
-    /// which is correct for a scroll-first tiling WM.  (Earlier versions
-    /// shrunk flexible columns proportionally, but that caused cumulative
-    /// narrowing on display/theme changes.)
-    /// Returns `true` if any column was resized.
-    pub fn apply_min_width_constraints(&mut self) -> bool {
-        if self.window_min_widths.is_empty() {
-            return false;
-        }
-        let mut changed = false;
-        for col_idx in 0..self.columns.len() {
-            if !self.is_column_active(&self.columns[col_idx]) {
-                continue;
-            }
-            let min_w = self.column_effective_min_width(&self.columns[col_idx]);
-            if min_w > self.columns[col_idx].width {
-                self.columns[col_idx].width = min_w;
-                changed = true;
-            }
-        }
-        changed
     }
 
     // ========================================================================
@@ -308,13 +288,14 @@ impl Workspace {
         }
         let base = self.width_base(viewport_width);
         let gap = self.gap.max(0);
-        let Some(column) = self.columns.get_mut(self.focused_column) else {
+        let Some(column) = self.columns.get(self.focused_column) else {
             return;
         };
         if base <= 0 {
             return;
         }
-        let current_frac = (column.width + gap) as f64 / base as f64;
+        let current_frac =
+            self.effective_column_width(column).saturating_add(gap) as f64 / base as f64;
 
         let mut sorted = presets.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -323,7 +304,7 @@ impl Workspace {
         let target = sorted.iter().find(|&&p| p > current_frac + TOLERANCE);
         if let Some(&frac) = target {
             let new_width = (base as f64 * frac - gap as f64).floor() as i32;
-            column.set_width(new_width);
+            self.columns[self.focused_column].set_width(new_width);
         }
     }
 
@@ -335,13 +316,14 @@ impl Workspace {
         }
         let base = self.width_base(viewport_width);
         let gap = self.gap.max(0);
-        let Some(column) = self.columns.get_mut(self.focused_column) else {
+        let Some(column) = self.columns.get(self.focused_column) else {
             return;
         };
         if base <= 0 {
             return;
         }
-        let current_frac = (column.width + gap) as f64 / base as f64;
+        let current_frac =
+            self.effective_column_width(column).saturating_add(gap) as f64 / base as f64;
 
         let mut sorted = presets.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -350,7 +332,7 @@ impl Workspace {
         let target = sorted.iter().rev().find(|&&p| p < current_frac - TOLERANCE);
         if let Some(&frac) = target {
             let new_width = (base as f64 * frac - gap as f64).floor() as i32;
-            column.set_width(new_width);
+            self.columns[self.focused_column].set_width(new_width);
         }
     }
 

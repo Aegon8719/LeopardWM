@@ -641,8 +641,9 @@ mod tests {
 
             assert_eq!(ws.visible_width(viewport.width), 800);
             ws.set_window_min_width(3, 900);
-            assert!(ws.apply_min_width_constraints());
-            assert_eq!(ws.columns()[2].width(), 900);
+            assert_eq!(ws.columns()[2].width(), 300);
+            assert_eq!(ws.effective_column_width(&ws.columns()[2]), 900);
+            assert_eq!(ws.total_width(), 1700);
             assert_eq!(
                 ws.compute_placements(viewport)[2].visibility,
                 Visibility::OffScreenRight,
@@ -2032,8 +2033,7 @@ mod tests {
         // Column width should remain at the original value, not inflated
         assert_eq!(ws.columns()[0].width(), 400);
 
-        // apply_min_width_constraints should not widen anything
-        assert!(!ws.apply_min_width_constraints());
+        assert_eq!(ws.effective_column_width(&ws.columns()[0]), 400);
     }
 
     #[test]
@@ -2474,6 +2474,309 @@ mod tests {
     fn test_equalize_widths_empty() {
         let mut ws = Workspace::new();
         ws.equalize_column_widths(1920); // Should not panic
+    }
+
+    #[test]
+    fn test_native_minimum_geometry_agrees_across_placement_and_focus_paths() {
+        for mode in [
+            CenteringMode::Center,
+            CenteringMode::JustInView,
+            CenteringMode::OnOverflow,
+        ] {
+            let mut ws = Workspace::with_gaps(10, 10);
+            ws.set_centering_mode(mode);
+            ws.insert_window(1, Some(467)).unwrap();
+            ws.insert_window(2, Some(467)).unwrap();
+            ws.insert_window(3, Some(467)).unwrap();
+            ws.set_window_min_width(2, 842);
+            assert_eq!(ws.total_width(), 1796);
+            let full = ws.placements_for_full_strip(Rect::new(0, 0, 1816, 600));
+            assert_eq!(
+                full.iter()
+                    .map(|p| (p.rect.x, p.rect.width))
+                    .collect::<Vec<_>>(),
+                vec![(10, 467), (487, 842), (1339, 467)]
+            );
+            ws.focus_window(2).unwrap();
+            let viewport = Rect::new(0, 0, 1000, 600);
+            ws.ensure_focused_visible(viewport.width);
+            let placements = ws.compute_placements(viewport);
+            assert!(placements[1].rect.x >= 10);
+            assert!(placements[1].rect.x + placements[1].rect.width <= 990);
+            assert_eq!(
+                ws.compute_placements_animated(viewport)
+                    .iter()
+                    .map(|p| (p.window_id, p.rect))
+                    .collect::<Vec<_>>(),
+                placements
+                    .iter()
+                    .map(|p| (p.window_id, p.rect))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(ws.columns()[1].width(), 467);
+        }
+    }
+
+    #[test]
+    fn test_native_minimum_clear_retargets_scroll_when_current_focus_already_fits() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.set_centering_mode(CenteringMode::JustInView);
+        ws.insert_window(1, Some(467)).unwrap();
+        ws.insert_window(2, Some(467)).unwrap();
+        ws.insert_window(3, Some(467)).unwrap();
+        ws.focus_window(2).unwrap();
+        ws.set_window_min_width(3, 842);
+        ws.set_scroll_offset(100.0);
+        ws.start_scroll_animation(816.0, 1000, Some(1000), None);
+        ws.tick_animation(10);
+        let current = ws.effective_scroll_offset();
+        ws.clear_window_min_width(3);
+        ws.ensure_focused_visible_animated(1000);
+        assert!((ws.effective_scroll_offset() - current).abs() < 0.5);
+        ws.tick_animation(1000);
+        assert_eq!(ws.scroll_offset(), 441.0);
+    }
+
+    #[test]
+    fn test_native_minimum_clear_keeps_animated_centering_past_edges() {
+        for reduce_motion in [false, true] {
+            let mut ws = Workspace::with_gaps(10, 10);
+            ws.set_centering_mode(CenteringMode::Center);
+            ws.set_center_past_edges(true);
+            ws.set_reduce_motion(reduce_motion);
+            ws.insert_window(1, Some(467)).unwrap();
+            ws.insert_window(2, Some(1000)).unwrap();
+            ws.focus_window(1).unwrap();
+            ws.set_window_min_width(1, 842);
+            ws.ensure_focused_visible(1000);
+            assert_eq!(ws.scroll_offset(), -69.0);
+            ws.clear_window_min_width(1);
+            ws.ensure_focused_visible_animated(1000);
+            assert_eq!(
+                ws.effective_scroll_offset(),
+                if reduce_motion { -257.0 } else { -69.0 }
+            );
+            ws.tick_animation(1000);
+            assert_eq!(ws.scroll_offset(), -257.0);
+        }
+    }
+
+    #[test]
+    fn test_native_minimum_clear_preserves_explicit_centering() {
+        for mode in [CenteringMode::JustInView, CenteringMode::OnOverflow] {
+            for reduce_motion in [false, true] {
+                let mut ws = Workspace::with_gaps(10, 10);
+                ws.set_centering_mode(mode);
+                ws.set_center_past_edges(true);
+                ws.set_reduce_motion(false);
+                ws.insert_window(1, Some(467)).unwrap();
+                ws.insert_window(2, Some(1000)).unwrap();
+                ws.focus_window(1).unwrap();
+                ws.set_window_min_width(1, 842);
+                ws.center_focused_column_animated(1000);
+                ws.tick_animation(10);
+                let before = ws.effective_scroll_offset();
+                ws.clear_window_min_width(1);
+                ws.set_reduce_motion(reduce_motion);
+                ws.ensure_focused_visible_animated(1000);
+                if !reduce_motion {
+                    assert_eq!(ws.effective_scroll_offset(), before);
+                }
+                ws.tick_animation(1000);
+                assert_eq!(ws.scroll_offset(), -69.0, "{mode:?}, {reduce_motion}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_reconcile_scroll_bounds_preserves_valid_scroll_and_animation() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.set_centering_mode(CenteringMode::Center);
+        for id in [1, 2, 3] {
+            ws.insert_window(id, Some(800)).unwrap();
+        }
+        ws.set_scroll_offset(137.0);
+        ws.reconcile_scroll_bounds(1920);
+        assert_eq!(ws.scroll_offset(), 137.0);
+        ws.start_scroll_animation(400.0, 1920, Some(1000), Some(Easing::Linear));
+        ws.tick_animation(100);
+        let mut expected = ws.clone();
+        ws.reconcile_scroll_bounds(1920);
+        assert!(ws.is_animating());
+        assert_eq!(
+            ws.effective_scroll_offset(),
+            expected.effective_scroll_offset()
+        );
+        ws.tick_animation(100);
+        expected.tick_animation(100);
+        assert_eq!(
+            ws.effective_scroll_offset(),
+            expected.effective_scroll_offset()
+        );
+    }
+
+    #[test]
+    fn test_reconcile_scroll_bounds_cancels_invalid_current_or_target() {
+        for (current, target) in [(1220.0, 300.0), (100.0, 1220.0)] {
+            let mut ws = Workspace::with_gaps(10, 10);
+            ws.set_center_past_edges(false);
+            for id in [1, 2, 3] {
+                ws.insert_window(id, Some(800)).unwrap();
+            }
+            ws.set_window_min_width(3, 1500);
+            ws.set_scroll_offset(current);
+            ws.start_scroll_animation(target, 1920, Some(1000), Some(Easing::Linear));
+            ws.tick_animation(10);
+            let expected = ws.effective_scroll_offset().clamp(0.0, 520.0);
+            ws.clear_window_min_width(3);
+            ws.reconcile_scroll_bounds(1920);
+            assert!(!ws.is_animating());
+            assert_eq!(ws.scroll_offset(), expected);
+            ws.tick_animation(1000);
+            assert_eq!(ws.scroll_offset(), expected);
+        }
+    }
+
+    #[test]
+    fn test_reconcile_scroll_bounds_honors_effective_edge_centering() {
+        for (focused, centered) in [(2, -450.0), (4, 1620.0)] {
+            for animated in [false, true] {
+                for allow_edges in [false, true] {
+                    let mut ws = Workspace::with_gaps(10, 10);
+                    ws.set_center_past_edges(true);
+                    ws.set_reduce_motion(!animated);
+                    for id in 1..=5 {
+                        ws.insert_window(id, Some(if id == 1 || id == 5 { 5000 } else { 800 }))
+                            .unwrap();
+                    }
+                    ws.mark_minimized(1);
+                    ws.mark_minimized(5);
+                    ws.set_window_min_width(2, 1000);
+                    ws.set_window_min_width(4, 1500);
+                    ws.focus_window(focused).unwrap();
+                    ws.center_focused_column_animated(1920);
+                    if animated {
+                        ws.tick_animation(10);
+                    }
+                    let current = ws.effective_scroll_offset();
+                    ws.set_center_past_edges(allow_edges);
+                    ws.reconcile_scroll_bounds(1920);
+                    if allow_edges {
+                        assert_eq!(ws.is_animating(), animated);
+                        assert_eq!(ws.effective_scroll_offset(), current);
+                    } else {
+                        assert!(!ws.is_animating());
+                        assert_eq!(ws.scroll_offset(), current.clamp(0.0, 1420.0));
+                    }
+                    ws.tick_animation(1000);
+                    assert_eq!(
+                        ws.scroll_offset(),
+                        if allow_edges {
+                            centered
+                        } else {
+                            current.clamp(0.0, 1420.0)
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_reconcile_scroll_bounds_empty_or_minimized_strip() {
+        for minimized in [false, true] {
+            let mut ws = Workspace::with_gaps(10, 10);
+            ws.set_center_past_edges(true);
+            if minimized {
+                ws.insert_window(1, Some(800)).unwrap();
+                ws.mark_minimized(1);
+            }
+            ws.set_scroll_offset(100.0);
+            ws.reconcile_scroll_bounds(1920);
+            assert_eq!(ws.scroll_offset(), 0.0);
+            assert!(!ws.is_animating());
+        }
+    }
+
+    #[test]
+    fn test_native_minimum_resize_uses_effective_baseline_except_zero() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.insert_window(1, Some(467)).unwrap();
+        ws.set_window_min_width(1, 842);
+        ws.set_window_min_height(1, 700);
+        ws.resize_focused_column(0);
+        assert_eq!(ws.columns()[0].width(), 467);
+        assert_eq!(ws.window_min_widths.get(&1), Some(&842));
+        assert_eq!(ws.window_min_heights.get(&1), Some(&700));
+        for (delta, expected) in [(10, 852), (-10, 832), (i32::MIN, MIN_COLUMN_WIDTH)] {
+            let mut resized = ws.clone();
+            resized.resize_focused_column(delta);
+            assert_eq!(resized.columns()[0].width(), expected);
+            assert!(resized.window_min_widths.is_empty());
+            assert!(resized.window_min_heights.is_empty());
+        }
+        ws.toggle_maximize_column(1920);
+        ws.resize_focused_column(0);
+        assert!(!ws.toggle_maximize_column(1920));
+        assert_eq!(ws.columns()[0].width(), 467);
+    }
+
+    #[test]
+    fn test_native_minimum_presets_and_maximized_restore_keep_requested_intent() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.insert_window(1, Some(467)).unwrap();
+        ws.set_window_min_width(1, 842);
+        let presets = [0.25, 0.5, 0.75];
+        ws.cycle_width_up(&presets, 1000);
+        assert_eq!(
+            ws.columns()[0].width(),
+            467,
+            "no upward preset above the effective width"
+        );
+        ws.cycle_width_down(&presets, 1000);
+        assert_eq!(ws.columns()[0].width(), 732);
+        assert_eq!(ws.effective_column_width(&ws.columns()[0]), 842);
+        ws.set_focused_column_width_fraction(0.25, 1000);
+        assert_eq!(ws.columns()[0].width(), 237);
+        assert_eq!(ws.effective_column_width(&ws.columns()[0]), 842);
+        ws.snap_column_width_to_preset(0, 850, &presets, 1920);
+        assert_eq!(ws.columns()[0].width(), 945);
+        assert!(ws.window_min_widths.is_empty());
+
+        ws.set_all_column_widths(1267);
+        ws.set_window_min_width(1, 1500);
+        assert!(ws.toggle_maximize_column(5120));
+        ws.rescale_column_widths(10, 10, 10, 5120, 2560);
+        assert!(!ws.toggle_maximize_column(2560));
+        assert_eq!(ws.columns()[0].width(), 627);
+        assert_eq!(ws.effective_column_width(&ws.columns()[0]), 1500);
+        ws.equalize_column_widths(1000);
+        assert_eq!(ws.columns()[0].width(), 980);
+        assert!(ws.window_min_widths.is_empty());
+    }
+
+    #[test]
+    fn test_native_minimum_lifecycle_preserves_requests_and_serialization() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.insert_window(1, Some(467)).unwrap();
+        ws.insert_window_in_column(2, 0).unwrap();
+        ws.commit_pending_min_size_clears();
+        ws.set_window_min_width(1, 842);
+        ws.set_window_min_width(2, 700);
+        let saved = serde_json::to_value(&ws).unwrap();
+        assert_eq!(saved["columns"][0]["width"], 467);
+        assert!(saved.get("window_min_widths").is_none());
+        let restored: Workspace = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.effective_column_width(&restored.columns()[0]), 467);
+        assert!(ws.mark_minimized(1));
+        assert_eq!(ws.effective_column_width(&ws.columns()[0]), 467);
+        assert!(ws.mark_restored(1));
+        assert_eq!(ws.effective_column_width(&ws.columns()[0]), 467);
+        ws.set_window_min_width(1, 842);
+        ws.insert_window_in_column(3, 0).unwrap();
+        assert_eq!(ws.effective_column_width(&ws.columns()[0]), 842);
+        assert!(ws.commit_pending_min_size_clears());
+        assert_eq!(ws.effective_column_width(&ws.columns()[0]), 467);
     }
 
     #[test]
@@ -4121,6 +4424,8 @@ mod tests {
         }"#;
         let ws: Workspace = serde_json::from_str(legacy).unwrap();
         assert!(matches!(ws.columns[0].mode(), ColumnMode::Vertical));
+        assert_eq!(ws.columns()[0].width(), 800);
+        assert_eq!(ws.effective_column_width(&ws.columns()[0]), 800);
     }
 
     #[test]

@@ -23,7 +23,9 @@ impl Workspace {
             if skip_minimized && !self.is_column_active(col) {
                 continue;
             }
-            x = x.saturating_add(col.width).saturating_add(gap);
+            x = x
+                .saturating_add(self.effective_column_width(col))
+                .saturating_add(gap);
         }
         x
     }
@@ -32,7 +34,7 @@ impl Workspace {
     fn focused_column_bounds(&self) -> Option<(i32, i32)> {
         self.columns.get(self.focused_column).map(|col| {
             let x = self.column_x(self.focused_column);
-            (x, col.width)
+            (x, self.effective_column_width(col))
         })
     }
 
@@ -96,10 +98,14 @@ impl Workspace {
 
     /// Resize the focused column by a delta amount.
     pub fn resize_focused_column(&mut self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
         self.maximized_column = None;
-        if let Some(column) = self.columns.get_mut(self.focused_column) {
-            let new_width = column.width.saturating_add(delta).max(MIN_COLUMN_WIDTH);
-            column.width = new_width;
+        if let Some(column) = self.columns.get(self.focused_column) {
+            let new_width = self.effective_column_width(column).saturating_add(delta);
+            let column = &mut self.columns[self.focused_column];
+            column.set_width(new_width);
             // Clear cached min-widths and min-heights so constraints will be
             // re-detected from the actual window size on the next apply cycle.
             for wid in column.windows() {
@@ -416,6 +422,40 @@ impl Workspace {
         self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll as f64);
     }
 
+    /// Repair bounds without revealing focus; preserve valid animations and edge centering.
+    pub fn reconcile_scroll_bounds(&mut self, viewport_width: i32) {
+        let vis_w = self.visible_width(viewport_width);
+        let mut min_scroll = 0.0_f64;
+        let mut max_scroll = (self.total_width() - vis_w).max(0) as f64;
+        if self.center_past_edges {
+            let mut active = self
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| self.is_column_active(column));
+            if let Some((first_idx, first)) = active.next() {
+                let (last_idx, last) = active.next_back().unwrap_or((first_idx, first));
+                let first_center = self.effective_column_width(first) / 2;
+                let last_center = self
+                    .column_x(last_idx)
+                    .saturating_add(self.effective_column_width(last) / 2);
+                min_scroll = min_scroll.min(first_center.saturating_sub(vis_w / 2) as f64);
+                max_scroll = max_scroll.max(last_center.saturating_sub(vis_w / 2) as f64);
+            }
+        }
+        let current = self.effective_scroll_offset();
+        let target = self
+            .active_animation
+            .as_ref()
+            .map_or(current, |anim| anim.target());
+        let bounds = min_scroll..=max_scroll;
+        if bounds.contains(&current) && bounds.contains(&target) {
+            return;
+        }
+        self.cancel_animation();
+        self.scroll_offset = self.scroll_offset.clamp(min_scroll, max_scroll);
+    }
+
     // ========================================================================
     // Animation Methods
     // ========================================================================
@@ -447,13 +487,16 @@ impl Workspace {
         let vis_w = self.visible_width(viewport_width);
         let max_scroll = (self.total_width() - vis_w).max(0);
         let clamped_target = target.clamp(0.0, max_scroll as f64);
+        self.animate_scroll_to(clamped_target, duration_ms, easing);
+    }
 
+    fn animate_scroll_to(&mut self, target: f64, duration_ms: Option<u64>, easing: Option<Easing>) {
         // Use current effective position as start (handles interrupting animations)
         let start = self.effective_scroll_offset();
 
         // If already at target, no animation needed
-        if (start - clamped_target).abs() < 0.5 {
-            self.scroll_offset = clamped_target;
+        if (start - target).abs() < 0.5 {
+            self.scroll_offset = target;
             self.active_animation = None;
             return;
         }
@@ -463,7 +506,7 @@ impl Workspace {
         let duration = duration_ms.unwrap_or(self.scroll_duration_ms);
         let ease = easing.unwrap_or(self.scroll_easing);
 
-        self.active_animation = Some(ScrollAnimation::new(start, clamped_target, duration, ease));
+        self.active_animation = Some(ScrollAnimation::new(start, target, duration, ease));
     }
 
     /// Advance the active animation by the given delta time in milliseconds.
@@ -522,7 +565,11 @@ impl Workspace {
             let col_center = col_x.saturating_add(col_width / 2);
             (col_center.saturating_sub(vis_w / 2)) as f64
         } else {
-            let current = self.effective_scroll_offset();
+            // Reveal must remain valid at landing, not only at the interpolated position.
+            let current = self
+                .active_animation
+                .as_ref()
+                .map_or(self.scroll_offset, |anim| anim.target());
             let scroll_left = current.round() as i32;
             let scroll_right = scroll_left.saturating_add(vis_w);
             let col_right = col_x.saturating_add(col_width);
@@ -533,7 +580,7 @@ impl Workspace {
                 col_right.saturating_sub(vis_w) as f64
             } else {
                 let max_scroll = (self.total_width() - vis_w).max(0) as f64;
-                if current < -0.5 {
+                if current < -0.5 && !self.center_past_edges {
                     0.0
                 } else if current > max_scroll + 0.5 {
                     max_scroll
@@ -543,7 +590,13 @@ impl Workspace {
             }
         };
 
-        self.start_scroll_animation(target_offset, viewport_width, None, None);
+        let max_scroll = (self.total_width() - vis_w).max(0) as f64;
+        let target = if self.center_past_edges {
+            target_offset.min(max_scroll)
+        } else {
+            target_offset.clamp(0.0, max_scroll)
+        };
+        self.animate_scroll_to(target, None, None);
     }
 
     /// Center the focused column in the viewport, regardless of centering mode.
@@ -570,19 +623,7 @@ impl Workspace {
                 return;
             }
 
-            let start = self.effective_scroll_offset();
-            if (start - target).abs() < 0.5 {
-                self.scroll_offset = target;
-                self.active_animation = None;
-                return;
-            }
-
-            self.active_animation = Some(ScrollAnimation::new(
-                start,
-                target,
-                self.scroll_duration_ms,
-                self.scroll_easing,
-            ));
+            self.animate_scroll_to(target, None, None);
         } else {
             // Clamped — use the standard scroll animation path
             if self.reduce_motion {

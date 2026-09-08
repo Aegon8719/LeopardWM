@@ -338,7 +338,7 @@ impl Workspace {
         // Outer gaps are viewport padding, not strip content.
         let column_widths: i32 = active_columns
             .iter()
-            .map(|c| c.width)
+            .map(|c| self.effective_column_width(c))
             .fold(0i32, |acc, w| acc.saturating_add(w));
         let gaps = gap.saturating_mul(active_columns.len().saturating_sub(1) as i32);
 

@@ -16,6 +16,11 @@ All notable changes to LeopardWM will be documented in this file.
 
 - **Runtime display changes preserve proportional column sizing.** Resolution and work-area
   changes recalculate column widths against the new viewport and keep the focused column in view.
+- **Native minimum sizes no longer permanently inflate column proportions.** Requested widths
+  remain separate from enforced minimums, so shrinking and restoring a resolution does not
+  rebase a temporary minimum into a larger requested width. Returning to a workspace repairs
+  stale scroll bounds before its transition starts, and minimum-size changes preserve allowed
+  negative centering during animations.
 - **Activating a minimized tab restores it without stealing focus early.** The tab is restored
   before layout and foreground synchronization, while stale tab-click actions are discarded
   instead of being redirected to a changed workspace or column.

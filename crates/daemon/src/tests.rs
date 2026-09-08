@@ -494,6 +494,275 @@ fn test_animation_maximized_skip_result_invalidates_daemon_bookkeeping() {
 }
 
 #[test]
+fn test_width_feedback_preserves_requested_resolution_round_trip() {
+    for invalidate in [false, true] {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        let monitor = state.focused_monitor;
+        let mut workspace = Workspace::with_gaps(10, 10);
+        workspace.insert_window(100, Some(1267)).unwrap();
+        workspace.insert_window(200, Some(1267)).unwrap();
+        state.workspaces.get_mut(&monitor).unwrap()[0] = workspace;
+
+        for (old_width, new_width, requested) in
+            [(5120, 2560, 627), (2560, 1920, 467), (1920, 5120, 1266)]
+        {
+            if invalidate {
+                state.monitors.get_mut(&monitor).unwrap().rect.width = old_width;
+                state.monitors.get_mut(&monitor).unwrap().work_area.width = old_width;
+                state.invalidate_display_change_constraints(true);
+                let mut monitors = test_monitors();
+                monitors[0].rect.width = new_width;
+                monitors[0].work_area.width = new_width;
+                state.reconcile_monitors(monitors);
+            } else {
+                state.workspaces.get_mut(&monitor).unwrap()[0]
+                    .rescale_column_widths(10, 10, 10, old_width, new_width);
+            }
+            let workspace = &state.workspaces[&monitor][0];
+            if invalidate {
+                assert_eq!(
+                    workspace.compute_placements(Rect::new(0, 0, new_width, 1040))[0]
+                        .rect
+                        .width,
+                    requested
+                );
+            }
+            if new_width < 5120 {
+                state.propagate_size_violations(
+                    &[leopardwm_platform_win32::WidthViolation {
+                        window_id: 100,
+                        min_width: 842,
+                    }],
+                    &[],
+                );
+            }
+
+            let workspace = &state.workspaces.get(&monitor).unwrap()[0];
+            assert_eq!(workspace.columns()[0].width(), requested);
+            assert_eq!(workspace.columns()[1].width(), requested);
+            let placements = workspace.compute_placements(Rect::new(0, 0, new_width, 1040));
+            assert_eq!(placements[0].rect.width, requested.max(842));
+            assert_eq!(placements[1].rect.width, requested);
+        }
+    }
+}
+
+#[test]
+fn test_width_feedback_noop_preserves_animation_and_effective_subscription() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.insert_window(100, Some(467)).unwrap();
+    workspace.insert_window(200, Some(1600)).unwrap();
+    workspace.set_reduce_motion(false);
+    let original_sig = state.focused_layout_signature();
+    let feedback = [leopardwm_platform_win32::WidthViolation {
+        window_id: 100,
+        min_width: 842,
+    }];
+    assert!(state.propagate_size_violations(&feedback, &[]));
+    let effective_sig = state.focused_layout_signature();
+    assert_ne!(effective_sig, original_sig);
+    assert_eq!(state.focused_layout_columns()[0].width_px, 842);
+    match state.handle_command(IpcCommand::QueryWorkspace) {
+        IpcResponse::WorkspaceState { total_width, .. } => assert_eq!(total_width, 2452),
+        other => panic!("Expected WorkspaceState, got {other:?}"),
+    }
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.start_scroll_animation(300.0, 1920, Some(1000), None);
+    workspace.tick_animation(400);
+    let mut expected = workspace.clone();
+    assert!(!state.propagate_size_violations(&feedback, &[]));
+    assert!(!state.propagate_size_violations(
+        &[leopardwm_platform_win32::WidthViolation {
+            window_id: 200,
+            min_width: 700
+        }],
+        &[]
+    ));
+    assert_eq!(state.focused_layout_signature(), effective_sig);
+    state.focused_workspace_mut().unwrap().tick_animation(600);
+    expected.tick_animation(600);
+    assert_eq!(
+        state.focused_workspace().unwrap().effective_scroll_offset(),
+        expected.effective_scroll_offset()
+    );
+    assert!(!state.focused_workspace().unwrap().is_animating());
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.focus_window(100).unwrap();
+    workspace.set_focused_column_width_fraction(0.3, 1920);
+    workspace.focus_window(200).unwrap();
+    assert_eq!(state.focused_layout_signature(), effective_sig);
+    assert_eq!(state.focused_layout_columns()[0].width_px, 842);
+
+    state.paused = false;
+    state.injected_apply_placements_behavior = Some(
+        TestApplyPlacementsBehavior::SucceedWithSizeViolations(feedback.to_vec(), Vec::new()),
+    );
+    state.apply_layout().unwrap();
+    assert_eq!(
+        state
+            .injected_apply_placements_call_count
+            .load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[test]
+fn test_deferred_minimum_clear_reconciles_apply_and_animation_boundaries() {
+    for frame_boundary in [false, true] {
+        for animated in [false, true] {
+            for center in [false, true] {
+                let mut monitors = test_monitors();
+                monitors[0].rect.width = 1000;
+                monitors[0].work_area.width = 1000;
+                let mut state = AppState::new_with_config(test_config(), monitors);
+                state.paused = false;
+                let mut workspace = Workspace::with_gaps(10, 10);
+                workspace.set_reduce_motion(false);
+                workspace.set_centering_mode(if center {
+                    leopardwm_core_layout::CenteringMode::Center
+                } else {
+                    leopardwm_core_layout::CenteringMode::JustInView
+                });
+                workspace.set_center_past_edges(center);
+                workspace.insert_window(100, Some(467)).unwrap();
+                workspace
+                    .insert_window(200, Some(if center { 1000 } else { 467 }))
+                    .unwrap();
+                let constrained = if center { 100 } else { 200 };
+                let column = if center { 0 } else { 1 };
+                workspace.focus_window(constrained).unwrap();
+                workspace.set_window_min_width(constrained, 842);
+                workspace.ensure_focused_visible(1000);
+                if animated {
+                    workspace.set_scroll_offset(100.0);
+                    workspace.ensure_focused_visible_animated(1000);
+                    workspace.tick_animation(10);
+                }
+                workspace.insert_window_in_column(300, column).unwrap();
+                let before = workspace.effective_scroll_offset();
+                let mut inactive = workspace.clone();
+                inactive.cancel_animation();
+                inactive.set_scroll_offset(137.0);
+                state.workspaces.insert(1, vec![workspace, inactive]);
+                if frame_boundary {
+                    for id in [100, 200, 300] {
+                        state.application_fullscreen.insert(
+                            id,
+                            crate::state::ApplicationFullscreenState {
+                                monitor_id: 1,
+                                rect: Rect::new(0, 0, 1000, 1040),
+                            },
+                        );
+                    }
+                    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+                    let worker = animation_worker::AnimationWorkerHandle::spawn(
+                        tx,
+                        state.apply_worker_cancelled.clone(),
+                    )
+                    .unwrap();
+                    state.send_animation_frame(&worker).unwrap();
+                    drop(worker);
+                } else {
+                    state.injected_apply_placements_behavior =
+                        Some(TestApplyPlacementsBehavior::SleepAndSucceed(Duration::ZERO));
+                    state.apply_layout().unwrap();
+                }
+                let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+                assert_eq!(
+                    workspace.effective_column_width(&workspace.columns()[column]),
+                    467
+                );
+                if animated {
+                    assert!((workspace.effective_scroll_offset() - before).abs() < 0.5);
+                }
+                workspace.tick_animation(1000);
+                assert_eq!(workspace.scroll_offset(), if center { -257.0 } else { 0.0 });
+                let placed = workspace.compute_placements(Rect::new(0, 0, 1000, 1040));
+                let focused = placed.iter().find(|p| p.window_id == 300).unwrap();
+                assert!(focused.rect.x >= 10 && focused.rect.x + focused.rect.width <= 990);
+                let inactive = &state.workspaces[&1][1];
+                assert_eq!(
+                    inactive.effective_column_width(&inactive.columns()[column]),
+                    467
+                );
+                assert_eq!(inactive.scroll_offset(), 137.0);
+                assert_eq!(state.active_workspace_idx(1), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_full_display_invalidation_reconciles_binding_minimum_without_viewport_change() {
+    for animated in [false, true] {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        let workspace = state.focused_workspace_mut().unwrap();
+        workspace.set_centering_mode(leopardwm_core_layout::CenteringMode::JustInView);
+        workspace.set_reduce_motion(false);
+        for id in [100, 200, 300] {
+            workspace.insert_window(id, Some(800)).unwrap();
+        }
+        workspace.set_window_min_width(300, 1500);
+        workspace.set_scroll_offset(1000.0);
+        if animated {
+            workspace.start_scroll_animation(1200.0, 1920, Some(1000), None);
+            workspace.tick_animation(10);
+        }
+        let before = workspace.effective_scroll_offset();
+        state.invalidate_display_change_constraints(true);
+        state.reconcile_monitors(test_monitors());
+        let workspace = state.focused_workspace_mut().unwrap();
+        if animated {
+            assert!((workspace.effective_scroll_offset() - before).abs() < 0.5);
+        }
+        workspace.tick_animation(1000);
+        assert_eq!(workspace.scroll_offset(), 520.0);
+        assert_eq!(workspace.columns()[2].width(), 800);
+    }
+}
+
+#[test]
+fn test_deferred_nonbinding_minimum_clear_preserves_manual_scroll_and_animation() {
+    for min_width in [0, 400] {
+        for animated in [false, true] {
+            let mut state = AppState::new_with_config(test_config(), test_monitors());
+            state.paused = false;
+            let workspace = state.focused_workspace_mut().unwrap();
+            workspace.set_reduce_motion(false);
+            for id in [100, 200, 300] {
+                workspace.insert_window(id, Some(800)).unwrap();
+            }
+            workspace.set_window_min_width(200, min_width);
+            workspace.set_window_min_height(200, 600);
+            workspace.insert_window_in_column(400, 1).unwrap();
+            workspace.set_scroll_offset(137.0);
+            if animated {
+                workspace.start_scroll_animation(300.0, 1920, Some(1000), None);
+                workspace.tick_animation(400);
+            }
+            let mut expected = workspace.clone();
+            state.injected_apply_placements_behavior =
+                Some(TestApplyPlacementsBehavior::SleepAndSucceed(Duration::ZERO));
+            state.apply_layout().unwrap();
+            let workspace = state.focused_workspace_mut().unwrap();
+            assert!(!workspace.commit_pending_min_size_clears());
+            assert_eq!(
+                workspace.effective_scroll_offset(),
+                expected.effective_scroll_offset()
+            );
+            workspace.tick_animation(600);
+            expected.tick_animation(600);
+            assert_eq!(
+                workspace.effective_scroll_offset(),
+                expected.effective_scroll_offset()
+            );
+            assert_eq!(workspace.is_animating(), expected.is_animating());
+        }
+    }
+}
+
+#[test]
 fn test_width_feedback_retargets_an_existing_scroll_animation() {
     let mut config = test_config();
     config.layout.outer_gap_left = 100;
@@ -528,7 +797,11 @@ fn test_width_feedback_retargets_an_existing_scroll_animation() {
     state.handle_animation_placement_result(&frame_result);
 
     let workspace = &state.workspaces.get(&monitor).unwrap()[0];
-    assert_eq!(workspace.columns()[2].width(), usable_width - 1);
+    assert_eq!(workspace.columns()[2].width(), 300);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[2]),
+        usable_width - 1
+    );
     assert!(workspace.is_animating(), "the existing pump is retargeted");
     assert_eq!(
         workspace.scroll_offset(),
@@ -593,7 +866,11 @@ fn test_width_feedback_widens_inactive_workspace_without_changing_scroll() {
     state.handle_animation_placement_result(&frame_result);
 
     let workspace = &state.workspaces.get(&monitor).unwrap()[1];
-    assert_eq!(workspace.columns()[2].width(), 1_500);
+    assert_eq!(workspace.columns()[2].width(), 300);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[2]),
+        1_500
+    );
     assert_eq!(workspace.scroll_offset(), 137.0);
     assert!(!workspace.is_animating());
     assert_eq!(
@@ -639,7 +916,11 @@ fn test_sync_size_violation_reapplies_once_and_reveals_widened_focus() {
         "synchronous feedback has one guarded corrective reapply"
     );
     let workspace = &state.workspaces.get(&monitor).unwrap()[0];
-    assert_eq!(workspace.columns()[2].width(), usable_width - 1);
+    assert_eq!(workspace.columns()[2].width(), 300);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[2]),
+        usable_width - 1
+    );
     assert!(
         !workspace.is_animating(),
         "no pump means immediate correction"
@@ -718,7 +999,11 @@ fn test_animation_size_violations_use_usable_width_and_retarget_transition() {
 
     state.tick_animations(10_000);
     let workspace = &state.workspaces.get(&monitor).unwrap()[0];
-    assert_eq!(workspace.columns()[2].width(), usable_width - 1);
+    assert_eq!(workspace.columns()[2].width(), 300);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[2]),
+        usable_width - 1
+    );
     assert!(
         workspace
             .compute_placements(viewport)
@@ -5762,6 +6047,31 @@ fn test_all_managed_window_ids_multi_monitor() {
 // ================================================================
 
 #[test]
+fn test_minimize_reconciles_geometry_after_native_minimum_removal() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.set_reduce_motion(false);
+    workspace.set_centering_mode(leopardwm_core_layout::CenteringMode::JustInView);
+    workspace.insert_window(100, Some(467)).unwrap();
+    workspace.insert_window(200, Some(467)).unwrap();
+    workspace.insert_window_in_column(300, 1).unwrap();
+    workspace.commit_pending_min_size_clears();
+    workspace.set_window_min_width(200, 842);
+    workspace.set_scroll_offset(339.0);
+    assert_eq!(state.tiled_column_width(1, 0, 200), Some(467));
+    state.handle_window_event(WindowEvent::Minimized(200));
+    let workspace = state.focused_workspace_mut().unwrap();
+    assert!(workspace.is_minimized(200));
+    assert_eq!(workspace.columns()[1].width(), 467);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[1]),
+        467
+    );
+    workspace.tick_animation(1000);
+    assert_eq!(workspace.scroll_offset(), 0.0);
+}
+
+#[test]
 fn test_minimize_marks_workspace_window() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     let ws = state.focused_workspace_mut().unwrap();
@@ -7375,6 +7685,209 @@ fn test_workspace_numeric_switch_retains_raw_index_animation_direction() {
         IpcCommand::SwitchWorkspace { index: 1 },
         -1,
     );
+}
+
+#[test]
+fn test_workspace_activation_repairs_cleared_minimum_before_snapshot() {
+    for (deferred, sticky) in [(false, false), (true, false), (true, true)] {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        state.reduce_motion = false;
+        state.ensure_workspace_exists(1, 1);
+        let mut workspace = Workspace::with_gaps(10, 10);
+        workspace.set_centering_mode(leopardwm_core_layout::CenteringMode::JustInView);
+        workspace.set_center_past_edges(false);
+        for id in [200, 300, 400] {
+            workspace.insert_window(id, Some(800)).unwrap();
+        }
+        workspace.commit_pending_min_size_clears();
+        workspace.set_window_min_width(400, 1500);
+        workspace.set_scroll_offset(1220.0);
+        if deferred {
+            workspace.insert_window_in_column(500, 2).unwrap();
+        }
+        state.workspaces.get_mut(&1).unwrap()[1] = workspace;
+        if !deferred {
+            state.invalidate_display_change_constraints(true);
+            state.reconcile_monitors(test_monitors());
+        }
+        if sticky {
+            state
+                .focused_workspace_mut()
+                .unwrap()
+                .insert_window(100, Some(100))
+                .unwrap();
+            state.toggle_sticky();
+        }
+        assert_eq!(state.workspaces[&1][1].scroll_offset(), 1220.0);
+        assert_eq!(state.active_workspace_idx(1), 0);
+        assert!(matches!(
+            state.handle_command(IpcCommand::SwitchWorkspace { index: 2 }),
+            IpcResponse::Ok
+        ));
+        let transition = state.layout_transition.as_ref().unwrap();
+        let expected_scroll = if sticky { 630.0 } else { 520.0 };
+        assert_eq!(
+            transition.start_rects[&400].x,
+            1630 - expected_scroll as i32,
+            "deferred={deferred}, sticky={sticky}"
+        );
+        assert_eq!(transition.start_rects[&400].width, 800);
+        assert_eq!(state.workspaces[&1][1].scroll_offset(), expected_scroll);
+        if sticky {
+            assert!(state.workspaces[&1][1].contains_window(100));
+            assert!(!state.workspaces[&1][0].contains_window(100));
+        }
+    }
+}
+
+#[test]
+fn test_focus_follow_activation_repairs_minimum_before_snapshot() {
+    for (deferred, reduce_motion) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        state.reduce_motion = reduce_motion;
+        state.last_prune_at = Some(std::time::Instant::now());
+        state.ensure_workspace_exists(1, 1);
+        let mut workspace = Workspace::with_gaps(10, 10);
+        workspace.set_centering_mode(leopardwm_core_layout::CenteringMode::JustInView);
+        workspace.set_center_past_edges(false);
+        for id in [200, 300, 400] {
+            workspace.insert_window(id, Some(800)).unwrap();
+            state
+                .injected_window_info
+                .insert(id, make_test_window_info(id));
+        }
+        workspace.commit_pending_min_size_clears();
+        workspace.set_window_min_width(400, 1500);
+        workspace.set_scroll_offset(1220.0);
+        if deferred {
+            workspace.insert_window_in_column(500, 2).unwrap();
+            state
+                .injected_window_info
+                .insert(500, make_test_window_info(500));
+        } else {
+            workspace.clear_window_min_width(400);
+        }
+        state.workspaces.get_mut(&1).unwrap()[1] = workspace;
+        assert_eq!(state.active_workspace_idx(1), 0);
+        assert_eq!(state.workspaces[&1][1].scroll_offset(), 1220.0);
+
+        state.handle_window_event(WindowEvent::Focused(400, 0));
+
+        assert_eq!(state.active_workspace_idx(1), 1);
+        if reduce_motion {
+            assert!(state.layout_transition.is_none());
+        } else {
+            let transition = state.layout_transition.as_ref().unwrap();
+            assert_eq!(transition.start_rects[&400].x, 1110, "deferred={deferred}");
+            assert_eq!(transition.start_rects[&400].width, 800);
+        }
+        assert_eq!(state.workspaces[&1][1].scroll_offset(), 520.0);
+        assert_eq!(state.workspaces[&1][1].focused_window(), Some(400));
+        assert_eq!(state.previous_focused_hwnd, Some(400));
+    }
+}
+
+#[test]
+fn test_focus_follow_activation_snapshots_valid_scroll_without_revealing_focus() {
+    for (offset, target) in [
+        (137.0, None),
+        (-550.0, None),
+        (1070.0, None),
+        (137.0, Some(400.0)),
+    ] {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        state.reduce_motion = false;
+        state.last_prune_at = Some(std::time::Instant::now());
+        state.ensure_workspace_exists(1, 1);
+        let mut workspace = Workspace::with_gaps(10, 10);
+        workspace.set_centering_mode(leopardwm_core_layout::CenteringMode::Center);
+        workspace.set_center_past_edges(true);
+        for id in [200, 300, 400] {
+            workspace.insert_window(id, Some(800)).unwrap();
+            state
+                .injected_window_info
+                .insert(id, make_test_window_info(id));
+        }
+        workspace.commit_pending_min_size_clears();
+        workspace.set_scroll_offset(offset);
+        if let Some(target) = target {
+            workspace.start_scroll_animation(
+                target,
+                1920,
+                Some(1000),
+                Some(leopardwm_core_layout::Easing::Linear),
+            );
+            workspace.tick_animation(10);
+        }
+        let expected = workspace.compute_placements_animated(state.layout_viewport(1));
+        state.workspaces.get_mut(&1).unwrap()[1] = workspace;
+
+        state.handle_window_event(WindowEvent::Focused(400, 0));
+
+        let transition = state.layout_transition.as_ref().unwrap();
+        for placement in expected {
+            assert_eq!(
+                transition.start_rects[&placement.window_id].x,
+                placement.rect.x
+            );
+            assert_eq!(
+                transition.start_rects[&placement.window_id].width,
+                placement.rect.width
+            );
+        }
+        assert_eq!(state.previous_focused_hwnd, Some(400));
+    }
+}
+
+#[test]
+fn test_workspace_activation_preserves_valid_manual_and_animated_scroll() {
+    for reduce_motion in [false, true] {
+        for (offset, target) in [
+            (137.0, None),
+            (-550.0, None),
+            (1070.0, None),
+            (137.0, Some(400.0)),
+        ] {
+            let mut state = AppState::new_with_config(test_config(), test_monitors());
+            state.reduce_motion = reduce_motion;
+            state.ensure_workspace_exists(1, 1);
+            let mut workspace = Workspace::with_gaps(10, 10);
+            workspace.set_centering_mode(leopardwm_core_layout::CenteringMode::Center);
+            workspace.set_center_past_edges(true);
+            for id in [200, 300, 400] {
+                workspace.insert_window(id, Some(800)).unwrap();
+            }
+            workspace.commit_pending_min_size_clears();
+            workspace.set_scroll_offset(offset);
+            if let Some(target) = target {
+                workspace.start_scroll_animation(
+                    target,
+                    1920,
+                    Some(1000),
+                    Some(leopardwm_core_layout::Easing::Linear),
+                );
+                workspace.tick_animation(10);
+            }
+            let mut expected = workspace.clone();
+            state.workspaces.get_mut(&1).unwrap()[1] = workspace;
+            assert!(matches!(
+                state.handle_command(IpcCommand::SwitchWorkspace { index: 2 }),
+                IpcResponse::Ok
+            ));
+            let actual = &mut state.workspaces.get_mut(&1).unwrap()[1];
+            assert_eq!(
+                actual.effective_scroll_offset(),
+                expected.effective_scroll_offset()
+            );
+            assert_eq!(actual.is_animating(), expected.is_animating());
+            actual.tick_animation(100);
+            expected.tick_animation(100);
+            assert_eq!(
+                actual.effective_scroll_offset(),
+                expected.effective_scroll_offset()
+            );
+        }
+    }
 }
 
 fn switch_to_empty_workspace_with_pending_focus() -> AppState {
@@ -10307,11 +10820,12 @@ fn test_taskbar_work_area_invalidation_clears_heights_and_preserves_widths() {
             "heights clear in workspace {workspace_idx}"
         );
         workspace.set_all_column_widths(400);
-        assert!(
-            workspace.apply_min_width_constraints(),
+        assert_eq!(
+            workspace.effective_column_width(&workspace.columns()[0]),
+            600,
             "width remains constrained in workspace {workspace_idx}"
         );
-        assert_eq!(workspace.columns()[0].width(), 600);
+        assert_eq!(workspace.columns()[0].width(), 400);
     }
 }
 
@@ -10352,8 +10866,9 @@ fn test_full_display_invalidation_clears_widths_and_heights() {
             "heights clear in workspace {workspace_idx}"
         );
         workspace.set_all_column_widths(400);
-        assert!(
-            !workspace.apply_min_width_constraints(),
+        assert_eq!(
+            workspace.effective_column_width(&workspace.columns()[0]),
+            400,
             "width clears in workspace {workspace_idx}"
         );
         assert_eq!(workspace.columns()[0].width(), 400);
