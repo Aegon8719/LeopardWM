@@ -11,4 +11,6 @@ jobs:
         shell: pwsh
         run: ./.github/verify-gui-subsystems.ps1
       - run: cargo test --all
+      - name: Verify offline desktop acceptance helpers
+        run: python -m unittest discover -s tools -p test_desktop_acceptance.py -v
       - run: cargo clippy --all -- -D warnings

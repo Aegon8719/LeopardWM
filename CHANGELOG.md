@@ -31,6 +31,10 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Internal
 
+- **Desktop acceptance checks distinguish layout behavior from restoration failures.**
+  Offline helpers exclude fully minimized columns from strip extent and plan bounded
+  requested-width repairs without treating native minimums as intent changes. Synthetic
+  regression tests run in CI; private desktop evidence remains outside the repository.
 - **Scoop manifest maintenance now lives outside this repository.** The checked-in
   manifest, dedicated validator, and post-release refresh process are removed
   while the GitHub Release archive contract used by Scoop Extras remains
