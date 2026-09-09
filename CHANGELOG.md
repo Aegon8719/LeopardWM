@@ -14,6 +14,9 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Fixes
 
+- **Office Click-to-Run dialogs no longer become tiled columns.** Their custom window class
+  is excluded even when Windows provides no dialog styles or owner. Restoring a saved layout
+  now honors built-in class exclusions without dropping hidden or minimized application windows.
 - **Runtime display changes preserve proportional column sizing.** Resolution and work-area
   changes recalculate column widths against the new viewport and keep the focused column in view.
 - **Native minimum sizes no longer permanently inflate column proportions.** Requested widths

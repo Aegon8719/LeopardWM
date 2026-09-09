@@ -48,6 +48,13 @@ pub fn is_excluded_tool_window_hwnd(hwnd: WindowId) -> bool {
     is_excluded_tool_window(style, ex_style)
 }
 
+/// Checks built-in class exclusions without rejecting hidden or cloaked managed windows.
+pub fn is_excluded_window_class_hwnd(hwnd: WindowId) -> bool {
+    let mut class_buf = [0u16; 256];
+    let class_len = unsafe { GetClassNameW(HWND(hwnd as *mut c_void), &mut class_buf) };
+    should_skip_window_by_class(&String::from_utf16_lossy(&class_buf[..class_len as usize]))
+}
+
 /// Get info for a single window handle with relaxed filters.
 ///
 /// Unlike `enumerate_windows`, this does not filter out cloaked windows
@@ -683,6 +690,7 @@ pub(crate) fn should_skip_window_by_class(class_name: &str) -> bool {
         // tiling breaks them because the remote session controls sizing
         "Ghost",  // DWM hung-window replacement — tiling duplicates the original
         "#32770", // Standard Win32 dialog (Open/Save/Print/Properties)
+        "C2RCustomWindowDialog", // Office Click-to-Run dialogs have no native dialog styles or owner.
         "OperationStatusWindow", // Shell copy/move/delete progress dialog. Style-based
         // dialog detection misses it: it keeps WS_MINIMIZEBOX,
         // so it fails the "no minimize *and* no maximize" test.
@@ -997,6 +1005,15 @@ mod tests {
             should_skip_window_by_class("OperationStatusWindow"),
             "shell copy/move/delete progress dialogs should not be tiled"
         );
+    }
+
+    #[test]
+    fn test_office_click_to_run_dialog_is_skipped_exactly() {
+        assert!(should_skip_window_by_class("C2RCustomWindowDialog"));
+        assert!(!should_skip_window_by_class("C2RCustomWindow"));
+        assert!(!should_skip_window_by_class("OMain"));
+        assert!(!should_skip_window_by_class("OpusApp"));
+        assert!(!should_skip_window_by_class("XLMAIN"));
     }
 
     #[test]

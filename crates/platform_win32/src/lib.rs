@@ -50,7 +50,8 @@ pub use elevation::{manage_block, window_manage_block, ManageBlock};
 pub use enumeration::{
     enumerate_monitors, enumerate_windows, find_monitor_by_id, find_monitor_for_rect,
     get_primary_monitor, get_process_executable, get_window_info, is_excluded_tool_window_hwnd,
-    monitor_above, monitor_below, monitor_to_left, monitor_to_right, monitors_by_position,
+    is_excluded_window_class_hwnd, monitor_above, monitor_below, monitor_to_left, monitor_to_right,
+    monitors_by_position,
 };
 pub use event_hooks::{install_event_hooks, EventHookHandle, WindowEvent};
 pub use focus::{

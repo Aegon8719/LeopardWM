@@ -211,13 +211,14 @@ impl AppState {
             // otherwise restore as a column we can never fill (a ghost column);
             // dropping it here lets enumerate re-see it, record it, and notify.
             leopardwm_platform_win32::is_valid_window(hwnd)
+                && !leopardwm_platform_win32::is_excluded_window_class_hwnd(hwnd)
                 && !leopardwm_platform_win32::window_manage_block(hwnd).is_blocked()
         })
     }
 
     /// Testable core of `restore_workspace_structure`: the `keep`
     /// predicate decides which HWNDs survive pruning. Production passes the
-    /// real `is_valid_window` + elevation check; tests pass a fake so the
+    /// real validity, class exclusion, and elevation checks; tests pass a fake so the
     /// structure-rebuild logic can be exercised without Win32.
     pub(crate) fn restore_workspace_structure_with(
         &mut self,

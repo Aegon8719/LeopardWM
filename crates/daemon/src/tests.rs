@@ -10597,6 +10597,79 @@ fn test_restore_structure_prunes_dead_windows() {
 }
 
 #[test]
+fn test_restore_structure_rejects_excluded_classes_but_keeps_hidden_windows() {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WS_MINIMIZE,
+    };
+
+    struct TestWindow(HWND);
+    impl TestWindow {
+        fn new(class: PCWSTR, style: WINDOW_STYLE) -> Self {
+            Self(unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    class,
+                    w!(""),
+                    style,
+                    0,
+                    0,
+                    200,
+                    100,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+        }
+
+        fn id(&self) -> u64 {
+            self.0 .0 as u64
+        }
+    }
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    let dialog = TestWindow::new(w!("#32770"), WINDOW_STYLE::default());
+    let hidden = TestWindow::new(w!("STATIC"), WINDOW_STYLE::default());
+    let minimized = TestWindow::new(w!("STATIC"), WS_MINIMIZE);
+    assert!(!leopardwm_platform_win32::is_window_visible(hidden.id()));
+    assert_eq!(
+        leopardwm_platform_win32::window_minimized_state(minimized.id()),
+        Some(true)
+    );
+    let mut workspace = leopardwm_core_layout::Workspace::default();
+    for window in [&dialog, &hidden, &minimized] {
+        workspace.insert_window(window.id(), Some(480)).unwrap();
+    }
+    let snapshot = crate::state::StateSnapshot {
+        saved_at: "0".to_string(),
+        workspaces: vec![crate::state::WorkspaceSnapshot {
+            monitor_device_name: "DISPLAY2".to_string(),
+            workspace_index: 0,
+            workspace,
+        }],
+        focused_monitor_name: "DISPLAY1".to_string(),
+        active_workspace: std::collections::HashMap::new(),
+        tab_title_overrides: std::collections::HashMap::new(),
+    };
+    let mut state = structure_restore_state();
+    let restored = state.restore_workspace_structure(&snapshot);
+    let &(monitor, index) = restored.iter().next().unwrap();
+    let workspace = &state.workspaces[&monitor][index];
+    assert!(!workspace.contains_window(dialog.id()));
+    assert!(workspace.contains_window(hidden.id()));
+    assert!(workspace.contains_window(minimized.id()));
+    assert_eq!(workspace.column_count(), 2);
+}
+
+#[test]
 fn test_restore_structure_clamps_workspace_index() {
     let mut state = structure_restore_state();
     let mut ws = leopardwm_core_layout::Workspace::default();
