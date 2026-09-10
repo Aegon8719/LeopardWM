@@ -14,6 +14,13 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Fixes
 
+- **Animations preserve their final native placement even when the layout is unchanged.**
+  A pending landing bypasses the unchanged-layout shortcut, and its exact endpoint is queued
+  after intermediate frames so delayed native moves cannot overwrite the resting position.
+- **Transient oversize measurements no longer immediately become native minimum sizes.**
+  The existing single placement retry requires excess widths and heights to repeat
+  unchanged before recording a minimum. Fitting measurements clear older suspects, and
+  new or changing sizes on the retry remain unconfirmed rather than inflating the layout.
 - **Office Click-to-Run dialogs no longer become tiled columns.** Their custom window class
   is excluded even when Windows provides no dialog styles or owner. Restoring a saved layout
   now honors built-in class exclusions without dropping hidden or minimized application windows.

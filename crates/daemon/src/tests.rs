@@ -881,6 +881,28 @@ fn test_width_feedback_widens_inactive_workspace_without_changing_scroll() {
 }
 
 #[test]
+fn test_post_animation_landing_applies_unchanged_layout() {
+    let window_id = u64::MAX - 1;
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(window_id, Some(800))
+        .unwrap();
+    state.apply_layout().unwrap();
+    assert!(state.last_placed_layout_rects.contains_key(&window_id));
+
+    state.post_animation_nudge_pending = true;
+    state.apply_layout().unwrap();
+
+    assert!(
+        !state.post_animation_nudge_pending,
+        "the final landing must reach the worker even when the logical layout is unchanged"
+    );
+}
+
+#[test]
 fn test_sync_size_violation_reapplies_once_and_reveals_widened_focus() {
     let mut config = test_config();
     config.layout.outer_gap_left = 100;
@@ -9051,9 +9073,14 @@ fn test_snap_config_toggle_on() {
     config.behavior.disable_snap_layouts = false;
     let mut state = AppState::new_with_config(config, test_monitors());
 
-    // No windows tiled, so no snap_disabled_hwnds after enabling
+    // Config reload enumerates the desktop; keep this empty-layout fixture isolated.
     let mut new_config = test_config();
     new_config.behavior.disable_snap_layouts = true;
+    new_config.window_rules = vec![config::WindowRule {
+        match_class: Some(".*".to_string()),
+        action: config::WindowAction::Ignore,
+        ..Default::default()
+    }];
     state.apply_config(new_config);
     // No tiled windows → nothing to disable
     assert!(state.snap_disabled_hwnds.is_empty());

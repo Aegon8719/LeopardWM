@@ -448,22 +448,16 @@ pub fn apply_placements(
     placements: &[WindowPlacement],
     config: &PlatformConfig,
     mut cache: Option<&mut PlacementCache>,
-    nudge_sticky_compositors: bool,
+    post_animation_landing: bool,
 ) -> Result<ApplyPlacementsResult, Win32Error> {
-    apply_placements_inner(
-        placements,
-        config,
-        &mut cache,
-        nudge_sticky_compositors,
-        true,
-    )
+    apply_placements_inner(placements, config, &mut cache, post_animation_landing, true)
 }
 
 fn apply_placements_inner(
     placements: &[WindowPlacement],
     _config: &PlatformConfig,
     cache: &mut Option<&mut PlacementCache>,
-    nudge_sticky_compositors: bool,
+    post_animation_landing: bool,
     allow_landing_measurement_retry: bool,
 ) -> Result<ApplyPlacementsResult, Win32Error> {
     let empty_result = ApplyPlacementsResult {
@@ -514,7 +508,8 @@ fn apply_placements_inner(
     // Uncloak before positioning so DWM composites returning windows at their
     // new rect before the landing measurement. The retry can repeat this safely.
     uncloak_becoming_visible(&entries);
-    let (applied, failed_window_ids) = position_entries(&entries);
+    let (applied, failed_window_ids) =
+        position_entries(&entries, cache.is_none() && post_animation_landing);
 
     // On the synchronous landing pass, compare the DWM visible measurement to
     // both the layout request and the expanded SetWindowPos frame request. A
@@ -540,7 +535,7 @@ fn apply_placements_inner(
             detection.suspect_confirmation_windows.len(),
         );
         evict_cached_border_insets(&detection.inset_artifact_windows, cache);
-        return apply_placements_inner(placements, _config, cache, nudge_sticky_compositors, false);
+        return apply_placements_inner(placements, _config, cache, post_animation_landing, false);
     }
 
     finalize_cached_border_insets(&entries, &detection.inset_artifact_windows, cache);
@@ -587,7 +582,7 @@ fn apply_placements_inner(
     // sees "no size change" and never rebuilds. A brief (w-1 -> w) resize pair
     // forces a real delta through. Scoped to known-affected classes to avoid a
     // universal flicker tax.
-    if async_flag == SET_WINDOW_POS_FLAGS(0) && nudge_sticky_compositors {
+    if async_flag == SET_WINDOW_POS_FLAGS(0) && post_animation_landing {
         let nudge_targets: Vec<NudgeTarget> = entries
             .iter()
             .filter(|e| {
@@ -800,7 +795,26 @@ fn uncloak_becoming_visible(entries: &[DeferEntry]) {
 }
 
 /// Position all entries in one DeferWindowPos batch; returns (applied, failed ids).
-fn position_entries(entries: &[DeferEntry]) -> (u32, HashSet<u64>) {
+fn position_entries(entries: &[DeferEntry], post_animation_landing: bool) -> (u32, HashSet<u64>) {
+    if post_animation_landing {
+        // A synchronous move can overtake older async frames on the owner thread.
+        // Queue the endpoint last as well, so those frames cannot undo the landing.
+        for entry in entries {
+            if let Err(error) = unsafe {
+                SetWindowPos(
+                    entry.hwnd,
+                    None,
+                    entry.x,
+                    entry.y,
+                    entry.w,
+                    entry.h,
+                    (entry.flags & !SWP_FRAMECHANGED) | SWP_ASYNCWINDOWPOS,
+                )
+            } {
+                tracing::warn!(window_id = entry.window_id, %error, "Could not queue animation endpoint");
+            }
+        }
+    }
     let mut applied = 0u32;
 
     // Track windows that failed positioning (excluded from cache).
@@ -900,19 +914,15 @@ fn position_entries(entries: &[DeferEntry]) -> (u32, HashSet<u64>) {
     (applied, failed_window_ids)
 }
 
-/// Per-window suspect state for the size-violation two-pass confirmation:
-/// `(width_suspect, height_suspect)` — whether that axis's oversize looked stale
-/// (beyond the stale-bounds ratio) on the window's prior measurement. A genuine
-/// min-size reproduces and is promoted on the second sighting; a one-off stale
-/// DWM read does not reproduce and is dropped. Module-global because the
-/// free-function detector must retain per-window, per-axis suspicion through the
-/// forced same-apply confirmation retry and later landing opportunities, until
-/// authoritative resolution or destroy cleanup. Entries are evicted on window
-/// destroy (`clear_suspected_oversize`) so the map stays bounded and a recycled
-/// HWND never inherits a stale suspect bit.
-static SUSPECTED_OVERSIZE: Mutex<Option<HashMap<u64, (bool, bool)>>> = Mutex::new(None);
+type SuspectedSizes = (Option<i32>, Option<i32>);
 
-fn lock_suspected_oversize() -> std::sync::MutexGuard<'static, Option<HashMap<u64, (bool, bool)>>> {
+/// Keep measured width/height candidates across the bounded landing retry.
+/// Two changing oversize samples must not become a native minimum. Destroy
+/// cleanup prevents a recycled HWND from inheriting another window's candidate.
+static SUSPECTED_OVERSIZE: Mutex<Option<HashMap<WindowId, SuspectedSizes>>> = Mutex::new(None);
+
+fn lock_suspected_oversize(
+) -> std::sync::MutexGuard<'static, Option<HashMap<WindowId, SuspectedSizes>>> {
     SUSPECTED_OVERSIZE
         .lock()
         .unwrap_or_else(crate::recover_poisoned_mutex)
@@ -928,7 +938,6 @@ pub fn clear_suspected_oversize(window_id: WindowId) {
 }
 
 const VISIBLE_SIZE_TOLERANCE: i32 = 2;
-const STALE_BOUNDS_RATIO: i32 = 3;
 const ABSURD_BOUNDS_RATIO: i32 = 4;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -983,7 +992,7 @@ fn classify_size_axis(
     frame_size: i32,
     visible_size: i32,
     allow_landing_measurement_retry: bool,
-    was_suspected: bool,
+    suspected_size: Option<i32>,
 ) -> AxisSizeClassification {
     if visible_size <= layout_size + VISIBLE_SIZE_TOLERANCE {
         return AxisSizeClassification::Fits;
@@ -992,41 +1001,19 @@ fn classify_size_axis(
         return AxisSizeClassification::InsetArtifact;
     }
 
-    // Confirmation and absurdity are judged against the layout request, as the
-    // pre-existing behavior did. The frame request stays relevant only to the
-    // inset-artifact test above: insets are a few pixels, so folding them into
-    // these ratios would silently widen both thresholds.
-    let looks_stale = layout_size > 0 && visible_size * 2 > layout_size * STALE_BOUNDS_RATIO;
+    // Even a small excess can be an animation frame that has not settled yet.
+    // Use the existing bounded retry before promoting it to a native minimum.
     let absurd = layout_size > 0 && visible_size > layout_size * ABSURD_BOUNDS_RATIO;
-    let (record, suspect) = classify_oversize(true, looks_stale, was_suspected, absurd);
-    AxisSizeClassification::Violation { record, suspect }
+    let confirmed = suspected_size == Some(visible_size) && !allow_landing_measurement_retry;
+    AxisSizeClassification::Violation {
+        record: !absurd && confirmed,
+        suspect: !absurd && !confirmed,
+    }
 }
 
 fn is_inset_artifact(layout_size: i32, frame_size: i32, visible_size: i32) -> bool {
     visible_size > layout_size + VISIBLE_SIZE_TOLERANCE
         && visible_size <= frame_size + VISIBLE_SIZE_TOLERANCE
-}
-
-/// Decide how to treat a confirmed oversize measurement after it has exceeded
-/// the frame request. A small excess records immediately; a >1.5x excess needs
-/// a second landing pass; a >4x excess is never trusted.
-fn classify_oversize(
-    over: bool,
-    looks_stale: bool,
-    was_suspected: bool,
-    absurd: bool,
-) -> (bool, bool) {
-    if !over {
-        (false, false)
-    } else if !looks_stale {
-        (true, false)
-    } else if absurd {
-        (false, false)
-    } else if was_suspected {
-        (true, false)
-    } else {
-        (false, true)
-    }
 }
 
 fn should_retry_landing_measurement(
@@ -1048,7 +1035,7 @@ fn classification_outcome(classification: &AxisSizeClassification) -> (bool, boo
 fn classify_measurements_and_update_suspects(
     measurements: &[WindowSizeMeasurement],
     allow_landing_measurement_retry: bool,
-    suspects: &mut HashMap<WindowId, (bool, bool)>,
+    suspects: &mut HashMap<WindowId, SuspectedSizes>,
 ) -> Vec<ClassifiedSizeMeasurement> {
     measurements
         .iter()
@@ -1056,7 +1043,7 @@ fn classify_measurements_and_update_suspects(
             let (was_w, was_h) = suspects
                 .get(&measurement.window_id)
                 .copied()
-                .unwrap_or((false, false));
+                .unwrap_or((None, None));
             let width = classify_size_axis(
                 measurement.layout_w,
                 measurement.frame_w,
@@ -1071,10 +1058,24 @@ fn classify_measurements_and_update_suspects(
                 allow_landing_measurement_retry,
                 was_h,
             );
-            let (_, suspect_w) = classification_outcome(&width);
-            let (_, suspect_h) = classification_outcome(&height);
+            let suspect_w = matches!(
+                width,
+                AxisSizeClassification::InsetArtifact
+                    | AxisSizeClassification::Violation { suspect: true, .. }
+            );
+            let suspect_h = matches!(
+                height,
+                AxisSizeClassification::InsetArtifact
+                    | AxisSizeClassification::Violation { suspect: true, .. }
+            );
             if suspect_w || suspect_h {
-                suspects.insert(measurement.window_id, (suspect_w, suspect_h));
+                suspects.insert(
+                    measurement.window_id,
+                    (
+                        suspect_w.then_some(measurement.visible_w),
+                        suspect_h.then_some(measurement.visible_h),
+                    ),
+                );
             } else {
                 suspects.remove(&measurement.window_id);
             }
@@ -1093,18 +1094,9 @@ fn detect_size_violations(
     failed_window_ids: &HashSet<u64>,
     allow_landing_measurement_retry: bool,
 ) -> SizeViolationDetection {
-    // Wait for the compositor to composite a frame before reading DWM
-    // bounds. Sync SetWindowPos only guarantees the target thread received
-    // WM_WINDOWPOSCHANGED — it does NOT wait for the target to process and
-    // re-render. Under CPU pressure (e.g. a background `cargo test` build),
-    // the target thread can lag behind: we'd read PRE-shrink bounds,
-    // interpret the oversized rect as a min-size violation, and record a
-    // bogus constraint that breaks subsequent layouts (e.g. a 50/50 column
-    // turning into 75/50 because one window's min_height got inflated).
-    //
-    // DwmFlush blocks for ~one vsync (~16ms) until the compositor has
-    // presented a frame incorporating our just-applied positions. Cheap
-    // on the landing pass (runs once per settle, not per frame).
+    // Synchronize with composition, but do not treat this as an owner-thread
+    // queue barrier: a delayed animation frame can still yield stale bounds.
+    // Oversize measurements use the bounded placement retry below.
     unsafe {
         let _ = DwmFlush();
     }
@@ -1157,13 +1149,12 @@ fn detect_size_violations(
 fn detect_size_violations_from_measurements(
     measurements: &[WindowSizeMeasurement],
     allow_landing_measurement_retry: bool,
-    suspects: &mut HashMap<WindowId, (bool, bool)>,
+    suspects: &mut HashMap<WindowId, SuspectedSizes>,
 ) -> SizeViolationDetection {
-    let mut candidate_suspects = suspects.clone();
     let classified = classify_measurements_and_update_suspects(
         measurements,
         allow_landing_measurement_retry,
-        &mut candidate_suspects,
+        suspects,
     );
 
     let mut detection = SizeViolationDetection::default();
@@ -1199,17 +1190,6 @@ fn detect_size_violations_from_measurements(
         };
         report_axis_size_outcome(&mut detection, width, &classified.width, true);
         report_axis_size_outcome(&mut detection, height, &classified.height, false);
-    }
-    if should_retry_landing_measurement(allow_landing_measurement_retry, &detection) {
-        for (window_id, (width_suspect, height_suspect)) in candidate_suspects {
-            if width_suspect || height_suspect {
-                let existing = suspects.entry(window_id).or_insert((false, false));
-                existing.0 |= width_suspect;
-                existing.1 |= height_suspect;
-            }
-        }
-    } else {
-        *suspects = candidate_suspects;
     }
     detection
 }
@@ -1680,6 +1660,119 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_landing_outlasts_queued_animation_positions() {
+        assert_eq!(queued_landing_rect(false), (10, 100, 200, 200));
+    }
+
+    #[test]
+    fn test_synchronous_correction_after_landing() {
+        assert_eq!(queued_landing_rect(true), (20, 100, 200, 200));
+    }
+
+    fn queued_landing_rect(correct_after_landing: bool) -> (i32, i32, i32, i32) {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        use windows::core::w;
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, DispatchMessageW, GetQueueStatus, PeekMessageW,
+            PostThreadMessageW, MSG, PM_REMOVE, QS_SENDMESSAGE, WINDOW_EX_STYLE, WM_APP, WS_POPUP,
+        };
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || unsafe {
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("LeopardWM hidden placement test"),
+                WS_POPUP,
+                100,
+                100,
+                200,
+                200,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            struct OwnedWindow(HWND);
+            impl Drop for OwnedWindow {
+                fn drop(&mut self) {
+                    let _ = unsafe { DestroyWindow(self.0) };
+                }
+            }
+            let window = OwnedWindow(hwnd);
+            ready_tx
+                .send((hwnd.0 as usize as u64, GetCurrentThreadId()))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            // Hold posted animation moves until the synchronous landing is waiting.
+            while GetQueueStatus(QS_SENDMESSAGE) >> 16 & QS_SENDMESSAGE.0 == 0 {
+                assert!(Instant::now() < deadline, "landing never reached the owner");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut message = MSG::default();
+            loop {
+                assert!(Instant::now() < deadline, "placement queue did not finish");
+                if PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                    if message.message == WM_APP {
+                        let mut rect = RECT::default();
+                        GetWindowRect(hwnd, &mut rect).unwrap();
+                        DestroyWindow(window.0).unwrap();
+                        std::mem::forget(window);
+                        return (
+                            rect.left,
+                            rect.top,
+                            rect.right - rect.left,
+                            rect.bottom - rect.top,
+                        );
+                    }
+                    DispatchMessageW(&message);
+                } else {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        });
+        let (window_id, thread_id) = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let position = |x, flags, landing| {
+            std::thread::spawn(move || {
+                let entry = DeferEntry {
+                    hwnd: window_id_to_hwnd(window_id).unwrap(),
+                    window_id,
+                    x,
+                    y: 100,
+                    w: 200,
+                    h: 200,
+                    layout_w: 200,
+                    layout_h: 200,
+                    insets: (0, 0, 0, 0),
+                    inset_source: InsetSource::Fresh,
+                    inset_generation: 0,
+                    visibility: Visibility::Visible,
+                    flags,
+                    column_index: 0,
+                };
+                position_entries(&[entry], landing)
+            })
+            .join()
+            .unwrap()
+        };
+        let flags = SWP_NOACTIVATE | SWP_NOZORDER;
+        let intermediate = position(400, flags | SWP_ASYNCWINDOWPOS, false);
+        let landing = position(10, flags, true);
+        // The owner is pumping by now: this covers sender lifetime, not every queue interleaving.
+        let correction = correct_after_landing.then(|| position(20, flags, false));
+        unsafe { PostThreadMessageW(thread_id, WM_APP, WPARAM(0), LPARAM(0)).unwrap() };
+        let observed = owner.join().unwrap();
+        for result in [intermediate, landing].into_iter().chain(correction) {
+            assert_eq!(result, (1, HashSet::new()));
+        }
+        observed
+    }
+
+    #[test]
     fn test_visible_and_frame_rects_round_trip_with_insets() {
         let visible = Rect::new(120, 100, 1000, 700);
         let insets = (7, 1, 7, 8);
@@ -1767,8 +1860,8 @@ mod tests {
                 true,
                 false,
                 AxisSizeClassification::Violation {
-                    record: true,
-                    suspect: false,
+                    record: false,
+                    suspect: true,
                 },
             ),
             (
@@ -1789,8 +1882,8 @@ mod tests {
                 true,
                 true,
                 AxisSizeClassification::Violation {
-                    record: true,
-                    suspect: false,
+                    record: false,
+                    suspect: true,
                 },
             ),
             (
@@ -1811,14 +1904,10 @@ mod tests {
                 false,
                 false,
                 AxisSizeClassification::Violation {
-                    record: true,
-                    suspect: false,
+                    record: false,
+                    suspect: true,
                 },
             ),
-            // Nonzero insets must not widen the >1.5x confirmation threshold:
-            // 605 > 1.5 * 400 (layout), but 605 < 1.5 * 414 (frame). Judged
-            // against the frame this would record a bogus 605px minimum on
-            // first sighting instead of deferring it to a second landing.
             (
                 400,
                 414,
@@ -1860,7 +1949,13 @@ mod tests {
 
         for (layout, frame, visible, allow_retry, was_suspected, expected) in cases {
             assert_eq!(
-                classify_size_axis(layout, frame, visible, allow_retry, was_suspected),
+                classify_size_axis(
+                    layout,
+                    frame,
+                    visible,
+                    allow_retry,
+                    was_suspected.then_some(visible),
+                ),
                 expected,
                 "layout={layout}, frame={frame}, visible={visible}, allow_retry={allow_retry}"
             );
@@ -1886,6 +1981,171 @@ mod tests {
     }
 
     #[test]
+    fn test_landing_confirms_small_oversize_before_recording_minimums() {
+        let width = width_measurement(7, 2545, 2559, 3789);
+        let height = WindowSizeMeasurement {
+            layout_h: 681,
+            frame_h: 688,
+            visible_h: 880,
+            ..width_measurement(8, 2840, 2854, 2840)
+        };
+        for measurement in [width, height] {
+            for fits_after_retry in [true, false] {
+                let mut suspects = HashMap::new();
+                let first =
+                    detect_size_violations_from_measurements(&[measurement], true, &mut suspects);
+                assert!(first.width_violations.is_empty());
+                assert!(first.height_violations.is_empty());
+                assert!(should_retry_landing_measurement(true, &first));
+
+                let confirmed = if fits_after_retry {
+                    WindowSizeMeasurement {
+                        visible_w: measurement.layout_w,
+                        visible_h: measurement.layout_h,
+                        ..measurement
+                    }
+                } else {
+                    measurement
+                };
+                let second =
+                    detect_size_violations_from_measurements(&[confirmed], false, &mut suspects);
+                if fits_after_retry {
+                    assert!(second.width_violations.is_empty());
+                    assert!(second.height_violations.is_empty());
+                } else if measurement.window_id == width.window_id {
+                    assert_eq!(second.width_violations.len(), 1);
+                    assert_eq!(second.width_violations[0].min_width, 3789);
+                    assert!(second.height_violations.is_empty());
+                } else {
+                    assert!(second.width_violations.is_empty());
+                    assert_eq!(second.height_violations.len(), 1);
+                    assert_eq!(second.height_violations[0].min_height, 880);
+                }
+                assert!(suspects.is_empty());
+                assert!(!should_retry_landing_measurement(false, &second));
+            }
+        }
+    }
+
+    #[test]
+    fn test_changing_oversize_is_not_a_confirmed_minimum() {
+        let first_measurement = WindowSizeMeasurement {
+            layout_h: 681,
+            frame_h: 688,
+            visible_h: 821,
+            ..width_measurement(7, 2545, 2559, 3789)
+        };
+        let second_measurement = WindowSizeMeasurement {
+            visible_w: 2978,
+            visible_h: 740,
+            ..first_measurement
+        };
+        let mut suspects = HashMap::new();
+        detect_size_violations_from_measurements(&[first_measurement], true, &mut suspects);
+        let second =
+            detect_size_violations_from_measurements(&[second_measurement], false, &mut suspects);
+        assert!(second.width_violations.is_empty());
+        assert!(second.height_violations.is_empty());
+        assert!(!should_retry_landing_measurement(false, &second));
+
+        let mut settled_suspects = suspects.clone();
+        let settled_measurement = WindowSizeMeasurement {
+            visible_w: first_measurement.layout_w,
+            visible_h: first_measurement.layout_h,
+            ..first_measurement
+        };
+        let settled = detect_size_violations_from_measurements(
+            &[settled_measurement],
+            true,
+            &mut settled_suspects,
+        );
+        assert!(settled.width_violations.is_empty());
+        assert!(settled.height_violations.is_empty());
+        assert!(!should_retry_landing_measurement(true, &settled));
+        assert!(settled_suspects.is_empty());
+
+        detect_size_violations_from_measurements(&[second_measurement], true, &mut suspects);
+        let stable =
+            detect_size_violations_from_measurements(&[second_measurement], false, &mut suspects);
+        assert_eq!(stable.width_violations[0].min_width, 2978);
+        assert_eq!(stable.height_violations[0].min_height, 740);
+        assert!(suspects.is_empty());
+    }
+
+    #[test]
+    fn test_fitting_sample_clears_suspects_even_when_another_axis_retries() {
+        let oversize = WindowSizeMeasurement {
+            visible_h: 700,
+            ..width_measurement(7, 400, 414, 700)
+        };
+        for fits_height in [false, true] {
+            let mut suspects = HashMap::new();
+            detect_size_violations_from_measurements(&[oversize], true, &mut suspects);
+            let fitting = WindowSizeMeasurement {
+                visible_w: 400,
+                visible_h: if fits_height { 400 } else { 700 },
+                ..oversize
+            };
+            let peer = width_measurement(8, 400, 414, 500);
+            let first =
+                detect_size_violations_from_measurements(&[fitting, peer], true, &mut suspects);
+            assert!(should_retry_landing_measurement(true, &first));
+            let second =
+                detect_size_violations_from_measurements(&[oversize], false, &mut suspects);
+            assert!(second.width_violations.is_empty());
+            assert_eq!(second.height_violations.is_empty(), fits_height);
+            assert!(!should_retry_landing_measurement(false, &second));
+        }
+    }
+
+    #[test]
+    fn test_new_retry_oversize_requires_its_own_confirmation() {
+        for first_width in [400, 403] {
+            let mut suspects = HashMap::new();
+            let first = width_measurement(7, 400, 414, first_width);
+            let peer = width_measurement(8, 400, 414, 500);
+            detect_size_violations_from_measurements(&[first, peer], true, &mut suspects);
+            let oversize = width_measurement(7, 400, 414, 450);
+            let second =
+                detect_size_violations_from_measurements(&[oversize], false, &mut suspects);
+            assert!(second.width_violations.is_empty());
+            assert!(!should_retry_landing_measurement(false, &second));
+            detect_size_violations_from_measurements(&[oversize], true, &mut suspects);
+            let stable =
+                detect_size_violations_from_measurements(&[oversize], false, &mut suspects);
+            assert_eq!(stable.width_violations[0].min_width, 450);
+        }
+    }
+
+    #[test]
+    fn test_unmeasured_retry_requires_fresh_landing_confirmation() {
+        let measurement = WindowSizeMeasurement {
+            layout_h: 681,
+            frame_h: 688,
+            visible_h: 880,
+            ..width_measurement(7, 2545, 2559, 3789)
+        };
+        let mut suspects = HashMap::new();
+        let first = detect_size_violations_from_measurements(&[measurement], true, &mut suspects);
+        assert!(should_retry_landing_measurement(true, &first));
+        detect_size_violations_from_measurements(&[], false, &mut suspects);
+
+        let next = detect_size_violations_from_measurements(&[measurement], true, &mut suspects);
+        assert!(next.width_violations.is_empty());
+        assert!(next.height_violations.is_empty());
+        assert!(should_retry_landing_measurement(true, &next));
+        let fitting = WindowSizeMeasurement {
+            visible_w: measurement.layout_w,
+            visible_h: measurement.layout_h,
+            ..measurement
+        };
+        let confirmed = detect_size_violations_from_measurements(&[fitting], false, &mut suspects);
+        assert!(confirmed.width_violations.is_empty());
+        assert!(confirmed.height_violations.is_empty());
+        assert!(suspects.is_empty());
+    }
+
+    #[test]
     fn test_suspect_oversize_retries_and_confirms_stable_native_minimum() {
         let measurement = width_measurement(7, 1267, 1281, 3186);
         let mut suspects = HashMap::new();
@@ -1893,7 +2153,7 @@ mod tests {
         let first = detect_size_violations_from_measurements(&[measurement], true, &mut suspects);
         assert_eq!(first.suspect_confirmation_windows, HashSet::from([7]));
         assert!(should_retry_landing_measurement(true, &first));
-        assert_eq!(suspects.get(&7), Some(&(true, false)));
+        assert_eq!(suspects.get(&7), Some(&(Some(measurement.visible_w), None)));
 
         let second = detect_size_violations_from_measurements(&[measurement], false, &mut suspects);
         assert_eq!(second.width_violations.len(), 1);
@@ -1944,12 +2204,9 @@ mod tests {
 
         let first = detect_size_violations_from_measurements(&measurements, true, &mut suspects);
         assert_eq!(first.inset_artifact_windows, HashSet::from([1]));
-        assert_eq!(first.suspect_confirmation_windows, HashSet::from([2]));
-        assert_eq!(first.width_violations.len(), 1);
-        assert_eq!(first.width_violations[0].window_id, 3);
-        assert_eq!(first.height_violations.len(), 1);
-        assert_eq!(first.height_violations[0].window_id, 4);
-        assert_eq!(first.height_violations[0].min_height, 500);
+        assert_eq!(first.suspect_confirmation_windows, HashSet::from([2, 3, 4]));
+        assert!(first.width_violations.is_empty());
+        assert!(first.height_violations.is_empty());
         assert!(should_retry_landing_measurement(true, &first));
 
         let second = detect_size_violations_from_measurements(&measurements, false, &mut suspects);
@@ -1973,14 +2230,14 @@ mod tests {
     fn test_discarded_retry_preserves_existing_suspect_for_authoritative_confirmation() {
         let a = width_measurement(1, 1267, 1281, 3186);
         let b = width_measurement(2, 400, 414, 403);
-        let mut suspects = HashMap::from([(1, (true, false))]);
+        let mut suspects = HashMap::from([(1, (Some(a.visible_w), None))]);
 
         let first = detect_size_violations_from_measurements(&[a, b], true, &mut suspects);
         assert_eq!(first.inset_artifact_windows, HashSet::from([2]));
-        assert_eq!(first.width_violations.len(), 1);
-        assert_eq!(first.width_violations[0].window_id, 1);
+        assert!(first.width_violations.is_empty());
+        assert_eq!(first.suspect_confirmation_windows, HashSet::from([1]));
         assert!(should_retry_landing_measurement(true, &first));
-        assert_eq!(suspects.get(&1), Some(&(true, false)));
+        assert_eq!(suspects.get(&1), Some(&(Some(a.visible_w), None)));
 
         let second = detect_size_violations_from_measurements(&[a, b], false, &mut suspects);
         assert!(second
@@ -1999,7 +2256,7 @@ mod tests {
         let detection =
             detect_size_violations_from_measurements(&[measurement], false, &mut suspects);
         assert_eq!(detection.suspect_confirmation_windows, HashSet::from([7]));
-        assert_eq!(suspects.get(&7), Some(&(true, false)));
+        assert_eq!(suspects.get(&7), Some(&(Some(measurement.visible_w), None)));
         assert!(!should_retry_landing_measurement(false, &detection));
     }
 
@@ -2138,7 +2395,7 @@ mod tests {
 
     #[test]
     fn test_suspect_updates_merge_current_state_per_measurement() {
-        let mut suspects = HashMap::from([(8, (true, false))]);
+        let mut suspects = HashMap::from([(8, (Some(820), None))]);
         let measurement = WindowSizeMeasurement {
             hwnd: HWND::default(),
             window_id: 7,
@@ -2158,27 +2415,8 @@ mod tests {
                 suspect: true,
             }
         );
-        assert_eq!(suspects.get(&7), Some(&(true, false)));
-        assert_eq!(suspects.get(&8), Some(&(true, false)));
-    }
-
-    #[test]
-    fn test_classify_oversize_confirmation_and_absurd_guard() {
-        let cases = [
-            ((false, false, false, false), (false, false)),
-            ((true, false, false, false), (true, false)),
-            ((true, true, false, false), (false, true)),
-            ((true, true, true, false), (true, false)),
-            ((true, true, true, true), (false, false)),
-            ((true, true, false, true), (false, false)),
-        ];
-
-        for ((over, looks_stale, was_suspected, absurd), expected) in cases {
-            assert_eq!(
-                classify_oversize(over, looks_stale, was_suspected, absurd),
-                expected
-            );
-        }
+        assert_eq!(suspects.get(&7), Some(&(Some(measurement.visible_w), None)));
+        assert_eq!(suspects.get(&8), Some(&(Some(820), None)));
     }
 
     #[test]

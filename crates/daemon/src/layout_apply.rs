@@ -535,8 +535,8 @@ impl AppState {
             }
         }
 
-        // Fast path: if every placement matches the last applied rect (and
-        // the visible-set is unchanged), there is nothing to do. Spawning
+        // Fast path: unchanged placements and visible-set need no worker
+        // unless a post-animation landing is pending. Spawning
         // the worker thread, the BeginDeferWindowPos batch, the DwmFlush,
         // size-violation queries, and the sticky-compositor nudge each take
         // tens of milliseconds; under rapid focus presses within the
@@ -552,7 +552,7 @@ impl AppState {
         let bypass_fast_path = self.injected_apply_placements_behavior.is_some();
         #[cfg(not(test))]
         let bypass_fast_path = false;
-        if placements_unchanged && !bypass_fast_path {
+        if placements_unchanged && !self.post_animation_nudge_pending && !bypass_fast_path {
             self.applying_layout = false;
             return Ok(());
         }
