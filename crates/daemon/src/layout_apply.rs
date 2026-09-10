@@ -1277,17 +1277,12 @@ mod park_tests {
     };
 
     #[test]
-    fn parks_below_when_a_horizontal_neighbor_blocks_the_side() {
-        // Ultrawide at origin, second monitor to its right. Nothing above/below,
-        // so the nearest free edge is below the owner.
+    fn parks_at_the_recoverable_sentinel_with_a_horizontal_neighbor() {
         let owner = Rect::new(0, 0, 5120, 1440);
         let right = Rect::new(5120, 0, 1920, 1080);
-        let parked = offscreen_park_rect(WIN, owner, &[owner, right]);
-        assert_eq!(
-            parked.y,
-            owner.y + owner.height + 4,
-            "parked just below the owner"
-        );
+        let parked = offscreen_park_rect(WIN, &[owner, right], (0, 0, 0, 0));
+        let sentinel = leopardwm_platform_win32::MOVE_OFFSCREEN_SENTINEL_COORD;
+        assert_eq!((parked.x, parked.y), (sentinel, sentinel));
         assert_eq!((parked.width, parked.height), (WIN.width, WIN.height));
         assert!(
             ![owner, right].iter().any(|m| parked.intersects(m)),
@@ -1296,18 +1291,13 @@ mod park_tests {
     }
 
     #[test]
-    fn parks_to_the_side_when_stacked_vertically_boxes_top_and_bottom() {
-        // Three monitors stacked; the owner is the middle one, so above and
-        // below are both taken and the park falls to the right edge.
+    fn parks_at_the_recoverable_sentinel_with_stacked_neighbors() {
         let owner = Rect::new(0, 1080, 1920, 1080);
         let above = Rect::new(0, 0, 1920, 1080);
         let below = Rect::new(0, 2160, 1920, 1080);
-        let parked = offscreen_park_rect(WIN, owner, &[owner, above, below]);
-        assert_eq!(
-            parked.x,
-            owner.x + owner.width + 4,
-            "parked just right of the owner"
-        );
+        let parked = offscreen_park_rect(WIN, &[owner, above, below], (0, 0, 0, 0));
+        let sentinel = leopardwm_platform_win32::MOVE_OFFSCREEN_SENTINEL_COORD;
+        assert_eq!((parked.x, parked.y), (sentinel, sentinel));
         assert!(
             ![owner, above, below].iter().any(|m| parked.intersects(m)),
             "clears every monitor"
@@ -1315,19 +1305,14 @@ mod park_tests {
     }
 
     #[test]
-    fn parks_to_the_left_when_below_above_and_right_are_all_taken() {
-        // Owner boxed on below, above, and right, so the left edge is the only
-        // one that clears every monitor.
+    fn parks_at_the_recoverable_sentinel_with_three_adjacent_neighbors() {
         let owner = Rect::new(2000, 0, 1000, 1000);
         let below = Rect::new(2000, 1000, 1000, 1000);
         let above = Rect::new(2000, -1000, 1000, 1000);
         let right = Rect::new(3000, 0, 1000, 1000);
-        let parked = offscreen_park_rect(WIN, owner, &[owner, below, above, right]);
-        assert_eq!(
-            parked.x,
-            owner.x - WIN.width - 4,
-            "parked just left of the owner"
-        );
+        let parked = offscreen_park_rect(WIN, &[owner, below, above, right], (0, 0, 0, 0));
+        let sentinel = leopardwm_platform_win32::MOVE_OFFSCREEN_SENTINEL_COORD;
+        assert_eq!((parked.x, parked.y), (sentinel, sentinel));
         assert!(
             ![owner, below, above, right]
                 .iter()
@@ -1346,7 +1331,7 @@ mod park_tests {
             Rect::new(0, -2000, 1000, 2000), // above
             Rect::new(0, 1000, 1000, 2000),  // below
         ];
-        let parked = offscreen_park_rect(WIN, owner, &neighbors);
+        let parked = offscreen_park_rect(WIN, &neighbors, (0, 0, 0, 0));
         let sentinel = leopardwm_platform_win32::MOVE_OFFSCREEN_SENTINEL_COORD;
         assert_eq!((parked.x, parked.y), (sentinel, sentinel));
     }

@@ -2840,28 +2840,63 @@ async fn handle_settings_event(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InterruptedAnimationFrameAction {
+    LeaveNewerFrame,
+    Resume,
+    ReapplyThenResume,
+}
+
+pub(crate) fn interrupted_animation_frame_action(
+    result: AnimationPlacementResult,
+    inflight_request_id: Option<u64>,
+) -> Option<InterruptedAnimationFrameAction> {
+    match result {
+        AnimationPlacementResult::Stale if inflight_request_id.is_some() => {
+            Some(InterruptedAnimationFrameAction::LeaveNewerFrame)
+        }
+        AnimationPlacementResult::Stale => Some(InterruptedAnimationFrameAction::Resume),
+        AnimationPlacementResult::InvalidatedCurrent => {
+            Some(InterruptedAnimationFrameAction::ReapplyThenResume)
+        }
+        AnimationPlacementResult::Current => None,
+    }
+}
+
 /// Process an applied animation frame: feed back violations, tick, and land the final layout.
 async fn handle_animation_frame_applied(
     ctx: &mut EventLoopCtx<'_>,
     frame_result: animation_worker::FrameResult,
 ) {
-    let current_result = {
+    let (current_result, inflight_request_id) = {
         let mut state = ctx.state.lock().await;
-        state.handle_animation_placement_result(&frame_result)
+        let result = state.handle_animation_placement_result(&frame_result);
+        (result, state.inflight_request_id)
     };
-    match current_result {
-        AnimationPlacementResult::Stale => return,
-        AnimationPlacementResult::InvalidatedCurrent => {
-            let mut state = ctx.state.lock().await;
-            if let Err(error) = state.apply_layout() {
-                warn!(
-                    "Current layout landing after invalidated animation frame failed: {}",
-                    error
-                );
-            }
+    if let Some(action) = interrupted_animation_frame_action(current_result, inflight_request_id) {
+        if action == InterruptedAnimationFrameAction::LeaveNewerFrame {
             return;
         }
-        AnimationPlacementResult::Current => {}
+        let resumed = {
+            let mut state = ctx.state.lock().await;
+            if action == InterruptedAnimationFrameAction::ReapplyThenResume {
+                if let Err(error) = state.apply_layout() {
+                    warn!(
+                        "Current layout landing after invalidated animation frame failed: {}",
+                        error
+                    );
+                }
+            }
+            if state.is_animating() {
+                state.tick_animations(0);
+                matches!(state.send_animation_frame(ctx.animation_worker), Ok(true))
+            } else {
+                false
+            }
+        };
+        *ctx.animation_active = resumed;
+        *ctx.last_frame_instant = resumed.then(std::time::Instant::now);
+        return;
     }
     if let Err(ref e) = frame_result.apply_result {
         warn!("Animation frame failed: {}", e);

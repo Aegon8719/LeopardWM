@@ -1843,6 +1843,17 @@ mod tests {
     }
 
     #[test]
+    fn test_offscreen_sentinel_stays_recoverable_after_frame_conversion() {
+        let sentinel = crate::MOVE_OFFSCREEN_SENTINEL_COORD;
+        let visible = Rect::new(sentinel, sentinel, 1600, 900);
+        let frame = visible_rect_to_frame_rect(visible, (7, 1, 7, 8), false);
+
+        assert!(crate::is_move_offscreen_sentinel_rect(&frame));
+        assert!(frame.x <= sentinel && frame.y <= sentinel);
+        assert_eq!((frame.width, frame.height), (1614, 909));
+    }
+
+    #[test]
     fn test_visible_and_frame_rects_ignore_insets_in_high_contrast() {
         let visible = Rect::new(120, 100, 1000, 700);
         let insets = (7, 1, 7, 8);

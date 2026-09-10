@@ -12,7 +12,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
 
-const PARK_MARGIN: i32 = 4;
 const CONTAINMENT_TOLERANCE: i32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -325,7 +324,7 @@ pub(crate) fn project_physical_rect(
     let height = bottom - top;
     if width <= 0 || height <= 0 {
         return PhysicalDecision::Parked {
-            rect: offscreen_park_rect(window, owner, monitor_rects),
+            rect: offscreen_park_rect(window, monitor_rects, (0, 0, 0, 0)),
         };
     }
 
@@ -337,58 +336,35 @@ pub(crate) fn project_physical_rect(
     }
 }
 
-/// Pick an off-screen rect that clears every monitor, tried along the owning
-/// monitor's edges (below, above, right, left). Falls back to the far sentinel
-/// only if the owner is boxed in on all four sides.
-pub(crate) fn offscreen_park_rect(window: Rect, owner: Rect, monitor_rects: &[Rect]) -> Rect {
-    let candidates = [
-        Rect::new(
-            owner.x,
-            owner
-                .y
-                .saturating_add(owner.height)
-                .saturating_add(PARK_MARGIN),
-            window.width,
-            window.height,
-        ),
-        Rect::new(
-            owner.x,
-            owner
-                .y
-                .saturating_sub(window.height)
-                .saturating_sub(PARK_MARGIN),
-            window.width,
-            window.height,
-        ),
-        Rect::new(
-            owner
-                .x
-                .saturating_add(owner.width)
-                .saturating_add(PARK_MARGIN),
-            owner.y,
-            window.width,
-            window.height,
-        ),
-        Rect::new(
-            owner
-                .x
-                .saturating_sub(window.width)
-                .saturating_sub(PARK_MARGIN),
-            owner.y,
-            window.width,
-            window.height,
-        ),
-    ];
-    for candidate in candidates {
-        if !monitor_rects
-            .iter()
-            .any(|monitor| candidate.intersects(monitor))
-        {
-            return candidate;
-        }
-    }
-    const SENTINEL: i32 = leopardwm_platform_win32::MOVE_OFFSCREEN_SENTINEL_COORD;
-    Rect::new(SENTINEL, SENTINEL, window.width, window.height)
+/// Pick a recoverable frame-space parking location that clears every monitor.
+///
+/// Both coordinates remain at or beyond the shared MoveOffScreen sentinel, so
+/// no-state recovery retains its narrow ownership test. The caller supplies
+/// visible-to-frame insets because the native move targets the outer frame.
+/// If an extreme virtual-desktop geometry cannot be represented, final native
+/// readback leaves the placement unconfirmed instead of treating it as safe.
+pub(crate) fn offscreen_park_rect(
+    window: Rect,
+    monitor_rects: &[Rect],
+    insets: (i32, i32, i32, i32),
+) -> Rect {
+    const SENTINEL: i64 = leopardwm_platform_win32::MOVE_OFFSCREEN_SENTINEL_COORD as i64;
+    let (_, _, right, bottom) = insets;
+    let outer_width = i64::from(window.width.max(1)) + i64::from(right.max(0));
+    let outer_height = i64::from(window.height.max(1)) + i64::from(bottom.max(0));
+    let x = monitor_rects
+        .iter()
+        .map(|monitor| i64::from(monitor.x) - outer_width)
+        .min()
+        .unwrap_or(SENTINEL)
+        .min(SENTINEL);
+    let y = monitor_rects
+        .iter()
+        .map(|monitor| i64::from(monitor.y) - outer_height)
+        .min()
+        .unwrap_or(SENTINEL)
+        .min(SENTINEL);
+    Rect::new(i32_sat(x), i32_sat(y), window.width, window.height)
 }
 
 pub(crate) fn park_offscreen_avoiding_neighbors(
@@ -396,9 +372,9 @@ pub(crate) fn park_offscreen_avoiding_neighbors(
     owner_id: MonitorId,
     monitors: &HashMap<MonitorId, MonitorInfo>,
 ) {
-    let Some(owner) = monitors.get(&owner_id).map(|monitor| monitor.rect) else {
+    if !monitors.contains_key(&owner_id) {
         return;
-    };
+    }
     let rects = monitor_rects(monitors);
     for placement in placements.iter_mut() {
         if placement.visibility == Visibility::Visible {
@@ -409,7 +385,8 @@ pub(crate) fn park_offscreen_avoiding_neighbors(
             .filter(|(id, _)| **id != owner_id)
             .any(|(_, monitor)| placement.rect.intersects(&monitor.rect));
         if bleeds {
-            placement.rect = offscreen_park_rect(placement.rect, owner, &rects);
+            placement.rect =
+                offscreen_park_rect(placement.rect, &rects, native_insets(placement.window_id));
         }
     }
 }
@@ -439,7 +416,9 @@ pub(crate) fn decide_physical_rect(
 ) -> PhysicalDecision {
     match project_physical_rect(window, owner, monitor_rects) {
         PhysicalDecision::Unchanged => PhysicalDecision::Unchanged,
-        PhysicalDecision::Parked { rect } => PhysicalDecision::Parked { rect },
+        PhysicalDecision::Parked { .. } => PhysicalDecision::Parked {
+            rect: offscreen_park_rect(window, monitor_rects, context.insets),
+        },
         PhysicalDecision::Constrained { rect, axes } => {
             let insufficient_observation = observation.is_some_and(|obs| {
                 obs.context.matches(context, axes)
@@ -460,7 +439,7 @@ pub(crate) fn decide_physical_rect(
                     })
                     .unwrap_or(window);
                 PhysicalDecision::Parked {
-                    rect: offscreen_park_rect(retained, owner, monitor_rects),
+                    rect: offscreen_park_rect(retained, monitor_rects, (0, 0, 0, 0)),
                 }
             } else {
                 PhysicalDecision::Constrained { rect, axes }
@@ -508,7 +487,7 @@ pub(crate) fn convert_failed_slices_to_parks(
     placements: &[WindowPlacement],
     failed_ids: &HashSet<u64>,
     retained: &HashMap<u64, Rect>,
-    owners: &HashMap<u64, Rect>,
+    _owners: &HashMap<u64, Rect>,
     monitor_rects: &[Rect],
 ) -> Vec<WindowPlacement> {
     placements
@@ -521,12 +500,8 @@ pub(crate) fn convert_failed_slices_to_parks(
                 .get(&placement.window_id)
                 .copied()
                 .unwrap_or(placement.rect);
-            let owner = owners
-                .get(&placement.window_id)
-                .copied()
-                .unwrap_or(placement.rect);
             WindowPlacement {
-                rect: offscreen_park_rect(size, owner, monitor_rects),
+                rect: offscreen_park_rect(size, monitor_rects, (0, 0, 0, 0)),
                 visibility: Visibility::OffScreenRight,
                 ..*placement
             }
@@ -673,21 +648,26 @@ impl AppState {
             })
     }
 
+    fn current_pending_physical_presentation(
+        &self,
+        window_id: u64,
+    ) -> Option<&PhysicalPresentation> {
+        let presentation = self.pending_physical_presentations.get(&window_id)?;
+        (self.inflight_request_id == Some(presentation.request_id)
+            && self.pending_physical_request_id == presentation.request_id
+            && self.pending_physical_invalidation_id == presentation.invalidation_id)
+            .then_some(presentation)
+    }
+
     pub(crate) fn expected_physical_rect(&self, window_id: u64) -> Option<Rect> {
-        self.last_physical_presentations
-            .get(&window_id)
+        self.current_pending_physical_presentation(window_id)
+            .or_else(|| self.last_physical_presentations.get(&window_id))
             .map(|presentation| presentation.physical.rect)
-            .or_else(|| {
-                self.pending_physical_presentations
-                    .get(&window_id)
-                    .map(|presentation| presentation.physical.rect)
-            })
     }
 
     pub(crate) fn is_physically_parked(&self, window_id: u64) -> bool {
-        self.last_physical_presentations
-            .get(&window_id)
-            .or_else(|| self.pending_physical_presentations.get(&window_id))
+        self.current_pending_physical_presentation(window_id)
+            .or_else(|| self.last_physical_presentations.get(&window_id))
             .is_some_and(|presentation| presentation.kind == PhysicalKind::Parked)
     }
 
@@ -727,6 +707,22 @@ impl AppState {
             };
             let context =
                 self.geometry_context_for(logical.window_id, owner_id, owner, logical.rect, &rects);
+            let projected = project_physical_rect(logical.rect, owner, &rects);
+            if let Some(observation) = self.physical_observations.get(&logical.window_id) {
+                let axes = match projected {
+                    PhysicalDecision::Constrained { axes, .. } => axes,
+                    PhysicalDecision::Unchanged | PhysicalDecision::Parked { .. } => {
+                        ConstrainedAxes {
+                            right: observation.width_affected,
+                            bottom: observation.height_affected,
+                            ..ConstrainedAxes::default()
+                        }
+                    }
+                };
+                if !observation.context.matches(&context, axes) {
+                    self.physical_observations.remove(&logical.window_id);
+                }
+            }
             let decision = if self.is_projection_exempt(&logical) {
                 PhysicalDecision::Unchanged
             } else {
@@ -960,8 +956,11 @@ impl AppState {
         self.last_applied_physical_invalidation =
             self.physical_invalidation_id.load(Ordering::SeqCst);
         self.last_topology_signature = topology_signature(&self.monitors);
-        self.pending_physical_presentations
-            .retain(|id, _| origins.contains_key(id));
+        if self.pending_physical_request_id == request_id
+            && self.pending_physical_invalidation_id == invalidation_id
+        {
+            self.pending_physical_presentations.clear();
+        }
 
         if failed_ids.is_empty() {
             return Vec::new();
@@ -1184,6 +1183,8 @@ mod tests {
             }],
             &dispatched,
         );
+        assert!(state.pending_physical_presentations.is_empty());
+        assert_eq!(state.expected_physical_rect(100), Some(dispatched[0].rect));
         assert!(state.last_physical_presentations[&100].confirmed);
         assert!(state.physical_fast_path_ok());
     }
@@ -1540,6 +1541,179 @@ mod tests {
     }
 
     #[test]
+    fn pending_presentation_precedes_last_until_consumed_and_fallback_remains_current() {
+        let mut state = AppState::new_with_config(
+            crate::config::Config::default(),
+            vec![
+                monitor(1, 0, 0, 1920, 1080),
+                monitor(2, 1920, 0, 1920, 1080),
+            ],
+        );
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(100, Some(800))
+            .unwrap();
+        let logical = placement(100, Rect::new(1800, 0, 400, 600), Visibility::Visible);
+        let first = state.apply_physical_projection(vec![logical.clone()]);
+        let mut previous = state.pending_physical_presentations[&100].clone();
+        previous.kind = PhysicalKind::Unchanged;
+        previous.physical.rect = logical.rect;
+        previous.confirmed = true;
+        state.last_physical_presentations.insert(100, previous);
+        assert_eq!(state.expected_physical_rect(100), Some(first[0].rect));
+        assert!(!state.is_physically_parked(100));
+
+        let (request_id, invalidation_id) = state.physical_request_ids();
+        let fallback = state.consume_physical_landings(
+            request_id,
+            invalidation_id,
+            &[PlacementLanding {
+                window_id: 100,
+                requested_rect: first[0].rect,
+                requested_visibility: Visibility::Visible,
+                actual_visible_rect: Some(logical.rect),
+                actual_outer_rect: Some(Rect::new(1800, 0, 450, 650)),
+                failed: false,
+                unreadable: false,
+            }],
+            &first,
+        );
+        assert!(state.pending_physical_presentations.is_empty());
+        state.begin_physical_follow_up(&fallback);
+        assert!(state.is_physically_parked(100));
+        assert_eq!(
+            state.expected_physical_rect(100),
+            Some(fallback[0].rect),
+            "the confirmed fallback replaces the consumed pending slice"
+        );
+    }
+
+    #[test]
+    fn stale_landing_consumption_preserves_a_newer_pending_presentation() {
+        let mut state = AppState::new_with_config(
+            crate::config::Config::default(),
+            vec![monitor(1, 0, 0, 1920, 1080)],
+        );
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(100, Some(800))
+            .unwrap();
+        let first = state.apply_physical_projection(vec![placement(
+            100,
+            Rect::new(100, 0, 400, 600),
+            Visibility::Visible,
+        )]);
+        let (old_request, old_invalidation) = state.physical_request_ids();
+        let newer = state.apply_physical_projection(vec![placement(
+            100,
+            Rect::new(200, 0, 400, 600),
+            Visibility::Visible,
+        )]);
+        assert!(state
+            .consume_physical_landings(old_request, old_invalidation, &[], &first)
+            .is_empty());
+        assert_eq!(state.expected_physical_rect(100), Some(newer[0].rect));
+        assert_eq!(
+            state.pending_physical_request_id,
+            old_request.wrapping_add(1)
+        );
+    }
+
+    #[test]
+    fn context_change_discards_rejection_but_same_context_reuses_it() {
+        let mut state = AppState::new_with_config(
+            crate::config::Config::default(),
+            vec![
+                monitor(1, 0, 0, 1920, 1080),
+                monitor(2, 1920, 0, 1920, 1080),
+            ],
+        );
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(100, Some(800))
+            .unwrap();
+        let a = placement(100, Rect::new(1800, 0, 400, 600), Visibility::Visible);
+        let rejected = state.apply_physical_projection(vec![a.clone()]);
+        let (request_id, invalidation_id) = state.physical_request_ids();
+        state.consume_physical_landings(
+            request_id,
+            invalidation_id,
+            &[PlacementLanding {
+                window_id: 100,
+                requested_rect: rejected[0].rect,
+                requested_visibility: Visibility::Visible,
+                actual_visible_rect: Some(a.rect),
+                actual_outer_rect: Some(Rect::new(1800, 0, 450, 650)),
+                failed: false,
+                unreadable: false,
+            }],
+            &rejected,
+        );
+        assert!(state.physical_observations.contains_key(&100));
+
+        let repeat = state.apply_physical_projection(vec![a.clone()]);
+        assert_eq!(
+            state.pending_physical_presentations[&100].kind,
+            PhysicalKind::Parked,
+            "the same rejected context must avoid another constrained probe"
+        );
+        let (request_id, invalidation_id) = state.physical_request_ids();
+        state.consume_physical_landings(
+            request_id,
+            invalidation_id,
+            &[PlacementLanding {
+                window_id: 100,
+                requested_rect: repeat[0].rect,
+                requested_visibility: Visibility::OffScreenRight,
+                actual_visible_rect: None,
+                actual_outer_rect: Some(repeat[0].rect),
+                failed: false,
+                unreadable: false,
+            }],
+            &repeat,
+        );
+        assert!(
+            state.physical_observations.contains_key(&100),
+            "parking in the unchanged context keeps the rejection observation"
+        );
+
+        state.monitors.insert(1, monitor(1, 0, 0, 1000, 1080));
+        state.monitors.insert(2, monitor(2, 1000, 0, 1920, 1080));
+        let parked_in_b = state.apply_physical_projection(vec![a.clone()]);
+        assert_eq!(
+            state.pending_physical_presentations[&100].kind,
+            PhysicalKind::Parked,
+            "a changed topology can park the window before another constrained probe"
+        );
+        assert!(
+            !state.physical_observations.contains_key(&100),
+            "the changed parked context discards the old rejection"
+        );
+        let (request_id, invalidation_id) = state.physical_request_ids();
+        state.consume_physical_landings(
+            request_id,
+            invalidation_id,
+            &[PlacementLanding {
+                window_id: 100,
+                requested_rect: parked_in_b[0].rect,
+                requested_visibility: Visibility::OffScreenRight,
+                actual_visible_rect: None,
+                actual_outer_rect: Some(parked_in_b[0].rect),
+                failed: false,
+                unreadable: false,
+            }],
+            &parked_in_b,
+        );
+
+        state.monitors.insert(1, monitor(1, 0, 0, 1920, 1080));
+        state.monitors.insert(2, monitor(2, 1920, 0, 1920, 1080));
+        let retry_a = state.apply_physical_projection(vec![a]);
+        assert_eq!(
+            state.pending_physical_presentations[&100].kind,
+            PhysicalKind::Constrained,
+            "the original rejection must not revive after another context landed"
+        );
+        assert_eq!(retry_a[0].visibility, Visibility::Visible);
+    }
+
+    #[test]
     fn reproduction_right_overflow_is_sliced_to_owner_edge() {
         let window = reproduction_window();
         let owner = owner_5120();
@@ -1682,6 +1856,33 @@ mod tests {
     }
 
     #[test]
+    fn zero_slice_parking_moves_past_a_monitor_near_the_recovery_sentinel() {
+        let owner = Rect::new(-100_000, -100_000, 500, 500);
+        let neighbor = Rect::new(-99_500, -100_000, 500, 500);
+        let window = Rect::new(-99_500, -100_000, 400, 400);
+        let context = GeometryContext {
+            owner_id: 1,
+            owner_rect: owner,
+            topology: sorted_topology(&[owner, neighbor]),
+            scale_milli: 1000,
+            insets: (7, 1, 7, 8),
+            native_style: 0,
+            window_width: window.width,
+            window_height: window.height,
+        };
+        let parked = match decide_physical_rect(window, owner, &[owner, neighbor], None, &context) {
+            PhysicalDecision::Parked { rect } => rect,
+            other => panic!("expected zero visible slice to park, got {other:?}"),
+        };
+        let outer =
+            leopardwm_platform_win32::visible_rect_to_frame_rect(parked, context.insets, false);
+        assert!(leopardwm_platform_win32::is_move_offscreen_sentinel_rect(
+            &outer
+        ));
+        assert!(parking_clears_monitors(outer, &[owner, neighbor]));
+    }
+
+    #[test]
     fn arithmetic_extremes_do_not_overflow() {
         let owner = Rect::new(i32::MIN / 2, 0, 1000, 1000);
         let neighbor = Rect::new(i32::MIN / 2 + 1000, 0, 1000, 1000);
@@ -1703,10 +1904,14 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert!(slice.width < window.width);
-        let parked = offscreen_park_rect(window, owner, &[owner, neighbor]);
+        let parked = offscreen_park_rect(window, &[owner, neighbor], (7, 1, 7, 8));
         assert_eq!((parked.width, parked.height), (window.width, window.height));
-        assert!(!parked.intersects(&owner));
-        assert!(!parked.intersects(&neighbor));
+        let outer =
+            leopardwm_platform_win32::visible_rect_to_frame_rect(parked, (7, 1, 7, 8), false);
+        assert!(leopardwm_platform_win32::is_move_offscreen_sentinel_rect(
+            &outer
+        ));
+        assert!(parking_clears_monitors(outer, &[owner, neighbor]));
     }
 
     #[test]
@@ -1888,7 +2093,7 @@ mod tests {
     }
 
     #[test]
-    fn parks_below_when_a_horizontal_neighbor_blocks_the_side() {
+    fn parks_at_recoverable_sentinel_when_a_horizontal_neighbor_blocks_the_side() {
         const WIN: Rect = Rect {
             x: 6000,
             y: 10,
@@ -1897,14 +2102,15 @@ mod tests {
         };
         let owner = owner_5120();
         let right = Rect::new(5120, 0, 1920, 1080);
-        let parked = offscreen_park_rect(WIN, owner, &[owner, right]);
-        assert_eq!(parked.y, owner.y + owner.height + 4);
+        let parked = offscreen_park_rect(WIN, &[owner, right], (0, 0, 0, 0));
+        let sentinel = leopardwm_platform_win32::MOVE_OFFSCREEN_SENTINEL_COORD;
+        assert_eq!((parked.x, parked.y), (sentinel, sentinel));
         assert_eq!((parked.width, parked.height), (WIN.width, WIN.height));
         assert!(![owner, right].iter().any(|m| parked.intersects(m)));
     }
 
     #[test]
-    fn parks_to_the_side_when_stacked_vertically_boxes_top_and_bottom() {
+    fn parks_at_recoverable_sentinel_when_stacked_vertically() {
         const WIN: Rect = Rect {
             x: 6000,
             y: 10,
@@ -1914,13 +2120,14 @@ mod tests {
         let owner = Rect::new(0, 1080, 1920, 1080);
         let above = Rect::new(0, 0, 1920, 1080);
         let below = Rect::new(0, 2160, 1920, 1080);
-        let parked = offscreen_park_rect(WIN, owner, &[owner, above, below]);
-        assert_eq!(parked.x, owner.x + owner.width + 4);
+        let parked = offscreen_park_rect(WIN, &[owner, above, below], (0, 0, 0, 0));
+        let sentinel = leopardwm_platform_win32::MOVE_OFFSCREEN_SENTINEL_COORD;
+        assert_eq!((parked.x, parked.y), (sentinel, sentinel));
         assert!(![owner, above, below].iter().any(|m| parked.intersects(m)));
     }
 
     #[test]
-    fn parks_to_the_left_when_below_above_and_right_are_all_taken() {
+    fn parks_at_recoverable_sentinel_when_other_edges_are_taken() {
         const WIN: Rect = Rect {
             x: 6000,
             y: 10,
@@ -1931,8 +2138,9 @@ mod tests {
         let below = Rect::new(2000, 1000, 1000, 1000);
         let above = Rect::new(2000, -1000, 1000, 1000);
         let right = Rect::new(3000, 0, 1000, 1000);
-        let parked = offscreen_park_rect(WIN, owner, &[owner, below, above, right]);
-        assert_eq!(parked.x, owner.x - WIN.width - 4);
+        let parked = offscreen_park_rect(WIN, &[owner, below, above, right], (0, 0, 0, 0));
+        let sentinel = leopardwm_platform_win32::MOVE_OFFSCREEN_SENTINEL_COORD;
+        assert_eq!((parked.x, parked.y), (sentinel, sentinel));
         assert!(![owner, below, above, right]
             .iter()
             .any(|m| parked.intersects(m)));
@@ -1954,7 +2162,7 @@ mod tests {
             Rect::new(0, -2000, 1000, 2000),
             Rect::new(0, 1000, 1000, 2000),
         ];
-        let parked = offscreen_park_rect(WIN, owner, &neighbors);
+        let parked = offscreen_park_rect(WIN, &neighbors, (0, 0, 0, 0));
         let sentinel = leopardwm_platform_win32::MOVE_OFFSCREEN_SENTINEL_COORD;
         assert_eq!((parked.x, parked.y), (sentinel, sentinel));
     }

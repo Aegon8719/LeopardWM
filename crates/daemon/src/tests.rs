@@ -1071,6 +1071,79 @@ fn test_stale_animation_result_does_not_release_newer_physical_latch() {
 }
 
 #[test]
+fn test_outer_animation_pump_preserves_newer_frame_and_resumes_after_sync_supersession() {
+    use crate::layout_apply::AnimationPlacementResult;
+    use crate::{interrupted_animation_frame_action, InterruptedAnimationFrameAction};
+
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    let placement = leopardwm_core_layout::WindowPlacement {
+        window_id: 100,
+        rect: Rect::new(1800, 0, 400, 600),
+        visibility: leopardwm_core_layout::Visibility::Visible,
+        column_index: 0,
+    };
+    state.apply_physical_projection(vec![placement.clone()]);
+    let (old_request, old_invalidation) = state.physical_request_ids();
+    let newer = state.apply_physical_projection(vec![placement]);
+    let (new_request, new_invalidation) = state.physical_request_ids();
+    let stale = animation_worker::FrameResult {
+        apply_result: Ok(()),
+        frame_time: std::time::Duration::ZERO,
+        width_violations: Vec::new(),
+        height_violations: Vec::new(),
+        maximized_skipped_window_ids: Vec::new(),
+        physical_request_id: old_request,
+        physical_invalidation_id: old_invalidation,
+        landings: Vec::new(),
+    };
+
+    let result = state.handle_animation_placement_result(&stale);
+    assert!(matches!(result, AnimationPlacementResult::Stale));
+    assert_eq!(state.inflight_request_id, Some(new_request));
+    assert_eq!(
+        interrupted_animation_frame_action(
+            AnimationPlacementResult::Stale,
+            state.inflight_request_id
+        ),
+        Some(InterruptedAnimationFrameAction::LeaveNewerFrame),
+        "an old completion must not supersede the newer outstanding frame"
+    );
+
+    state.consume_physical_landings(
+        new_request,
+        new_invalidation,
+        &[leopardwm_platform_win32::PlacementLanding {
+            window_id: 100,
+            requested_rect: newer[0].rect,
+            requested_visibility: newer[0].visibility,
+            actual_visible_rect: Some(newer[0].rect),
+            actual_outer_rect: Some(newer[0].rect),
+            failed: false,
+            unreadable: false,
+        }],
+        &newer,
+    );
+    assert_eq!(state.inflight_request_id, None);
+    assert_eq!(
+        interrupted_animation_frame_action(AnimationPlacementResult::Stale, state.inflight_request_id),
+        Some(InterruptedAnimationFrameAction::Resume),
+        "after synchronous apply consumes the newer request, the stale acknowledgement restarts the pump"
+    );
+    assert_eq!(
+        interrupted_animation_frame_action(AnimationPlacementResult::InvalidatedCurrent, None),
+        Some(InterruptedAnimationFrameAction::ReapplyThenResume),
+        "a matching invalidated frame re-lands before progressing"
+    );
+    assert_eq!(
+        interrupted_animation_frame_action(AnimationPlacementResult::Current, None),
+        None
+    );
+}
+
+#[test]
 fn test_invalidated_animation_result_releases_only_matching_latch() {
     let mut state = AppState::new_with_config(test_config(), two_monitors());
     state.workspaces.get_mut(&1).unwrap()[0]
