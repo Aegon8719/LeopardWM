@@ -10798,6 +10798,135 @@ fn test_persisted_signature_changes_on_active_workspace() {
 }
 
 #[test]
+fn test_width_only_persistence_tracks_requested_not_native_width() {
+    let window_id = u64::MAX - 1;
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let viewport_width = state.focused_viewport().width;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(window_id, Some(300))
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    state.install_save_channel(tx);
+    state.request_save_if_changed();
+    assert_eq!(rx.try_recv(), Ok(()));
+
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.set_window_min_width(window_id, 1200);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[0]),
+        1200
+    );
+    state.request_save_if_changed();
+    assert_eq!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    );
+
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.set_focused_column_width_fraction(0.25, viewport_width);
+    let requested_width = workspace.columns()[0].width();
+    assert_ne!(requested_width, 300);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[0]),
+        1200
+    );
+    state.request_save_if_changed();
+    assert_eq!(
+        rx.try_recv(),
+        Ok(()),
+        "requested-width change must queue a save"
+    );
+    let saved: serde_json::Value =
+        serde_json::from_str(&state.build_state_json().unwrap()).unwrap();
+    assert_eq!(
+        saved["workspaces"][0]["workspace"]["columns"][0]["width"],
+        requested_width
+    );
+    state.request_save_if_changed();
+    assert_eq!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    );
+}
+
+#[test]
+fn test_width_only_persistence_command_saves_unchanged_placements() {
+    let window_id = u64::MAX - 1;
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state.reduce_motion = true;
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.insert_window(window_id, Some(300)).unwrap();
+    workspace.commit_pending_min_size_clears();
+    workspace.set_window_min_width(window_id, 1200);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    state.install_save_channel(tx);
+    state.apply_layout().unwrap();
+    assert_eq!(rx.try_recv(), Ok(()));
+    let placements = state.last_placed_layout_rects.clone();
+    assert_eq!(placements[&window_id].width, 1200);
+
+    assert!(matches!(
+        state.handle_command(IpcCommand::SetColumnWidth { fraction: 0.25 }),
+        IpcResponse::Ok
+    ));
+    let workspace = state.focused_workspace().unwrap();
+    assert_ne!(workspace.columns()[0].width(), 300);
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[0]),
+        1200
+    );
+    assert_eq!(workspace.scroll_offset(), 0.0);
+    assert_eq!(state.last_placed_layout_rects, placements);
+    assert!(!state.applying_layout);
+    assert!(state.layout_transition.is_none());
+    assert_eq!(
+        rx.try_recv(),
+        Ok(()),
+        "unchanged placements must not skip saving width intent"
+    );
+    state.apply_layout().unwrap();
+    assert_eq!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    );
+}
+
+#[test]
+fn test_width_only_persistence_resize_queues_save() {
+    let window_id = u64::MAX - 1;
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state.reduce_motion = true;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(window_id, Some(800))
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    state.install_save_channel(tx);
+    state.apply_layout().unwrap();
+    assert_eq!(rx.try_recv(), Ok(()));
+
+    assert!(matches!(
+        state.handle_command(IpcCommand::Resize { delta: -100 }),
+        IpcResponse::Ok
+    ));
+    let workspace = state.focused_workspace().unwrap();
+    assert_eq!(workspace.columns()[0].width(), 700);
+    assert_eq!(workspace.scroll_offset(), 0.0);
+    assert_eq!(state.last_placed_layout_rects[&window_id].width, 700);
+    assert_eq!(rx.try_recv(), Ok(()), "width-only resize must queue a save");
+    state.apply_layout().unwrap();
+    assert_eq!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    );
+}
+
+#[test]
 fn test_request_save_if_changed_updates_last_sig_and_no_panic_without_sender() {
     // No save_request_tx installed (constructor leaves it None under
     // cfg(test)); request must update last_persisted_sig and not panic.

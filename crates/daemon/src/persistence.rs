@@ -95,10 +95,10 @@ impl AppState {
         Ok(json)
     }
 
-    /// Cheap deterministic hash of the PERSISTED state (everything
-    /// `build_state_json` would serialize): focused monitor, per-monitor
-    /// active workspace index, every workspace's column membership +
-    /// floating windows + rounded scroll offset, and tab title override
+    /// Cheap deterministic hash for save-request deduplication: focused
+    /// monitor, per-monitor active workspace index, every workspace's
+    /// requested column widths + membership + floating windows + rounded
+    /// scroll offset, and tab title override
     /// keys/value lengths. Used to dedup save requests so unchanged
     /// state (e.g. mid-animation frames with no structural delta) does
     /// not enqueue a write.
@@ -118,8 +118,8 @@ impl AppState {
             self.active_workspace_idx(monitor_id).hash(&mut hasher);
             if let Some(ws_vec) = self.workspaces.get(&monitor_id) {
                 for workspace in ws_vec {
-                    // Column window-id membership (Vec<Vec<u64>>).
                     for column in workspace.columns() {
+                        column.width().hash(&mut hasher);
                         column.windows().len().hash(&mut hasher);
                         for &wid in column.windows() {
                             wid.hash(&mut hasher);

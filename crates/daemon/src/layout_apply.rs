@@ -554,6 +554,7 @@ impl AppState {
         let bypass_fast_path = false;
         if placements_unchanged && !self.post_animation_nudge_pending && !bypass_fast_path {
             self.applying_layout = false;
+            self.request_save_if_changed();
             return Ok(());
         }
 

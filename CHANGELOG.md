@@ -14,6 +14,9 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Fixes
 
+- **Column width changes trigger workspace saves without an unrelated layout change.**
+  Save detection tracks requested widths even when a native minimum keeps the effective
+  placement unchanged, while transient native constraints do not become saved width intent.
 - **Animations preserve their final native placement even when the layout is unchanged.**
   A pending landing bypasses the unchanged-layout shortcut, and its exact endpoint is queued
   after intermediate frames so delayed native moves cannot overwrite the resting position.

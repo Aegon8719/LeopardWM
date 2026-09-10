@@ -2305,8 +2305,8 @@ async fn handle_persist_state_now(state: &Arc<Mutex<AppState>>) {
 
 /// Install the debounced save channel and spawn the coalescing task.
 ///
-/// `finalize_layout_success` posts a `()` request whenever a PERSISTED
-/// field changes; the task coalesces a burst into at most ~one
+/// `request_save_if_changed` posts a `()` request when its persisted-field
+/// signature changes; the task coalesces a burst into at most ~one
 /// persist/second. The task itself never touches `AppState` (which is
 /// not `Send`): after the quiet period it asks the main loop to persist
 /// via `DaemonEvent::PersistStateNow`, which builds the snapshot under
