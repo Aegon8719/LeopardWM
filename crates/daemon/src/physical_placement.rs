@@ -775,13 +775,15 @@ impl AppState {
         }
 
         if let Some(mut origins) = self.inflight_origins.remove(&request_id) {
-            for presentation in origins.values_mut() {
-                presentation.confirmed = false;
+            if !origins.is_empty() {
+                for presentation in origins.values_mut() {
+                    presentation.confirmed = false;
+                }
+                self.last_physical_presentations = origins;
+                self.last_applied_physical_invalidation =
+                    self.physical_invalidation_id.load(Ordering::SeqCst);
+                self.last_topology_signature = topology_signature(&self.monitors);
             }
-            self.last_physical_presentations = origins;
-            self.last_applied_physical_invalidation =
-                self.physical_invalidation_id.load(Ordering::SeqCst);
-            self.last_topology_signature = topology_signature(&self.monitors);
         }
         if self.inflight_request_id == Some(request_id) {
             self.inflight_request_id = None;

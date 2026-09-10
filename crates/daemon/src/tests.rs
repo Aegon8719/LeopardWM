@@ -467,6 +467,68 @@ fn test_placement_parked_maximized_target_reaches_sync_and_animation_dispatch() 
 }
 
 #[test]
+fn test_empty_abandoned_request_preserves_unconfirmed_physical_context() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    let placement = leopardwm_core_layout::WindowPlacement {
+        window_id: 100,
+        rect: Rect::new(0, 0, 800, 1040),
+        visibility: leopardwm_core_layout::Visibility::Visible,
+        column_index: 0,
+    };
+
+    state.apply_physical_projection(vec![placement.clone()]);
+    let (failed_request_id, failed_invalidation_id) = state.physical_request_ids();
+    state.abandon_physical_request(failed_request_id, failed_invalidation_id);
+    let failed_presentation = state.last_physical_presentations[&100].clone();
+    assert!(!failed_presentation.confirmed);
+    assert!(!state.physical_fast_path_ok());
+
+    let now = std::time::Instant::now();
+    state.window_managed_at.insert(100, now);
+    state.window_last_maximized_at.insert(100, now);
+    assert!(
+        state
+            .prepare_physical_placements_with_parked(
+                vec![placement],
+                &std::collections::HashSet::from([100]),
+                |_| true,
+            )
+            .is_empty(),
+        "a temporarily settling visible window is filtered before physical dispatch"
+    );
+    let (empty_request_id, empty_invalidation_id) = state.physical_request_ids();
+    state.abandon_physical_request(empty_request_id, empty_invalidation_id);
+
+    let retained = state.last_physical_presentations.get(&100).unwrap();
+    assert_eq!(retained.request_id, failed_presentation.request_id);
+    assert_eq!(
+        retained.invalidation_id,
+        failed_presentation.invalidation_id
+    );
+    assert!(!retained.confirmed);
+    assert_eq!(
+        retained.physical.window_id,
+        failed_presentation.physical.window_id
+    );
+    assert_eq!(retained.physical.rect, failed_presentation.physical.rect);
+    assert_eq!(
+        retained.physical.visibility,
+        failed_presentation.physical.visibility
+    );
+    assert_eq!(
+        retained.physical.column_index,
+        failed_presentation.physical.column_index
+    );
+    assert!(
+        !state.physical_fast_path_ok(),
+        "an unchanged layout must still require a current landing after an empty abandoned request"
+    );
+}
+
+#[test]
 fn test_animation_maximized_skip_result_invalidates_daemon_bookkeeping() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     state.applying_layout = true;
