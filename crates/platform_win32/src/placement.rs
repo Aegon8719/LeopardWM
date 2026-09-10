@@ -326,6 +326,16 @@ fn uncloak_all_tracked() {
 /// Global set of window IDs currently cloaked by the placement system.
 static GLOBAL_CLOAKED: Mutex<Option<HashSet<WindowId>>> = Mutex::new(None);
 
+/// Tests that insert into or drain `GLOBAL_CLOAKED`, `GHOST_CLOAKED`, or
+/// `DIRECT_CLOAKED` share those process-global sets. Per-set mutexes only
+/// cover a single operation, so a multi-step parked-recovery sequence can
+/// lose membership when an empty apply or shutdown uncloak runs in parallel.
+#[cfg(test)]
+pub(crate) fn lock_cloak_set_tests() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(crate::recover_poisoned_mutex)
+}
+
 /// Cache of last-applied window placements and border insets.
 ///
 /// The position cache skips redundant SetWindowPos calls during animations.
@@ -2491,13 +2501,60 @@ mod tests {
         assert_eq!(suspects.get(&8), Some(&(Some(820), None)));
     }
 
+    struct CloakMembershipGuard {
+        window_id: WindowId,
+        had_global: bool,
+        had_ghost: bool,
+        had_direct: bool,
+    }
+
+    impl CloakMembershipGuard {
+        fn claim(window_id: WindowId) -> Self {
+            let this = Self {
+                window_id,
+                had_global: global_cloaked_contains(window_id),
+                had_ghost: ghost_cloaked_contains(window_id),
+                had_direct: lock_direct_cloaked()
+                    .as_ref()
+                    .is_some_and(|set| set.contains(&window_id)),
+            };
+            restore_cloak_membership(window_id, false, lock_cloaked);
+            restore_cloak_membership(window_id, false, lock_ghost_cloaked);
+            restore_cloak_membership(window_id, false, lock_direct_cloaked);
+            this
+        }
+    }
+
+    impl Drop for CloakMembershipGuard {
+        fn drop(&mut self) {
+            restore_cloak_membership(self.window_id, self.had_global, lock_cloaked);
+            restore_cloak_membership(self.window_id, self.had_ghost, lock_ghost_cloaked);
+            restore_cloak_membership(self.window_id, self.had_direct, lock_direct_cloaked);
+        }
+    }
+
+    fn restore_cloak_membership(
+        window_id: WindowId,
+        present: bool,
+        lock: impl FnOnce() -> std::sync::MutexGuard<'static, Option<HashSet<WindowId>>>,
+    ) {
+        let mut guard = lock();
+        if present {
+            guard.get_or_insert_with(HashSet::new).insert(window_id);
+        } else if let Some(set) = guard.as_mut() {
+            set.remove(&window_id);
+        }
+    }
+
     #[test]
     fn test_direct_cloak_is_tracked_for_recovery() {
         // A directly-cloaked window (e.g. a stashed scratchpad) must be
         // tracked in DIRECT_CLOAKED so shutdown/panic recovery can restore
         // it; otherwise it would be permanently invisible. Uses a unique
         // wid so it won't collide with parallel tests touching the set.
+        let _serialize = lock_cloak_set_tests();
         let wid: WindowId = 0x7FFF_FF01;
+        let _membership = CloakMembershipGuard::claim(wid);
         dwm_cloak_window(wid);
         assert!(
             lock_direct_cloaked()
@@ -2516,6 +2573,7 @@ mod tests {
 
     #[test]
     fn test_apply_placements_empty() {
+        let _serialize = lock_cloak_set_tests();
         // Verify empty placements succeed without error
         let config = PlatformConfig::default();
         let result = apply_placements(&[], &config, None, false);
@@ -2524,6 +2582,7 @@ mod tests {
 
     #[test]
     fn test_apply_placements_skips_invalid_windows() {
+        let _serialize = lock_cloak_set_tests();
         let config = PlatformConfig::default();
         let placements = vec![WindowPlacement {
             window_id: 0,
@@ -2545,25 +2604,11 @@ mod tests {
     /// process-global.
     #[test]
     fn test_or_cloak_invariant() {
+        let _serialize = lock_cloak_set_tests();
         let wid: WindowId = 0xFFFF_FFFF_FFFF_FF00;
-
-        // Snapshot any pre-existing state so we restore cleanly.
-        let had_global_before = global_cloaked_contains(wid);
-        let had_ghost_before = ghost_cloaked_contains(wid);
+        let _membership = CloakMembershipGuard::claim(wid);
 
         // Case 1: neither set → false.
-        {
-            let mut g = lock_cloaked();
-            if let Some(ref mut s) = *g {
-                s.remove(&wid);
-            }
-        }
-        {
-            let mut g = lock_ghost_cloaked();
-            if let Some(ref mut s) = *g {
-                s.remove(&wid);
-            }
-        }
         assert!(!is_placement_cloaked(wid), "neither set should give false");
 
         // Case 2: global only → true.
@@ -2593,16 +2638,54 @@ mod tests {
             !is_placement_cloaked(wid),
             "neither again should give false"
         );
+    }
 
-        // Restore pre-existing state for whatever ran before this test.
-        if had_global_before {
-            let mut g = lock_cloaked();
-            let s = g.get_or_insert_with(HashSet::new);
-            s.insert(wid);
-        }
-        if had_ghost_before {
-            mark_ghost_cloaked(wid);
-        }
+    #[test]
+    fn test_empty_apply_and_managed_uncloak_clear_foreign_parked_cloaks() {
+        let _serialize = lock_cloak_set_tests();
+        let parked: WindowId = 0xFFFF_FFFF_FFFF_FF13;
+        let direct: WindowId = 0xFFFF_FFFF_FFFF_FF14;
+        let _parked_membership = CloakMembershipGuard::claim(parked);
+        let _direct_membership = CloakMembershipGuard::claim(direct);
+        let visible_tiled = WindowPlacement {
+            window_id: parked,
+            rect: Rect::new(0, 0, 800, 600),
+            visibility: Visibility::Visible,
+            column_index: 0,
+        };
+        let mut cache = PlacementCache::new();
+        cache
+            .positions
+            .insert(parked, (visible_tiled.rect, Visibility::Visible));
+
+        mark_placement_parked(parked);
+        apply_placements(&[], &PlatformConfig::default(), None, false)
+            .expect("empty apply should succeed");
+        assert!(skip_visible_tiled_maximized(
+            &visible_tiled,
+            true,
+            Some(&mut cache),
+            SET_WINDOW_POS_FLAGS(0),
+        ));
+        assert!(
+            !is_placement_parked(parked),
+            "empty apply_placements drains GLOBAL_CLOAKED, so invalid maximized recovery cannot retain placement ownership"
+        );
+
+        mark_placement_parked(parked);
+        mark_ghost_cloaked(parked);
+        dwm_cloak_window(direct);
+        crate::uncloak_all_managed_windows(&[]);
+        assert!(
+            !is_placement_cloaked(parked),
+            "uncloak_all_managed_windows drains GLOBAL and GHOST via dwm_uncloak_all"
+        );
+        assert!(
+            !lock_direct_cloaked()
+                .as_ref()
+                .is_some_and(|set| set.contains(&direct)),
+            "uncloak_all_managed_windows drains DIRECT_CLOAKED via dwm_uncloak_all"
+        );
     }
 
     /// Regression: a visible tiled placement skipped because the HWND is
@@ -2610,7 +2693,9 @@ mod tests {
     /// then releases exactly that ownership after a successful recovery.
     #[test]
     fn test_skip_visible_tiled_maximized_recovers_only_after_position_succeeds() {
+        let _serialize = lock_cloak_set_tests();
         let wid: WindowId = 0xFFFF_FFFF_FFFF_FF10;
+        let _membership = CloakMembershipGuard::claim(wid);
         let visible_tiled = WindowPlacement {
             window_id: wid,
             rect: Rect::new(0, 0, 800, 600),
@@ -2618,16 +2703,6 @@ mod tests {
             column_index: 0,
         };
         let landing_flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
-
-        let had_global_before = global_cloaked_contains(wid);
-        let had_ghost_before = ghost_cloaked_contains(wid);
-        {
-            let mut g = lock_cloaked();
-            if let Some(ref mut s) = *g {
-                s.remove(&wid);
-            }
-        }
-        unmark_ghost_cloaked(wid);
 
         let mut cache = PlacementCache::new();
         assert!(!skip_visible_tiled_maximized(
@@ -2701,13 +2776,5 @@ mod tests {
             "successful recovery must retain a ghost-owned effective cloak"
         );
         unmark_ghost_cloaked(wid);
-
-        if had_global_before {
-            let mut g = lock_cloaked();
-            g.get_or_insert_with(HashSet::new).insert(wid);
-        }
-        if had_ghost_before {
-            mark_ghost_cloaked(wid);
-        }
     }
 }

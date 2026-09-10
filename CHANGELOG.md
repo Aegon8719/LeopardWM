@@ -49,6 +49,7 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Internal
 
+- **Platform cloak-set tests serialize around the shared tracking sets.** Empty apply, shutdown uncloak, and parked-recovery fixtures no longer interleave process-global cloak membership.
 - **Desktop acceptance checks distinguish layout behavior from restoration failures.**
   Offline helpers exclude fully minimized columns from strip extent and plan bounded
   requested-width repairs without treating native minimums as intent changes. Synthetic
