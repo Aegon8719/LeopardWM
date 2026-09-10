@@ -312,6 +312,11 @@ impl AppState {
         self.abort_active_crossfade();
     }
 
+    pub(crate) fn invalidate_physical_display_change(&mut self) {
+        self.abort_active_crossfade();
+        self.bump_physical_invalidation();
+    }
+
     /// Send `AbortCrossfade { epoch }` to the worker if a fade is in
     /// flight. The worker checks between fade iterations and exits
     /// early; CrossfadeComplete arrives within ~16ms (one DwmFlush).
@@ -322,11 +327,6 @@ impl AppState {
     /// confirms the worker has stopped using the entries. This avoids
     /// re-registering a thumbnail for the same source HWND while the
     /// worker may still be updating the old one (Microsoft Q&A 3229922).
-    pub(crate) fn invalidate_physical_display_change(&mut self) {
-        self.abort_active_crossfade();
-        self.bump_physical_invalidation();
-    }
-
     pub(crate) fn abort_active_crossfade(&mut self) {
         if let Some(state) = self.active_crossfade.take() {
             if let Some(ref ctrl) = self.animation_worker_control {

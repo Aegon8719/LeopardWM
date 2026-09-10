@@ -2230,11 +2230,10 @@ impl AppState {
             dwm_rect,
             is_zoomed,
         )?;
+        let expected_physical = self.expected_physical_rect(hwnd);
         if let Some(expected) = application_fullscreen_expected_layout_rect(
-            self.expected_physical_rect(hwnd)
-                .or_else(|| self.compute_window_layout_rect(hwnd)),
-            self.expected_physical_rect(hwnd)
-                .or_else(|| self.last_placed_layout_rects.get(&hwnd).copied()),
+            expected_physical.or_else(|| self.compute_window_layout_rect(hwnd)),
+            expected_physical.or_else(|| self.last_placed_layout_rects.get(&hwnd).copied()),
         ) {
             let scale_factor = self
                 .monitors

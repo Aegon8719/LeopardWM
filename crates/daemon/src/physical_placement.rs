@@ -487,7 +487,6 @@ pub(crate) fn convert_failed_slices_to_parks(
     placements: &[WindowPlacement],
     failed_ids: &HashSet<u64>,
     retained: &HashMap<u64, Rect>,
-    _owners: &HashMap<u64, Rect>,
     monitor_rects: &[Rect],
 ) -> Vec<WindowPlacement> {
     placements
@@ -815,12 +814,7 @@ impl AppState {
             && invalidation_id == self.physical_invalidation_id.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn allows_core_size_feedback(
-        &self,
-        request_id: u64,
-        window_id: u64,
-        width: bool,
-    ) -> bool {
+    pub(crate) fn allows_core_size_feedback(&self, request_id: u64, window_id: u64) -> bool {
         let Some(origin) = self
             .inflight_origins
             .get(&request_id)
@@ -829,7 +823,6 @@ impl AppState {
             return true;
         };
 
-        let _ = width;
         matches!(origin.kind, PhysicalKind::Unchanged)
     }
 
@@ -907,7 +900,6 @@ impl AppState {
             .collect();
         let mut failed_ids = HashSet::new();
         let mut retained = HashMap::new();
-        let mut owners = HashMap::new();
         let mut confirmed = origins.clone();
 
         for (window_id, presentation) in &origins {
@@ -942,7 +934,6 @@ impl AppState {
             let Some(owner) = self.monitors.get(&presentation.owner_id).map(|m| m.rect) else {
                 continue;
             };
-            owners.insert(*window_id, owner);
             let Some(landing) = landings_by_id.get(window_id) else {
                 warn!(
                     "Physical containment of window {} is blocked: no native readback",
@@ -993,7 +984,31 @@ impl AppState {
             return Vec::new();
         }
 
-        convert_failed_slices_to_parks(dispatched, &failed_ids, &retained, &owners, &rects)
+        convert_failed_slices_to_parks(dispatched, &failed_ids, &retained, &rects)
+    }
+
+    pub(crate) fn acknowledge_empty_physical_state(
+        &mut self,
+        request_id: u64,
+        invalidation_id: u64,
+        logically_empty: bool,
+    ) {
+        if !logically_empty
+            || request_id == 0
+            || !self.physical_result_is_current(request_id, invalidation_id)
+            || !self.last_physical_presentations.is_empty()
+        {
+            return;
+        }
+        let Some(origins) = self.inflight_origins.get(&request_id) else {
+            return;
+        };
+        if !origins.is_empty() {
+            return;
+        }
+        self.last_applied_physical_invalidation =
+            self.physical_invalidation_id.load(Ordering::SeqCst);
+        self.last_topology_signature = topology_signature(&self.monitors);
     }
 
     pub(crate) fn begin_physical_follow_up(&mut self, follow_up: &[WindowPlacement]) {
@@ -2075,14 +2090,8 @@ mod tests {
         ];
         let failed = HashSet::from([1u64]);
         let retained = HashMap::from([(1u64, Rect::new(4320, 10, 1600, 1440))]);
-        let owners = HashMap::from([(1u64, owner)]);
-        let follow_up = convert_failed_slices_to_parks(
-            &placements,
-            &failed,
-            &retained,
-            &owners,
-            &[owner, neighbor],
-        );
+        let follow_up =
+            convert_failed_slices_to_parks(&placements, &failed, &retained, &[owner, neighbor]);
         assert_eq!(follow_up[1].window_id, placements[1].window_id);
         assert_eq!(follow_up[1].rect, placements[1].rect);
         assert_eq!(follow_up[1].visibility, placements[1].visibility);
@@ -2096,6 +2105,76 @@ mod tests {
         );
         assert!(!follow_up[0].rect.intersects(&owner));
         assert!(!follow_up[0].rect.intersects(&neighbor));
+    }
+
+    #[test]
+    fn empty_acknowledgement_ignores_stale_and_superseded_requests() {
+        let mut state = AppState::new_with_config(
+            crate::config::Config::default(),
+            vec![monitor(1, 0, 0, 1920, 1080)],
+        );
+        state.apply_physical_projection(Vec::new());
+        let (stale_request, stale_invalidation) = state.physical_request_ids();
+        let applied = state.last_applied_physical_invalidation;
+        let topology = state.last_topology_signature.clone();
+
+        state.bump_physical_invalidation();
+        state.acknowledge_empty_physical_state(stale_request, stale_invalidation, true);
+        assert_eq!(state.last_applied_physical_invalidation, applied);
+        assert_eq!(state.last_topology_signature, topology);
+        assert_eq!(state.pending_physical_request_id, stale_request);
+        assert_eq!(state.inflight_request_id, Some(stale_request));
+        assert!(state.inflight_origins.contains_key(&stale_request));
+
+        state.apply_physical_projection(Vec::new());
+        let (newer_request, newer_invalidation) = state.physical_request_ids();
+        assert_ne!(newer_request, stale_request);
+        state.acknowledge_empty_physical_state(stale_request, stale_invalidation, true);
+        assert_eq!(state.pending_physical_request_id, newer_request);
+        assert_eq!(state.pending_physical_invalidation_id, newer_invalidation);
+        assert_eq!(state.inflight_request_id, Some(newer_request));
+        assert!(state.inflight_origins.contains_key(&newer_request));
+        assert!(!state.inflight_origins.contains_key(&stale_request));
+        assert_eq!(state.last_applied_physical_invalidation, applied);
+        assert_eq!(state.last_topology_signature, topology);
+    }
+
+    #[test]
+    fn empty_acknowledgement_is_fail_closed_without_logical_emptiness_or_prior_evidence() {
+        let mut state = AppState::new_with_config(
+            crate::config::Config::default(),
+            vec![monitor(1, 0, 0, 1920, 1080)],
+        );
+        state.apply_physical_projection(Vec::new());
+        let (empty_request, empty_invalidation) = state.physical_request_ids();
+        let applied = state.last_applied_physical_invalidation;
+        let topology = state.last_topology_signature.clone();
+        state.acknowledge_empty_physical_state(empty_request, empty_invalidation, false);
+        assert_eq!(state.last_applied_physical_invalidation, applied);
+        assert_eq!(state.last_topology_signature, topology);
+        assert_eq!(state.pending_physical_request_id, empty_request);
+
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(100, Some(800))
+            .unwrap();
+        state.apply_physical_projection(vec![placement(
+            100,
+            Rect::new(0, 0, 800, 1040),
+            Visibility::Visible,
+        )]);
+        let (failed_request, failed_invalidation) = state.physical_request_ids();
+        state.abandon_physical_request(failed_request, failed_invalidation);
+        assert!(!state.last_physical_presentations[&100].confirmed);
+        let applied = state.last_applied_physical_invalidation;
+        let topology = state.last_topology_signature.clone();
+        state.apply_physical_projection(Vec::new());
+        let (later_request, later_invalidation) = state.physical_request_ids();
+        state.acknowledge_empty_physical_state(later_request, later_invalidation, true);
+        assert_eq!(state.last_applied_physical_invalidation, applied);
+        assert_eq!(state.last_topology_signature, topology);
+        assert!(!state.last_physical_presentations[&100].confirmed);
+        assert_eq!(state.pending_physical_request_id, later_request);
+        assert!(state.inflight_origins.contains_key(&later_request));
     }
 
     #[test]

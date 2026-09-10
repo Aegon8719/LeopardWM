@@ -132,7 +132,6 @@ impl AppState {
                 self.allows_core_size_feedback(
                     frame_result.physical_request_id,
                     violation.window_id,
-                    true,
                 )
             })
             .cloned()
@@ -144,7 +143,6 @@ impl AppState {
                 self.allows_core_size_feedback(
                     frame_result.physical_request_id,
                     violation.window_id,
-                    false,
                 )
             })
             .cloned()
@@ -530,6 +528,7 @@ impl AppState {
         self.commit_pending_min_size_clears();
 
         let mut all_placements = self.collect_apply_placements();
+        let logically_empty = all_placements.is_empty();
 
         // Interpolate layout transitions (structural changes like move/expel).
         if let Some(ref transition) = self.layout_transition {
@@ -584,6 +583,11 @@ impl AppState {
         #[cfg(not(test))]
         let invoke_injected_empty_worker = false;
         if dispatched_placements.is_empty() && !invoke_injected_empty_worker {
+            self.acknowledge_empty_physical_state(
+                physical_request_id,
+                physical_invalidation_id,
+                logically_empty,
+            );
             self.abandon_physical_request(physical_request_id, physical_invalidation_id);
             self.applying_layout = false;
             self.finalize_layout_success();
@@ -624,21 +628,13 @@ impl AppState {
                 let width_violations: Vec<_> = width_violations
                     .into_iter()
                     .filter(|violation| {
-                        self.allows_core_size_feedback(
-                            physical_request_id,
-                            violation.window_id,
-                            true,
-                        )
+                        self.allows_core_size_feedback(physical_request_id, violation.window_id)
                     })
                     .collect();
                 let height_violations: Vec<_> = height_violations
                     .into_iter()
                     .filter(|violation| {
-                        self.allows_core_size_feedback(
-                            physical_request_id,
-                            violation.window_id,
-                            false,
-                        )
+                        self.allows_core_size_feedback(physical_request_id, violation.window_id)
                     })
                     .collect();
                 let primary_succeeded = result.is_ok();

@@ -484,7 +484,16 @@ fn test_empty_abandoned_request_preserves_unconfirmed_physical_context() {
     state.abandon_physical_request(failed_request_id, failed_invalidation_id);
     let failed_presentation = state.last_physical_presentations[&100].clone();
     assert!(!failed_presentation.confirmed);
+    let applied_invalidation = state.last_applied_physical_invalidation;
+    let applied_topology = state.last_topology_signature.clone();
     assert!(!state.physical_fast_path_ok());
+
+    state.bump_physical_invalidation();
+    state.monitors.get_mut(&1).unwrap().rect.width += 64;
+    let current_invalidation = state.physical_invalidation_id.load(Ordering::SeqCst);
+    let current_topology = crate::physical_placement::topology_signature(&state.monitors);
+    assert_ne!(applied_invalidation, current_invalidation);
+    assert_ne!(applied_topology, current_topology);
 
     let now = std::time::Instant::now();
     state.window_managed_at.insert(100, now);
@@ -500,14 +509,31 @@ fn test_empty_abandoned_request_preserves_unconfirmed_physical_context() {
         "a temporarily settling visible window is filtered before physical dispatch"
     );
     let (empty_request_id, empty_invalidation_id) = state.physical_request_ids();
+    assert_ne!(empty_request_id, failed_request_id);
+    assert_ne!(empty_invalidation_id, failed_invalidation_id);
     state.abandon_physical_request(empty_request_id, empty_invalidation_id);
 
+    assert_eq!(
+        state.last_applied_physical_invalidation,
+        applied_invalidation
+    );
+    assert_eq!(state.last_topology_signature, applied_topology);
+    assert_ne!(
+        state.last_applied_physical_invalidation,
+        current_invalidation
+    );
+    assert_ne!(
+        state.last_topology_signature,
+        crate::physical_placement::topology_signature(&state.monitors)
+    );
     let retained = state.last_physical_presentations.get(&100).unwrap();
     assert_eq!(retained.request_id, failed_presentation.request_id);
     assert_eq!(
         retained.invalidation_id,
         failed_presentation.invalidation_id
     );
+    assert_ne!(retained.request_id, empty_request_id);
+    assert_ne!(retained.invalidation_id, empty_invalidation_id);
     assert!(!retained.confirmed);
     assert_eq!(
         retained.physical.window_id,
@@ -522,10 +548,145 @@ fn test_empty_abandoned_request_preserves_unconfirmed_physical_context() {
         retained.physical.column_index,
         failed_presentation.physical.column_index
     );
+    assert_eq!(state.pending_physical_request_id, 0);
+    assert_eq!(state.pending_physical_invalidation_id, 0);
+    assert_eq!(state.inflight_request_id, None);
+    assert!(state.inflight_origins.is_empty());
+    assert!(state.pending_physical_presentations.is_empty());
     assert!(
         !state.physical_fast_path_ok(),
         "an unchanged layout must still require a current landing after an empty abandoned request"
     );
+}
+
+#[test]
+fn test_empty_layout_apply_consumes_stale_stamps_for_fast_path() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state.bump_physical_invalidation();
+    assert!(
+        !state.physical_fast_path_ok(),
+        "a fresh empty layout starts with stale topology/invalidation stamps"
+    );
+    let seq_before = state.physical_request_seq;
+
+    assert!(state.apply_layout().is_ok());
+    assert!(
+        state.physical_fast_path_ok(),
+        "a genuinely empty apply must consume stale stamps so the next layout can take the fast path"
+    );
+    assert_eq!(state.pending_physical_request_id, 0);
+    assert_eq!(state.inflight_request_id, None);
+    assert!(state.inflight_origins.is_empty());
+    assert!(state.last_physical_presentations.is_empty());
+    let seq_after_first = state.physical_request_seq;
+    assert!(
+        seq_after_first > seq_before,
+        "the first empty apply still allocates a current physical request"
+    );
+
+    assert!(state.apply_layout().is_ok());
+    assert_eq!(
+        state.physical_request_seq, seq_after_first,
+        "a current empty layout must not allocate another physical request"
+    );
+    assert_eq!(state.pending_physical_request_id, 0);
+    assert!(state.physical_fast_path_ok());
+}
+
+fn arm_settling_window(state: &mut AppState, window_id: u64) {
+    let now = std::time::Instant::now();
+    state.window_managed_at.insert(window_id, now);
+    state.window_last_maximized_at.insert(window_id, now);
+}
+
+#[test]
+fn test_filtered_empty_apply_with_empty_prior_evidence_retains_retry() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.bump_physical_invalidation();
+    arm_settling_window(&mut state, 100);
+    let applied_invalidation = state.last_applied_physical_invalidation;
+    let applied_topology = state.last_topology_signature.clone();
+    let seq_before = state.physical_request_seq;
+    assert!(state.last_physical_presentations.is_empty());
+    assert!(!state.physical_fast_path_ok());
+
+    assert!(state.apply_layout().is_ok());
+    assert_eq!(
+        state.last_applied_physical_invalidation,
+        applied_invalidation
+    );
+    assert_eq!(state.last_topology_signature, applied_topology);
+    assert!(
+        !state.physical_fast_path_ok(),
+        "filtered-empty work with no prior presentation must keep retrying"
+    );
+    let seq_after_first = state.physical_request_seq;
+    assert!(seq_after_first > seq_before);
+
+    arm_settling_window(&mut state, 100);
+    assert!(state.apply_layout().is_ok());
+    assert!(
+        state.physical_request_seq > seq_after_first,
+        "a later filtered-empty apply must allocate a fresh request instead of taking the fast path"
+    );
+    assert!(!state.physical_fast_path_ok());
+}
+
+#[test]
+fn test_filtered_empty_apply_with_unconfirmed_prior_evidence_retains_retry() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    let placement = leopardwm_core_layout::WindowPlacement {
+        window_id: 100,
+        rect: Rect::new(0, 0, 800, 1040),
+        visibility: leopardwm_core_layout::Visibility::Visible,
+        column_index: 0,
+    };
+    state.apply_physical_projection(vec![placement]);
+    let (failed_request_id, failed_invalidation_id) = state.physical_request_ids();
+    state.abandon_physical_request(failed_request_id, failed_invalidation_id);
+    let failed_presentation = state.last_physical_presentations[&100].clone();
+    let applied_invalidation = state.last_applied_physical_invalidation;
+    let applied_topology = state.last_topology_signature.clone();
+
+    state.bump_physical_invalidation();
+    state.monitors.get_mut(&1).unwrap().rect.width += 64;
+    arm_settling_window(&mut state, 100);
+    let seq_before = state.physical_request_seq;
+    assert!(!state.physical_fast_path_ok());
+
+    assert!(state.apply_layout().is_ok());
+    assert_eq!(
+        state.last_applied_physical_invalidation,
+        applied_invalidation
+    );
+    assert_eq!(state.last_topology_signature, applied_topology);
+    let retained = state.last_physical_presentations.get(&100).unwrap();
+    assert_eq!(retained.request_id, failed_presentation.request_id);
+    assert_eq!(
+        retained.invalidation_id,
+        failed_presentation.invalidation_id
+    );
+    assert!(!retained.confirmed);
+    assert!(!state.physical_fast_path_ok());
+    let seq_after_first = state.physical_request_seq;
+    assert!(seq_after_first > seq_before);
+
+    arm_settling_window(&mut state, 100);
+    assert!(state.apply_layout().is_ok());
+    assert!(
+        state.physical_request_seq > seq_after_first,
+        "unconfirmed prior evidence must not become current through a filtered-empty apply"
+    );
+    assert!(!state.physical_fast_path_ok());
 }
 
 #[test]
@@ -1048,12 +1209,8 @@ fn test_physical_feedback_uses_immutable_dispatch_origin() {
     state.apply_physical_projection(vec![constrained]);
     let (request_id, _) = state.physical_request_ids();
     assert!(
-        !state.allows_core_size_feedback(request_id, 100, true),
-        "a horizontally sliced origin must not teach a logical minimum"
-    );
-    assert!(
-        !state.allows_core_size_feedback(request_id, 100, false),
-        "a width slice can provoke coupled height reflow, so neither axis may teach core minima"
+        !state.allows_core_size_feedback(request_id, 100),
+        "a horizontally sliced origin must not teach a logical minimum on either axis"
     );
 
     let vertically_constrained = leopardwm_core_layout::WindowPlacement {
@@ -1065,10 +1222,9 @@ fn test_physical_feedback_uses_immutable_dispatch_origin() {
     state.apply_physical_projection(vec![vertically_constrained]);
     let (request_id, _) = state.physical_request_ids();
     assert!(
-        !state.allows_core_size_feedback(request_id, 100, true),
+        !state.allows_core_size_feedback(request_id, 100),
         "a height slice can provoke coupled width reflow, so neither axis may teach core minima"
     );
-    assert!(!state.allows_core_size_feedback(request_id, 100, false));
 
     let ordinary = leopardwm_core_layout::WindowPlacement {
         window_id: 100,
@@ -1078,8 +1234,10 @@ fn test_physical_feedback_uses_immutable_dispatch_origin() {
     };
     state.apply_physical_projection(vec![ordinary]);
     let (request_id, _) = state.physical_request_ids();
-    assert!(state.allows_core_size_feedback(request_id, 100, true));
-    assert!(state.allows_core_size_feedback(request_id, 100, false));
+    assert!(
+        state.allows_core_size_feedback(request_id, 100),
+        "ordinary uncut origins still allow core size feedback"
+    );
 }
 
 #[test]
@@ -1451,15 +1609,23 @@ fn test_failed_landing_retries_before_releasing_pending_ghost() {
         TestApplyPlacementsBehavior, TestApplyPlacementsOutcome, TestApplyPlacementsStep,
     };
 
+    const WID: u64 = 0xFFFF_FFFF_FFFF_FF32;
+    struct GhostCloakGuard(u64);
+    impl Drop for GhostCloakGuard {
+        fn drop(&mut self) {
+            leopardwm_platform_win32::unmark_ghost_cloaked(self.0);
+        }
+    }
+
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     state.paused = false;
     state.workspaces.get_mut(&1).unwrap()[0]
-        .insert_window(100, Some(800))
+        .insert_window(WID, Some(800))
         .unwrap();
     let placement = state.workspaces[&1][0]
         .compute_placements_animated(state.layout_viewport(1))
         .into_iter()
-        .find(|placement| placement.window_id == 100)
+        .find(|placement| placement.window_id == WID)
         .unwrap();
     let dispatched = state.apply_physical_projection(vec![placement.clone()]);
     let (request_id, invalidation_id) = state.physical_request_ids();
@@ -1467,7 +1633,7 @@ fn test_failed_landing_retries_before_releasing_pending_ghost() {
         request_id,
         invalidation_id,
         &[leopardwm_platform_win32::PlacementLanding {
-            window_id: 100,
+            window_id: WID,
             requested_rect: dispatched[0].rect,
             requested_visibility: dispatched[0].visibility,
             actual_visible_rect: Some(dispatched[0].rect),
@@ -1477,7 +1643,7 @@ fn test_failed_landing_retries_before_releasing_pending_ghost() {
         }],
         &dispatched,
     );
-    state.last_placed_layout_rects.insert(100, placement.rect);
+    state.last_placed_layout_rects.insert(WID, placement.rect);
     assert!(state.physical_fast_path_ok());
     state.post_animation_nudge_pending = true;
     state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::Scripted(vec![
@@ -1489,7 +1655,7 @@ fn test_failed_landing_retries_before_releasing_pending_ghost() {
             delay: std::time::Duration::ZERO,
             outcome: TestApplyPlacementsOutcome::Succeed {
                 landings: vec![leopardwm_platform_win32::PlacementLanding {
-                    window_id: 100,
+                    window_id: WID,
                     requested_rect: placement.rect,
                     requested_visibility: placement.visibility,
                     actual_visible_rect: Some(placement.rect),
@@ -1509,8 +1675,9 @@ fn test_failed_landing_retries_before_releasing_pending_ghost() {
         !state.physical_fast_path_ok(),
         "a failed landing must invalidate the old physical confirmation before an unchanged retry"
     );
-    leopardwm_platform_win32::mark_ghost_cloaked(100);
-    state.ghost_sources_pending_safe_landing.insert(100);
+    let _cloak_guard = GhostCloakGuard(WID);
+    leopardwm_platform_win32::mark_ghost_cloaked(WID);
+    state.ghost_sources_pending_safe_landing.insert(WID);
 
     assert!(state.apply_layout().is_ok());
     assert_eq!(
@@ -1520,8 +1687,8 @@ fn test_failed_landing_retries_before_releasing_pending_ghost() {
         2,
         "an unchanged retry must obtain a current landing instead of trusting the failed attempt's old confirmation"
     );
-    assert!(!state.ghost_sources_pending_safe_landing.contains(&100));
-    assert!(!leopardwm_platform_win32::is_placement_cloaked(100));
+    assert!(!state.ghost_sources_pending_safe_landing.contains(&WID));
+    assert!(!leopardwm_platform_win32::is_placement_cloaked(WID));
 }
 
 #[test]
