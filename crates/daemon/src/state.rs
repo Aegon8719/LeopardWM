@@ -1,6 +1,7 @@
 //! AppState struct definition, constructor, and basic accessors.
 
 use crate::config::{self, Config};
+use crate::physical_placement::{PhysicalPresentation, PhysicalRejectionObservation};
 use leopardwm_core_layout::{Rect, Workspace};
 use leopardwm_platform_win32::{MonitorId, MonitorInfo, PlatformConfig};
 use serde::{Deserialize, Serialize};
@@ -165,6 +166,23 @@ pub(crate) enum TestApplyPlacementsBehavior {
         Vec<leopardwm_platform_win32::WidthViolation>,
         Vec<leopardwm_platform_win32::HeightViolation>,
     ),
+    Scripted(Vec<TestApplyPlacementsStep>),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct TestApplyPlacementsStep {
+    pub(crate) delay: Duration,
+    pub(crate) outcome: TestApplyPlacementsOutcome,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) enum TestApplyPlacementsOutcome {
+    Succeed {
+        landings: Vec<leopardwm_platform_win32::PlacementLanding>,
+    },
+    Fail,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +218,11 @@ pub(crate) fn lerp_i32(a: i32, b: i32, t: f64) -> i32 {
     (a as f64 + (b as f64 - a as f64) * t).round() as i32
 }
 
+pub(crate) struct ExitProjectionProvenance {
+    pub(crate) owner: MonitorId,
+    pub(crate) eligible: bool,
+}
+
 /// Tracks an in-progress layout transition animation.
 /// Interpolates window positions from a pre-change snapshot to the new layout.
 pub(crate) struct LayoutTransition {
@@ -210,6 +233,8 @@ pub(crate) struct LayoutTransition {
     /// These windows are included in animation frames alongside entering windows.
     /// When the transition completes, they are moved offscreen.
     pub(crate) exit_rects: HashMap<u64, Rect>,
+    /// Pre-mutation owner and projection eligibility for synthetic exit placements.
+    pub(crate) exit_provenance: HashMap<u64, ExitProjectionProvenance>,
     /// Elapsed time in milliseconds.
     pub(crate) elapsed_ms: u64,
     /// Total duration in milliseconds.
@@ -485,6 +510,19 @@ pub(crate) struct AppState {
     /// rect within a few pixels, the layout is already correct and we skip
     /// the expensive full-retile snap-back.
     pub(crate) last_placed_layout_rects: HashMap<u64, leopardwm_core_layout::Rect>,
+    /// Intended/confirmed physical disposition keyed by HWND.
+    pub(crate) last_physical_presentations: HashMap<u64, PhysicalPresentation>,
+    pub(crate) pending_physical_presentations: HashMap<u64, PhysicalPresentation>,
+    pub(crate) inflight_origins: HashMap<u64, HashMap<u64, PhysicalPresentation>>,
+    pub(crate) physical_observations: HashMap<u64, PhysicalRejectionObservation>,
+    pub(crate) physical_request_seq: u64,
+    pub(crate) physical_dispatch_request_id: Arc<AtomicU64>,
+    pub(crate) physical_invalidation_id: Arc<AtomicU64>,
+    pub(crate) inflight_request_id: Option<u64>,
+    pub(crate) pending_physical_request_id: u64,
+    pub(crate) pending_physical_invalidation_id: u64,
+    pub(crate) last_applied_physical_invalidation: u64,
+    pub(crate) last_topology_signature: Vec<(MonitorId, i32, i32, i32, i32, u32)>,
     pub(crate) application_fullscreen: HashMap<u64, ApplicationFullscreenState>,
     /// Cooperative cancellation flag for placement workers during shutdown/revert.
     pub(crate) apply_worker_cancelled: Arc<AtomicBool>,
@@ -558,6 +596,9 @@ pub(crate) struct AppState {
     /// them into the worker for crossfade). Each `GhostEntry::Drop` calls
     /// `thumbnail::unregister_raw`, so every removal path is leak-safe.
     pub(crate) ghost_handles: HashMap<u64, GhostEntry>,
+    /// Ghost sources kept cloaked after their thumbnail is revoked until a
+    /// current synchronous physical landing proves their live HWND is safe.
+    pub(crate) ghost_sources_pending_safe_landing: HashSet<u64>,
     /// Set when a crossfade is in flight on the animation worker. The
     /// `epoch` lets us discriminate stale `CrossfadeComplete` events
     /// (from fades aborted by a newer transition).
@@ -612,6 +653,9 @@ pub(crate) struct AppState {
     pub(crate) injected_foreground_is_valid: Option<bool>,
     #[cfg(test)]
     pub(crate) injected_next_foreground_hwnd: Option<Option<u64>>,
+    /// Per-window native maximize responses for deterministic daemon tests.
+    #[cfg(test)]
+    pub(crate) injected_window_maximized: HashMap<u64, bool>,
     #[cfg(test)]
     pub(crate) departing_foreground_evidence_reads: usize,
     /// Optional test-only behavior override for placement application.
@@ -619,6 +663,8 @@ pub(crate) struct AppState {
     pub(crate) injected_apply_placements_behavior: Option<TestApplyPlacementsBehavior>,
     #[cfg(test)]
     pub(crate) injected_apply_placements_call_count: Arc<AtomicUsize>,
+    #[cfg(test)]
+    pub(crate) injected_apply_placements_batches: Arc<std::sync::Mutex<Vec<Vec<u64>>>>,
     /// Number of late-worker recovery passes executed after cancellation.
     #[cfg(test)]
     pub(crate) late_worker_recovery_count: Arc<AtomicUsize>,
@@ -856,6 +902,18 @@ impl AppState {
             pending_drag_hint: None,
             moved_or_resized_suppression: HashMap::new(),
             last_placed_layout_rects: HashMap::new(),
+            last_physical_presentations: HashMap::new(),
+            pending_physical_presentations: HashMap::new(),
+            inflight_origins: HashMap::new(),
+            physical_observations: HashMap::new(),
+            physical_request_seq: 0,
+            physical_dispatch_request_id: Arc::new(AtomicU64::new(0)),
+            physical_invalidation_id: Arc::new(AtomicU64::new(0)),
+            inflight_request_id: None,
+            pending_physical_request_id: 0,
+            pending_physical_invalidation_id: 0,
+            last_applied_physical_invalidation: 0,
+            last_topology_signature: Vec::new(),
             application_fullscreen: HashMap::new(),
             apply_worker_cancelled: Arc::new(AtomicBool::new(false)),
             apply_epoch: Arc::new(AtomicU64::new(0)),
@@ -877,6 +935,7 @@ impl AppState {
             high_contrast: leopardwm_platform_win32::is_high_contrast_enabled(),
             layout_transition: None,
             ghost_handles: HashMap::new(),
+            ghost_sources_pending_safe_landing: HashSet::new(),
             active_crossfade: None,
             crossfade_sources: std::collections::HashMap::new(),
             crossfade_epoch_counter: 0,
@@ -893,11 +952,15 @@ impl AppState {
             #[cfg(test)]
             injected_next_foreground_hwnd: None,
             #[cfg(test)]
+            injected_window_maximized: HashMap::new(),
+            #[cfg(test)]
             departing_foreground_evidence_reads: 0,
             #[cfg(test)]
             injected_apply_placements_behavior: None,
             #[cfg(test)]
             injected_apply_placements_call_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            injected_apply_placements_batches: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             late_worker_recovery_count: Arc::new(AtomicUsize::new(0)),
             // Capacity 256 is comfortable for human-rate events. A

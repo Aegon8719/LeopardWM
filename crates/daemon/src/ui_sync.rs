@@ -172,14 +172,34 @@ impl AppState {
                     if !is_floating {
                         match self.compute_window_layout_rect(hwnd) {
                             Some(layout_rect) => {
+                                if self.is_physically_parked(hwnd) {
+                                    frame.hide();
+                                    return;
+                                }
                                 if let Some(bgr) = self.border_color_bgr() {
-                                    frame.show_at_rect(
-                                        layout_rect,
+                                    let content =
+                                        self.expected_physical_rect(hwnd).unwrap_or(layout_rect);
+                                    let overlay = crate::physical_placement::expand_border_overlay(
+                                        content,
                                         border_width,
-                                        self.border_position(),
-                                        bgr,
-                                        corner_radius,
+                                        matches!(
+                                            self.border_position(),
+                                            leopardwm_platform_win32::border::BorderPosition::Outside
+                                        ),
                                     );
+                                    if let Some(overlay) =
+                                        self.project_decoration_rect(hwnd, overlay)
+                                    {
+                                        frame.show_final_overlay(
+                                            overlay,
+                                            border_width,
+                                            self.border_position(),
+                                            bgr,
+                                            corner_radius,
+                                        );
+                                    } else {
+                                        frame.hide();
+                                    }
                                     return;
                                 }
                             }
@@ -393,7 +413,24 @@ impl AppState {
                 if self.is_application_fullscreen(visible_hwnd) {
                     continue;
                 }
-                let Some(rect) = self.compute_window_layout_rect(visible_hwnd) else {
+                let Some(content_rect) = self.compute_window_layout_rect(visible_hwnd) else {
+                    continue;
+                };
+                if self.is_physically_parked(visible_hwnd) {
+                    continue;
+                }
+                let content_rect = self
+                    .expected_physical_rect(visible_hwnd)
+                    .unwrap_or(content_rect);
+                let strip_height =
+                    (self.config.appearance.tab_strip_height as f64 * scale).round() as i32;
+                let bottom_gap = (self.config.layout.gap.max(0) as f64 * scale).round() as i32;
+                let strip_rect = crate::physical_placement::tab_strip_rect(
+                    content_rect,
+                    strip_height,
+                    bottom_gap,
+                );
+                let Some(rect) = self.project_decoration_rect(visible_hwnd, strip_rect) else {
                     continue;
                 };
                 let stored_active = col.active_tab_idx().unwrap_or(visible_tab);
@@ -436,10 +473,6 @@ impl AppState {
             .retain(|key, _| desired.contains_key(key));
 
         // For each desired key, ensure an overlay exists and call show.
-        let strip_height = (self.config.appearance.tab_strip_height as f64 * 1.0).round() as u32;
-        let bottom_gap_px = self.config.layout.gap.max(0) as u32;
-        let _ = strip_height; // per-strip scaling done below
-        let _ = bottom_gap_px;
         for (key, show) in desired {
             let (monitor, ws_idx, col_idx) = key;
             // Spawn the overlay if missing. New overlays always render
@@ -461,17 +494,11 @@ impl AppState {
             let Some(strip) = self.tab_strip_overlays.get(&key) else {
                 continue;
             };
-            let scaled_strip_height =
-                (self.config.appearance.tab_strip_height as f64 * show.scale).round() as u32;
-            let scaled_bottom_gap_px =
-                (self.config.layout.gap.max(0) as f64 * show.scale).round() as u32;
-            strip.show(
+            strip.show_overlay_rect(
                 show.rect,
                 show.tabs,
                 show.active_idx,
                 colors,
-                scaled_strip_height,
-                scaled_bottom_gap_px,
                 monitor,
                 ws_idx,
                 col_idx,

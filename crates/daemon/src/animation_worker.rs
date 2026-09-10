@@ -11,7 +11,7 @@
 
 use leopardwm_core_layout::{Rect, WindowPlacement};
 use leopardwm_platform_win32::{PlacementCache, PlatformConfig};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,6 +29,10 @@ pub struct FrameRequest {
     /// same vsync.
     pub ghost_updates: Vec<GhostFrame>,
     pub platform_config: PlatformConfig,
+    pub physical_request_id: u64,
+    pub physical_invalidation_id: u64,
+    pub physical_dispatch_request_id: Arc<AtomicU64>,
+    pub physical_invalidation: Arc<AtomicU64>,
 }
 
 /// Per-frame thumbnail update payload. `handle_isize` is a raw
@@ -54,6 +58,9 @@ pub struct FrameResult {
     pub height_violations: Vec<leopardwm_platform_win32::HeightViolation>,
     /// Visible tiled windows omitted because they maximized after dispatch.
     pub maximized_skipped_window_ids: Vec<u64>,
+    pub physical_request_id: u64,
+    pub physical_invalidation_id: u64,
+    pub landings: Vec<leopardwm_platform_win32::PlacementLanding>,
 }
 
 impl FrameResult {
@@ -67,6 +74,9 @@ impl FrameResult {
             width_violations: result.width_violations,
             height_violations: result.height_violations,
             maximized_skipped_window_ids: result.maximized_skipped_window_ids,
+            physical_request_id: 0,
+            physical_invalidation_id: 0,
+            landings: result.landings,
         }
     }
 }
@@ -84,6 +94,7 @@ enum WorkerCommand {
         epoch: u64,
         entries: Vec<CrossfadeEntry>,
         frames: u32,
+        physical_invalidation: Option<(Arc<AtomicU64>, u64)>,
     },
     /// Tell the worker to break out of an in-flight fade for this epoch.
     /// Mismatching-epoch aborts are discarded. Cooperative: worker only
@@ -243,17 +254,29 @@ impl AnimationWorkerHandle {
     /// Send a crossfade command to the worker. The worker takes ownership
     /// of `entries` for the duration of the fade and unregisters each
     /// thumbnail on completion (via `CrossfadeEntry::Drop`).
+    #[cfg(test)]
     pub fn send_crossfade(
         &self,
         epoch: u64,
         entries: Vec<CrossfadeEntry>,
         frames: u32,
     ) -> Result<(), String> {
+        self.send_crossfade_with_physical_invalidation(epoch, entries, frames, None)
+    }
+
+    pub fn send_crossfade_with_physical_invalidation(
+        &self,
+        epoch: u64,
+        entries: Vec<CrossfadeEntry>,
+        frames: u32,
+        physical_invalidation: Option<(Arc<AtomicU64>, u64)>,
+    ) -> Result<(), String> {
         self.command_tx
             .send(WorkerCommand::Crossfade {
                 epoch,
                 entries,
                 frames,
+                physical_invalidation,
             })
             .map_err(|_| "Animation worker thread has exited".to_string())
     }
@@ -330,8 +353,17 @@ fn worker_loop(
                 epoch,
                 entries,
                 frames,
+                physical_invalidation,
             } => {
-                run_crossfade(&command_rx, &event_tx, epoch, entries, frames, &mut pending);
+                run_crossfade(
+                    &command_rx,
+                    &event_tx,
+                    epoch,
+                    entries,
+                    frames,
+                    physical_invalidation,
+                    &mut pending,
+                );
                 continue;
             }
             WorkerCommand::AbortCrossfade {
@@ -353,17 +385,24 @@ fn worker_loop(
             WorkerCommand::Frame(request) => {
                 let frame_start = Instant::now();
 
-                // Skip apply after shutdown/revert latch so a queued frame
-                // cannot re-park windows after the console-signal restore.
-                // Plain cancelled flag is enough: apply_epoch also bumps on
-                // every normal apply and would falsely drop live frames.
-                if apply_worker_cancelled.load(Ordering::SeqCst) {
+                // A queued frame must not place windows or update ghost thumbnails
+                // after either physical invalidation or a newer physical dispatch.
+                // `apply_worker_cancelled` remains shutdown/revert-only.
+                let stale_physical_request =
+                    request.physical_dispatch_request_id.load(Ordering::SeqCst)
+                        != request.physical_request_id
+                        || request.physical_invalidation.load(Ordering::SeqCst)
+                            != request.physical_invalidation_id;
+                if apply_worker_cancelled.load(Ordering::SeqCst) || stale_physical_request {
                     let result = FrameResult {
                         apply_result: Ok(()),
                         frame_time: frame_start.elapsed(),
                         width_violations: Vec::new(),
                         height_violations: Vec::new(),
                         maximized_skipped_window_ids: Vec::new(),
+                        physical_request_id: request.physical_request_id,
+                        physical_invalidation_id: request.physical_invalidation_id,
+                        landings: Vec::new(),
                     };
                     if event_tx
                         .blocking_send(super::DaemonEvent::AnimationFrameApplied(result))
@@ -405,7 +444,7 @@ fn worker_loop(
 
                 let frame_time = frame_start.elapsed();
 
-                let result = match apply_result {
+                let mut result = match apply_result {
                     Ok(result) => FrameResult::from_platform(result, frame_time),
                     Err(e) => FrameResult {
                         apply_result: Err(e.to_string()),
@@ -413,8 +452,13 @@ fn worker_loop(
                         width_violations: Vec::new(),
                         height_violations: Vec::new(),
                         maximized_skipped_window_ids: Vec::new(),
+                        physical_request_id: 0,
+                        physical_invalidation_id: 0,
+                        landings: Vec::new(),
                     },
                 };
+                result.physical_request_id = request.physical_request_id;
+                result.physical_invalidation_id = request.physical_invalidation_id;
 
                 // Send result back to main event loop
                 if event_tx
@@ -456,6 +500,7 @@ fn run_crossfade(
     epoch: u64,
     entries: Vec<CrossfadeEntry>,
     frames: u32,
+    physical_invalidation: Option<(Arc<AtomicU64>, u64)>,
     pending: &mut Option<WorkerCommand>,
 ) {
     use std::sync::mpsc::TryRecvError;
@@ -463,6 +508,13 @@ fn run_crossfade(
     let mut entries = entries;
     let mut aborted = false;
     for i in 0..frames {
+        if physical_invalidation
+            .as_ref()
+            .is_some_and(|(token, expected)| token.load(Ordering::SeqCst) != *expected)
+        {
+            aborted = true;
+            break;
+        }
         // Cooperative preempt/abort check.
         match command_rx.try_recv() {
             Ok(WorkerCommand::DropCrossfadeTarget {
@@ -626,6 +678,55 @@ mod tests {
             200,
             "peer must remain owned until the epoch ends"
         );
+    }
+
+    #[test]
+    fn stale_physical_frame_skips_native_dispatch() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        let worker = AnimationWorkerHandle::spawn(event_tx, Arc::new(AtomicBool::new(false)))
+            .expect("spawn animation worker");
+        let current_request = Arc::new(AtomicU64::new(1));
+        let current_invalidation = Arc::new(AtomicU64::new(5));
+        worker
+            .send_frame(FrameRequest {
+                placements: vec![WindowPlacement {
+                    window_id: 100,
+                    rect: Rect::new(0, 0, 100, 100),
+                    visibility: leopardwm_core_layout::Visibility::Visible,
+                    column_index: 0,
+                }],
+                ghost_updates: Vec::new(),
+                platform_config: PlatformConfig::default(),
+                physical_request_id: 1,
+                physical_invalidation_id: 4,
+                physical_dispatch_request_id: current_request,
+                physical_invalidation: current_invalidation,
+            })
+            .expect("queue stale frame");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(500), event_rx.recv()).await
+        });
+        assert!(matches!(
+            result,
+            Ok(Some(super::super::DaemonEvent::AnimationFrameApplied(FrameResult {
+                apply_result: Ok(()),
+                width_violations,
+                height_violations,
+                maximized_skipped_window_ids,
+                landings,
+                physical_request_id: 1,
+                physical_invalidation_id: 4,
+                ..
+            }))) if width_violations.is_empty()
+                && height_violations.is_empty()
+                && maximized_skipped_window_ids.is_empty()
+                && landings.is_empty()
+        ));
     }
 
     #[test]

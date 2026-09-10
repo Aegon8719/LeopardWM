@@ -530,6 +530,41 @@ impl TabStripOverlay {
         // same value to `tab_strip_reserve_px` so the column geometry
         // accommodates the gap rather than overlapping content.
         let strip_y = target_rect.y - strip_h - bottom_gap_px as i32;
+        self.show_overlay_rect(
+            leopardwm_core_layout::Rect::new(strip_x, strip_y, strip_w, strip_h),
+            tabs,
+            active_idx,
+            colors,
+            target_monitor,
+            target_workspace_idx,
+            target_column_idx,
+            scale_factor,
+            close_action,
+        );
+    }
+
+    /// Show the tab strip at an already-final overlay rectangle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn show_overlay_rect(
+        &self,
+        overlay: leopardwm_core_layout::Rect,
+        tabs: Vec<TabLabel>,
+        active_idx: usize,
+        colors: TabStripColors,
+        target_monitor: isize,
+        target_workspace_idx: usize,
+        target_column_idx: usize,
+        scale_factor: f64,
+        close_action: TabCloseAction,
+    ) {
+        if tabs.is_empty() {
+            self.hide();
+            return;
+        }
+        let strip_w = overlay.width.max(1);
+        let strip_h = overlay.height.max(0);
+        let strip_x = overlay.x;
+        let strip_y = overlay.y;
 
         // Compute hit rects (window-relative).
         let n = tabs.len();

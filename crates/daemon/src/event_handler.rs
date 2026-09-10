@@ -971,6 +971,7 @@ impl AppState {
         // Drop the recorded layout rect so the map doesn't retain
         // entries for windows that no longer exist.
         self.last_placed_layout_rects.remove(&hwnd);
+        self.clear_physical_window_state(hwnd);
         self.application_fullscreen.remove(&hwnd);
 
         // Drop any cached overview snapshot for the same reason.
@@ -2230,8 +2231,10 @@ impl AppState {
             is_zoomed,
         )?;
         if let Some(expected) = application_fullscreen_expected_layout_rect(
-            self.compute_window_layout_rect(hwnd),
-            self.last_placed_layout_rects.get(&hwnd).copied(),
+            self.expected_physical_rect(hwnd)
+                .or_else(|| self.compute_window_layout_rect(hwnd)),
+            self.expected_physical_rect(hwnd)
+                .or_else(|| self.last_placed_layout_rects.get(&hwnd).copied()),
         ) {
             let scale_factor = self
                 .monitors
@@ -2536,7 +2539,9 @@ impl AppState {
                 // chase. Real user drags are typically tens to hundreds
                 // of pixels off, so 20px comfortably separates them.
                 const POSITION_EPSILON_PX: i32 = 20;
-                let expected = self.last_placed_layout_rects.get(&hwnd).copied();
+                let expected = self
+                    .expected_physical_rect(hwnd)
+                    .or_else(|| self.last_placed_layout_rects.get(&hwnd).copied());
                 let dwm_actual = leopardwm_platform_win32::get_window_visible_rect(hwnd);
                 // Cross-check with GetWindowRect — for Chromium /
                 // Firefox / Cascadia under the swap-chain-stale bug,
@@ -2630,7 +2635,6 @@ impl AppState {
         // immediately on WM_DISPLAYCHANGE receipt (before debounce) in the
         // event loop. This handler runs after the debounce settles.
         info!("Display configuration changed - reconciling monitors");
-
         // Re-enumerate monitors
         match enumerate_monitors() {
             Ok(new_monitors) if !new_monitors.is_empty() => {

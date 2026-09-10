@@ -25,6 +25,7 @@ mod monitors;
 mod notify;
 mod overview;
 mod persistence;
+mod physical_placement;
 mod scratchpad;
 mod settings;
 mod startup;
@@ -45,6 +46,7 @@ use state::*;
 use anyhow::Result;
 use clap::Parser;
 use config::Config;
+use layout_apply::AnimationPlacementResult;
 use leopardwm_core_layout::Rect;
 use leopardwm_ipc::{pipe_name_candidates, preferred_pipe_name, IpcCommand, IpcResponse};
 use leopardwm_platform_win32::{
@@ -1633,6 +1635,7 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
         {
             let mut state = ctx.state.lock().await;
             state.refresh_high_contrast();
+            state.invalidate_physical_display_change();
             state.display_change_pending = true;
             // A real topology/DPI change needs the full reconcile; a
             // work-area-only change (taskbar) does not. Sticky-true if a
@@ -2842,9 +2845,23 @@ async fn handle_animation_frame_applied(
     ctx: &mut EventLoopCtx<'_>,
     frame_result: animation_worker::FrameResult,
 ) {
-    {
+    let current_result = {
         let mut state = ctx.state.lock().await;
-        state.handle_animation_placement_result(&frame_result);
+        state.handle_animation_placement_result(&frame_result)
+    };
+    match current_result {
+        AnimationPlacementResult::Stale => return,
+        AnimationPlacementResult::InvalidatedCurrent => {
+            let mut state = ctx.state.lock().await;
+            if let Err(error) = state.apply_layout() {
+                warn!(
+                    "Current layout landing after invalidated animation frame failed: {}",
+                    error
+                );
+            }
+            return;
+        }
+        AnimationPlacementResult::Current => {}
     }
     if let Err(ref e) = frame_result.apply_result {
         warn!("Animation frame failed: {}", e);
@@ -2916,12 +2933,9 @@ async fn handle_animation_frame_applied(
                 }
             }
 
-            // Uncloak surviving sources BEFORE apply_layout so
-            // the synchronous SetWindowPos hits a visible HWND.
-            for &wid in &surviving {
-                leopardwm_platform_win32::unmark_ghost_cloaked(wid);
-                leopardwm_platform_win32::apply_cloak_state(wid);
-            }
+            // Keep surviving sources cloaked through the synchronous landing.
+            // A thumbnail revocation must never expose the stale source before
+            // containment has been re-proven for the current topology.
 
             // Only this landing pass follows an async frame burst,
             // so it is the only `apply_layout` that needs to fire
@@ -2939,22 +2953,64 @@ async fn handle_animation_frame_applied(
                 );
             }
 
-            // If landing succeeded and we have ghosts,
-            // transfer their handles to the worker for an
-            // 8-frame ease-in-cubic crossfade. If landing
-            // failed, drop handles immediately (hard cut) —
-            // a fade over a misaligned source produces a
-            // visible duplicate.
-            if landing_ok && !surviving.is_empty() {
+            // Expose a source only after a successful current landing. A
+            // failed, parked, or invalidated landing remains blocked rather
+            // than briefly revealing the stale live HWND when its thumbnail
+            // is removed.
+            let mut exposed_ghosts = Vec::with_capacity(surviving.len());
+            if landing_ok {
+                for wid in &surviving {
+                    if state.physical_landing_is_safe_to_expose(*wid) {
+                        leopardwm_platform_win32::unmark_ghost_cloaked(*wid);
+                        leopardwm_platform_win32::apply_cloak_state(*wid);
+                        exposed_ghosts.push(*wid);
+                    } else {
+                        warn!(
+                            "Ghost source {} remains blocked after an unconfirmed physical landing",
+                            wid
+                        );
+                        state.ghost_sources_pending_safe_landing.insert(*wid);
+                    }
+                }
+                let pending: Vec<u64> = state
+                    .ghost_sources_pending_safe_landing
+                    .iter()
+                    .copied()
+                    .collect();
+                for wid in pending {
+                    if state.physical_landing_is_safe_to_expose(wid) {
+                        leopardwm_platform_win32::unmark_ghost_cloaked(wid);
+                        leopardwm_platform_win32::apply_cloak_state(wid);
+                        state.ghost_sources_pending_safe_landing.remove(&wid);
+                    }
+                }
+            } else {
+                state
+                    .ghost_sources_pending_safe_landing
+                    .extend(surviving.iter().copied());
+            }
+
+            // Crossfade only a current, confirmed physical destination. Stored
+            // logical thumbnail destinations are not reused after projection.
+            if landing_ok && !exposed_ghosts.is_empty() {
                 state.crossfade_epoch_counter = state.crossfade_epoch_counter.saturating_add(1);
                 let epoch = state.crossfade_epoch_counter;
                 let mut entries: Vec<animation_worker::CrossfadeEntry> =
-                    Vec::with_capacity(surviving.len());
+                    Vec::with_capacity(exposed_ghosts.len());
                 let mut sources: std::collections::HashSet<u64> =
-                    std::collections::HashSet::with_capacity(surviving.len());
-                for wid in &surviving {
+                    std::collections::HashSet::with_capacity(exposed_ghosts.len());
+                let host_origin = leopardwm_platform_win32::thumbnail::host().origin();
+                for wid in &exposed_ghosts {
                     if let Some(entry) = state.ghost_handles.remove(wid) {
-                        let dest = entry.final_dest_client_rect;
+                        let dest = state
+                            .expected_physical_rect(*wid)
+                            .map(|rect| {
+                                leopardwm_platform_win32::thumbnail::screen_to_host_client(
+                                    rect,
+                                    host_origin,
+                                )
+                            })
+                            .unwrap_or(entry.final_dest_client_rect);
                         entries.push(animation_worker::CrossfadeEntry {
                             window_id: *wid,
                             handle_isize: entry.take_isize(),
@@ -2978,7 +3034,21 @@ async fn handle_animation_frame_applied(
                     "ghost: crossfade epoch {} dispatched for {} source(s)",
                     epoch, entry_count
                 );
-                if let Err(e) = ctx.animation_worker.send_crossfade(epoch, entries, 8) {
+                let physical_invalidation_id = state
+                    .physical_invalidation_id
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if let Err(e) = ctx
+                    .animation_worker
+                    .send_crossfade_with_physical_invalidation(
+                        epoch,
+                        entries,
+                        8,
+                        Some((
+                            state.physical_invalidation_id.clone(),
+                            physical_invalidation_id,
+                        )),
+                    )
+                {
                     warn!("Failed to send crossfade to worker: {}", e);
                     // No worker: clear state so next transition
                     // isn't stuck waiting for a CrossfadeComplete

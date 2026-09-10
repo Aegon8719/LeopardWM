@@ -383,7 +383,20 @@ pub struct HeightViolation {
     pub min_height: i32,
 }
 
+/// Actual native geometry after a placement landing action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementLanding {
+    pub window_id: WindowId,
+    pub requested_rect: Rect,
+    pub requested_visibility: Visibility,
+    pub actual_visible_rect: Option<Rect>,
+    pub actual_outer_rect: Option<Rect>,
+    pub failed: bool,
+    pub unreadable: bool,
+}
+
 /// Result of apply_placements, including any detected size violations.
+#[derive(Debug, Clone, Default)]
 pub struct ApplyPlacementsResult {
     /// Width violations detected after positioning (windows wider than requested).
     pub width_violations: Vec<WidthViolation>,
@@ -391,6 +404,9 @@ pub struct ApplyPlacementsResult {
     pub height_violations: Vec<HeightViolation>,
     /// Visible tiled windows omitted because they were maximized at execution time.
     pub maximized_skipped_window_ids: Vec<WindowId>,
+    /// Per-window native readback after landing actions, including compositor nudges.
+    /// Animation (async) passes leave this empty; containment is a sync-landing concern.
+    pub landings: Vec<PlacementLanding>,
 }
 
 // Collect all (hwnd, adjusted_rect, flags) entries for deferred positioning.
@@ -460,11 +476,7 @@ fn apply_placements_inner(
     post_animation_landing: bool,
     allow_landing_measurement_retry: bool,
 ) -> Result<ApplyPlacementsResult, Win32Error> {
-    let empty_result = ApplyPlacementsResult {
-        width_violations: Vec::new(),
-        height_violations: Vec::new(),
-        maximized_skipped_window_ids: Vec::new(),
-    };
+    let empty_result = ApplyPlacementsResult::default();
     if placements.is_empty() {
         if let Some(cache) = cache.as_deref_mut() {
             cache.clear();
@@ -601,6 +613,19 @@ fn apply_placements_inner(
         nudge_sticky_compositor_windows(&nudge_targets);
     }
 
+    let landings = if async_flag == SET_WINDOW_POS_FLAGS(0) {
+        collect_placement_landings(placements, &failed_window_ids)
+    } else {
+        Vec::new()
+    };
+    if let Some(cache) = cache.as_deref_mut() {
+        for landing in &landings {
+            if landing.failed || landing.unreadable {
+                cache.positions.remove(&landing.window_id);
+            }
+        }
+    }
+
     tracing::debug!(
         "Applied {} placements ({} skipped unchanged), {} off-screen total",
         applied,
@@ -612,7 +637,43 @@ fn apply_placements_inner(
         width_violations: detection.width_violations,
         height_violations: detection.height_violations,
         maximized_skipped_window_ids,
+        landings,
     })
+}
+
+fn collect_placement_landings(
+    placements: &[WindowPlacement],
+    failed_window_ids: &HashSet<u64>,
+) -> Vec<PlacementLanding> {
+    placements
+        .iter()
+        .map(|placement| {
+            let actual_visible_rect = crate::get_window_visible_rect(placement.window_id);
+            let actual_outer_rect = crate::get_window_chrome_rect(placement.window_id);
+            PlacementLanding {
+                window_id: placement.window_id,
+                requested_rect: placement.rect,
+                requested_visibility: placement.visibility,
+                failed: failed_window_ids.contains(&placement.window_id),
+                unreadable: actual_visible_rect.is_none() && actual_outer_rect.is_none(),
+                actual_visible_rect,
+                actual_outer_rect,
+            }
+        })
+        .collect()
+}
+
+/// Read GWL_STYLE for a managed HWND. Used as physical-observation context, not
+/// as a placement policy.
+pub fn get_window_style_bits(window_id: WindowId) -> Option<u32> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongW, GWL_STYLE};
+    let hwnd = window_id_to_hwnd(window_id).ok()?;
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return None;
+        }
+        Some(GetWindowLongW(hwnd, GWL_STYLE) as u32)
+    }
 }
 
 fn recover_placement_parked<F>(

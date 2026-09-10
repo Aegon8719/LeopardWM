@@ -1397,6 +1397,75 @@ mod tests {
     }
 
     #[test]
+    fn test_overview_return_reapplies_adjacent_physical_landing() {
+        use crate::state::{
+            TestApplyPlacementsBehavior, TestApplyPlacementsOutcome, TestApplyPlacementsStep,
+        };
+
+        let mut state = AppState::new_with_config(
+            Config::default(),
+            vec![
+                MonitorInfo {
+                    id: 1,
+                    rect: Rect::new(0, 0, 1920, 1080),
+                    work_area: Rect::new(0, 0, 1920, 1040),
+                    is_primary: true,
+                    device_name: "DISPLAY1".to_string(),
+                    scale_factor: 1.0,
+                },
+                MonitorInfo {
+                    id: 2,
+                    rect: Rect::new(1920, 0, 1920, 1080),
+                    work_area: Rect::new(1920, 0, 1920, 1040),
+                    is_primary: false,
+                    device_name: "DISPLAY2".to_string(),
+                    scale_factor: 1.0,
+                },
+            ],
+        );
+        state.paused = false;
+        let mut workspace = leopardwm_core_layout::Workspace::with_gaps(0, 0);
+        workspace.insert_window(101, Some(2200)).unwrap();
+        state.workspaces.get_mut(&1).unwrap()[0] = workspace;
+        state.show_overview();
+        assert!(state.overview_open);
+        state.hide_overview();
+        assert!(!state.overview_open);
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::Scripted(vec![
+                TestApplyPlacementsStep {
+                    delay: std::time::Duration::ZERO,
+                    outcome: TestApplyPlacementsOutcome::Succeed {
+                        landings: vec![leopardwm_platform_win32::PlacementLanding {
+                            window_id: 101,
+                            requested_rect: Rect::new(0, 0, 1920, 1040),
+                            requested_visibility: leopardwm_core_layout::Visibility::Visible,
+                            actual_visible_rect: Some(Rect::new(0, 0, 1920, 1040)),
+                            actual_outer_rect: Some(Rect::new(0, 0, 1920, 1040)),
+                            failed: false,
+                            unreadable: false,
+                        }],
+                    },
+                },
+            ]));
+
+        state.apply_layout().unwrap();
+
+        let presentation = &state.last_physical_presentations[&101];
+        assert_eq!(presentation.logical.rect, Rect::new(0, 0, 2200, 1040));
+        assert_eq!(presentation.physical.rect, Rect::new(0, 0, 1920, 1040));
+        assert_eq!(
+            presentation.kind,
+            crate::physical_placement::PhysicalKind::Constrained
+        );
+        assert!(presentation.confirmed);
+        assert_eq!(
+            state.focused_workspace().unwrap().columns()[0].width(),
+            2200
+        );
+    }
+
+    #[test]
     fn test_active_row_cards_carry_real_placement_from_rect() {
         let mut state = test_state();
         add_windows(&mut state, 0, &[101, 102]);

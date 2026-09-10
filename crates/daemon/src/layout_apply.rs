@@ -52,92 +52,13 @@ type ApplyWorkerMsg = (
     Vec<leopardwm_platform_win32::WidthViolation>,
     Vec<leopardwm_platform_win32::HeightViolation>,
     Vec<u64>,
+    Vec<leopardwm_platform_win32::PlacementLanding>,
 );
 
-/// Re-park any off-screen placement that would land on a NEIGHBOR monitor to an
-/// off-screen spot that clears every monitor, so it doesn't render there (the
-/// cross-monitor bleed).
-///
-/// Off-screen hiding relies on physical position, not DWM cloak: cloaking an
-/// external (other-process) window fails with access-denied, so the cloak is a
-/// no-op for managed windows. On a single monitor an off-screen column sits at a
-/// negative / past-edge x that is off the desktop, but on a side-by-side monitor
-/// "off the virtual monitor's edge" lands on the neighbor.
-///
-/// The park spot is picked by [`offscreen_park_rect`]: the first edge of the
-/// owning monitor (below, above, right, left) whose off-screen strip clears
-/// every monitor. Side-by-side monitors park windows off the top/bottom; a
-/// stacked monitor parks them off whichever perpendicular edge is free.
-fn park_offscreen_avoiding_neighbors(
-    placements: &mut [leopardwm_core_layout::WindowPlacement],
-    owner_id: leopardwm_platform_win32::MonitorId,
-    monitors: &std::collections::HashMap<
-        leopardwm_platform_win32::MonitorId,
-        leopardwm_platform_win32::MonitorInfo,
-    >,
-) {
-    let Some(owner) = monitors.get(&owner_id).map(|m| m.rect) else {
-        return;
-    };
-    let monitor_rects: Vec<_> = monitors.values().map(|m| m.rect).collect();
-    for p in placements.iter_mut() {
-        if p.visibility == leopardwm_core_layout::Visibility::Visible {
-            continue;
-        }
-        let bleeds = monitors
-            .iter()
-            .filter(|(id, _)| **id != owner_id)
-            .any(|(_, m)| p.rect.intersects(&m.rect));
-        if bleeds {
-            p.rect = offscreen_park_rect(p.rect, owner, &monitor_rects);
-        }
-    }
-}
-
-/// Pick an off-screen rect for `window` that clears every monitor, tried along
-/// the owning monitor's edges in order (below, above, right, left) and picking
-/// the first that lands on no monitor. Falls back to the far sentinel only if
-/// the owner is boxed in on all four sides.
-fn offscreen_park_rect(
-    window: leopardwm_core_layout::Rect,
-    owner: leopardwm_core_layout::Rect,
-    monitor_rects: &[leopardwm_core_layout::Rect],
-) -> leopardwm_core_layout::Rect {
-    use leopardwm_core_layout::Rect;
-    const MARGIN: i32 = 4;
-    let candidates = [
-        Rect::new(
-            owner.x,
-            owner.y.saturating_add(owner.height).saturating_add(MARGIN),
-            window.width,
-            window.height,
-        ),
-        Rect::new(
-            owner.x,
-            owner.y.saturating_sub(window.height).saturating_sub(MARGIN),
-            window.width,
-            window.height,
-        ),
-        Rect::new(
-            owner.x.saturating_add(owner.width).saturating_add(MARGIN),
-            owner.y,
-            window.width,
-            window.height,
-        ),
-        Rect::new(
-            owner.x.saturating_sub(window.width).saturating_sub(MARGIN),
-            owner.y,
-            window.width,
-            window.height,
-        ),
-    ];
-    for candidate in candidates {
-        if !monitor_rects.iter().any(|m| candidate.intersects(m)) {
-            return candidate;
-        }
-    }
-    const SENTINEL: i32 = leopardwm_platform_win32::MOVE_OFFSCREEN_SENTINEL_COORD;
-    Rect::new(SENTINEL, SENTINEL, window.width, window.height)
+pub(crate) enum AnimationPlacementResult {
+    Current,
+    InvalidatedCurrent,
+    Stale,
 }
 
 impl AppState {
@@ -176,13 +97,70 @@ impl AppState {
     pub(crate) fn handle_animation_placement_result(
         &mut self,
         frame_result: &animation_worker::FrameResult,
-    ) {
+    ) -> AnimationPlacementResult {
+        if !self.physical_result_matches_inflight(
+            frame_result.physical_request_id,
+            frame_result.physical_invalidation_id,
+        ) {
+            debug!(
+                request_id = frame_result.physical_request_id,
+                invalidation_id = frame_result.physical_invalidation_id,
+                "Ignoring stale animation placement result"
+            );
+            return AnimationPlacementResult::Stale;
+        }
+        if !self.physical_result_is_current(
+            frame_result.physical_request_id,
+            frame_result.physical_invalidation_id,
+        ) {
+            if self.inflight_request_id == Some(frame_result.physical_request_id) {
+                self.inflight_request_id = None;
+                self.inflight_origins
+                    .remove(&frame_result.physical_request_id);
+            }
+            self.applying_layout = false;
+            return AnimationPlacementResult::InvalidatedCurrent;
+        }
+
+        let width_violations: Vec<_> = frame_result
+            .width_violations
+            .iter()
+            .filter(|violation| {
+                self.allows_core_size_feedback(
+                    frame_result.physical_request_id,
+                    violation.window_id,
+                    true,
+                )
+            })
+            .cloned()
+            .collect();
+        let height_violations: Vec<_> = frame_result
+            .height_violations
+            .iter()
+            .filter(|violation| {
+                self.allows_core_size_feedback(
+                    frame_result.physical_request_id,
+                    violation.window_id,
+                    false,
+                )
+            })
+            .cloned()
+            .collect();
+
         self.applying_layout = false;
         self.handle_maximized_placement_skips(&frame_result.maximized_skipped_window_ids);
-        self.propagate_size_violations(
-            &frame_result.width_violations,
-            &frame_result.height_violations,
-        );
+        if !frame_result.landings.is_empty() {
+            self.consume_physical_landings(
+                frame_result.physical_request_id,
+                frame_result.physical_invalidation_id,
+                &frame_result.landings,
+                &[],
+            );
+        }
+        if frame_result.apply_result.is_ok() {
+            self.propagate_size_violations(&width_violations, &height_violations);
+        }
+        AnimationPlacementResult::Current
     }
 
     fn observe_maximized_placements(
@@ -238,7 +216,9 @@ impl AppState {
     where
         F: Fn(u64) -> bool,
     {
-        self.filter_physical_placements_with_parked(placements, maximized, is_placement_parked)
+        let placements =
+            self.filter_physical_placements_with_parked(placements, maximized, is_placement_parked);
+        self.apply_physical_projection(placements)
     }
 
     #[cfg(test)]
@@ -293,6 +273,7 @@ impl AppState {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_animation_frame(
         &mut self,
         placements: Vec<leopardwm_core_layout::WindowPlacement>,
@@ -305,6 +286,7 @@ impl AppState {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_animation_frame_with_parked<F>(
         &mut self,
         placements: Vec<leopardwm_core_layout::WindowPlacement>,
@@ -314,23 +296,32 @@ impl AppState {
     where
         F: Fn(u64) -> bool,
     {
+        let placements =
+            self.filter_physical_placements_with_parked(placements, maximized, is_placement_parked);
+        self.prepare_projected_animation_frame(placements)
+    }
+
+    fn prepare_projected_animation_frame(
+        &mut self,
+        placements: Vec<leopardwm_core_layout::WindowPlacement>,
+    ) -> animation_worker::FrameRequest {
         let (live_placements, ghost_updates) = Self::partition_for_animation(
             placements,
             self.layout_transition.as_ref(),
             &self.ghost_handles,
         );
-        let live_placements = self.filter_physical_placements_with_parked(
-            live_placements,
-            maximized,
-            is_placement_parked,
-        );
         self.arm_moved_or_resized_suppression(
             live_placements.iter().map(|placement| placement.window_id),
         );
+        let (physical_request_id, physical_invalidation_id) = self.physical_request_ids();
         animation_worker::FrameRequest {
             placements: live_placements,
             ghost_updates,
             platform_config: self.platform_config.clone(),
+            physical_request_id,
+            physical_invalidation_id,
+            physical_dispatch_request_id: self.physical_dispatch_request_id.clone(),
+            physical_invalidation: self.physical_invalidation_id.clone(),
         }
     }
 
@@ -388,7 +379,11 @@ impl AppState {
                 if self.monitors.contains_key(monitor_id) {
                     let viewport = self.layout_viewport(*monitor_id);
                     let mut placements = workspace.compute_placements_animated(viewport);
-                    park_offscreen_avoiding_neighbors(&mut placements, *monitor_id, &self.monitors);
+                    crate::physical_placement::park_offscreen_avoiding_neighbors(
+                        &mut placements,
+                        *monitor_id,
+                        &self.monitors,
+                    );
                     all_placements.extend(placements);
                 }
             }
@@ -419,11 +414,17 @@ impl AppState {
 
         let dispatched_placements = self.filter_application_fullscreen_placements(all_placements);
         let maximized = self.observe_maximized_placements(&dispatched_placements);
+        let dispatched_placements = self.filter_physical_placements_with_parked(
+            dispatched_placements,
+            &maximized,
+            leopardwm_platform_win32::is_placement_parked,
+        );
+        let dispatched_placements = self.apply_physical_projection(dispatched_placements);
 
         // Partition into live placements + ghost-thumbnail updates. Ghost
         // wids are excluded from `placements` so the worker doesn't fire
         // per-frame SetWindowPos on the cloaked source HWND.
-        let request = self.prepare_animation_frame(dispatched_placements, &maximized);
+        let request = self.prepare_projected_animation_frame(dispatched_placements);
         self.applying_layout = true;
 
         if let Err(e) = worker.send_frame(request) {
@@ -552,7 +553,11 @@ impl AppState {
         let bypass_fast_path = self.injected_apply_placements_behavior.is_some();
         #[cfg(not(test))]
         let bypass_fast_path = false;
-        if placements_unchanged && !self.post_animation_nudge_pending && !bypass_fast_path {
+        if placements_unchanged
+            && self.physical_fast_path_ok()
+            && !self.post_animation_nudge_pending
+            && !bypass_fast_path
+        {
             self.applying_layout = false;
             self.request_save_if_changed();
             return Ok(());
@@ -584,21 +589,54 @@ impl AppState {
         );
 
         let timeout = self.layout_apply_timeout;
+        let (physical_request_id, physical_invalidation_id) = self.physical_request_ids();
+        let dispatched_for_landing = dispatched_placements.clone();
         let (rx, worker_handle) = self.spawn_apply_worker(dispatched_placements)?;
 
         let result = match rx.recv_timeout(timeout) {
-            Ok((result, width_violations, height_violations, maximized_skipped_window_ids)) => {
+            Ok((
+                result,
+                width_violations,
+                height_violations,
+                maximized_skipped_window_ids,
+                landings,
+            )) => {
                 let _ = worker_handle.join();
-                if result.is_err() {
+                let width_violations: Vec<_> = width_violations
+                    .into_iter()
+                    .filter(|violation| {
+                        self.allows_core_size_feedback(
+                            physical_request_id,
+                            violation.window_id,
+                            true,
+                        )
+                    })
+                    .collect();
+                let height_violations: Vec<_> = height_violations
+                    .into_iter()
+                    .filter(|violation| {
+                        self.allows_core_size_feedback(
+                            physical_request_id,
+                            violation.window_id,
+                            false,
+                        )
+                    })
+                    .collect();
+                let result = if result.is_err() {
                     self.moved_or_resized_suppression.clear();
+                    result
                 } else {
                     self.handle_maximized_placement_skips(&maximized_skipped_window_ids);
-                }
-                let constraints_changed = if result.is_ok() {
-                    self.propagate_size_violations(&width_violations, &height_violations)
-                } else {
-                    false
+                    let follow_up = self.consume_physical_landings(
+                        physical_request_id,
+                        physical_invalidation_id,
+                        &landings,
+                        &dispatched_for_landing,
+                    );
+                    self.apply_physical_follow_up(follow_up)
                 };
+                let constraints_changed = result.is_ok()
+                    && self.propagate_size_violations(&width_violations, &height_violations);
                 let restored_during_apply = result.is_ok()
                     && maximized_skipped_window_ids.iter().any(|window_id| {
                         !leopardwm_platform_win32::is_window_maximized(*window_id)
@@ -676,12 +714,86 @@ impl AppState {
         };
         self.applying_layout = false;
 
-        // Reposition border to track the focused window after layout changes
+        // Reposition border to track the focused window after layout changes.
+        // A thumbnail-revoked source remains cloaked until this exact landing
+        // has current physical containment evidence.
         if result.is_ok() {
+            self.release_ghost_sources_after_physical_landing();
             self.finalize_layout_success();
         }
 
         result
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn apply_physical_follow_up(
+        &mut self,
+        follow_up: Vec<leopardwm_core_layout::WindowPlacement>,
+    ) -> Result<()> {
+        if follow_up.is_empty() {
+            return Ok(());
+        }
+
+        let timeout_candidate_ids: Vec<u64> = follow_up
+            .iter()
+            .map(|placement| placement.window_id)
+            .collect();
+        self.begin_physical_follow_up(&follow_up);
+        self.arm_moved_or_resized_suppression(
+            follow_up.iter().map(|placement| placement.window_id),
+        );
+        let timeout = self.layout_apply_timeout;
+        let (rx, worker_handle) = self.spawn_apply_worker(follow_up)?;
+        match rx.recv_timeout(timeout) {
+            Ok((result, _, _, maximized_skipped_window_ids, landings)) => {
+                let _ = worker_handle.join();
+                if let Err(error) = result {
+                    self.moved_or_resized_suppression.clear();
+                    warn!("Physical follow-up parking batch failed: {}", error);
+                    return Err(error);
+                }
+                self.handle_maximized_placement_skips(&maximized_skipped_window_ids);
+                self.complete_physical_follow_up(&landings);
+                Ok(())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.paused = true;
+                self.apply_epoch.fetch_add(1, Ordering::SeqCst);
+                self.pending_apply_workers.push(worker_handle);
+                self.moved_or_resized_suppression.clear();
+                let msg = layout_apply_timeout_message(timeout);
+                let report = LayoutApplyTimeoutReport {
+                    timeout,
+                    candidates: self
+                        .collect_layout_apply_timeout_candidates(&timeout_candidate_ids),
+                };
+                warn!(
+                    "{} Timed-out physical follow-up batch contained {} candidate window(s); batch membership does not prove which window blocked placement.",
+                    msg,
+                    report.candidates.len()
+                );
+                for candidate in &report.candidates {
+                    warn!(
+                        "Timed-out physical follow-up candidate (not a proven blocker): hwnd={:#x} class={:?} title={:?} executable={:?}",
+                        candidate.hwnd,
+                        candidate.class_name,
+                        candidate.title,
+                        candidate.executable
+                    );
+                }
+                self.pending_layout_apply_timeout_report = Some(report);
+                let managed_window_ids = self.all_managed_window_ids();
+                run_layout_apply_recovery_pass(&managed_window_ids, "physical-follow-up-timeout");
+                Err(anyhow!(msg))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = worker_handle.join();
+                self.moved_or_resized_suppression.clear();
+                Err(anyhow!(
+                    "Physical follow-up worker thread exited without returning a result"
+                ))
+            }
+        }
     }
 
     /// Collect animated placements for every monitor's active workspace, with debug logging.
@@ -695,7 +807,11 @@ impl AppState {
                     // Use animated placements to support smooth scrolling
                     let viewport = self.layout_viewport(*monitor_id);
                     let mut placements = workspace.compute_placements_animated(viewport);
-                    park_offscreen_avoiding_neighbors(&mut placements, *monitor_id, &self.monitors);
+                    crate::physical_placement::park_offscreen_avoiding_neighbors(
+                        &mut placements,
+                        *monitor_id,
+                        &self.monitors,
+                    );
                     debug!(
                         "Monitor {}: {} placements for viewport {}x{} (animating: {}, scroll: {:.1}, minimized: {})",
                         monitor_id,
@@ -805,6 +921,8 @@ impl AppState {
         let injected_apply_placements_call_count =
             self.injected_apply_placements_call_count.clone();
         #[cfg(test)]
+        let injected_apply_placements_batches = self.injected_apply_placements_batches.clone();
+        #[cfg(test)]
         let late_worker_recovery_count = self.late_worker_recovery_count.clone();
 
         let (tx, rx) = std::sync::mpsc::channel::<ApplyWorkerMsg>();
@@ -816,7 +934,7 @@ impl AppState {
                         || apply_epoch_ref.load(Ordering::SeqCst) != apply_epoch
                 };
                 if should_cancel() {
-                    let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new()));
+                    let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
                     return;
                 }
 
@@ -824,38 +942,74 @@ impl AppState {
                 if let Some(behavior) = injected_behavior {
                     let call_index =
                         injected_apply_placements_call_count.fetch_add(1, Ordering::SeqCst);
+                    injected_apply_placements_batches
+                        .lock()
+                        .unwrap()
+                        .push(apply_window_ids.clone());
                     let (
                         result,
                         width_violations,
                         height_violations,
                         maximized_skipped_window_ids,
-                    ) = match behavior {
-                        TestApplyPlacementsBehavior::SleepAndSucceed(delay) => {
-                            std::thread::sleep(delay);
-                            (Ok(()), Vec::new(), Vec::new(), Vec::new())
-                        }
-                        TestApplyPlacementsBehavior::SleepAndFail(delay) => {
-                            std::thread::sleep(delay);
-                            (
-                                Err(anyhow!("injected apply_placements failure")),
+                        landings,
+                    ) =
+                        match behavior {
+                            TestApplyPlacementsBehavior::SleepAndSucceed(delay) => {
+                                std::thread::sleep(delay);
+                                (Ok(()), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                            }
+                            TestApplyPlacementsBehavior::SleepAndFail(delay) => {
+                                std::thread::sleep(delay);
+                                (
+                                    Err(anyhow!("injected apply_placements failure")),
+                                    Vec::new(),
+                                    Vec::new(),
+                                    Vec::new(),
+                                    Vec::new(),
+                                )
+                            }
+                            TestApplyPlacementsBehavior::SucceedWithMaximizedSkip(window_id) => {
+                                let skipped = if call_index == 0 {
+                                    vec![window_id]
+                                } else {
+                                    Vec::new()
+                                };
+                                (Ok(()), Vec::new(), Vec::new(), skipped, Vec::new())
+                            }
+                            TestApplyPlacementsBehavior::SucceedWithSizeViolations(
+                                width_violations,
+                                height_violations,
+                            ) => (
+                                Ok(()),
+                                width_violations,
+                                height_violations,
                                 Vec::new(),
                                 Vec::new(),
-                                Vec::new(),
-                            )
-                        }
-                        TestApplyPlacementsBehavior::SucceedWithMaximizedSkip(window_id) => {
-                            let skipped = if call_index == 0 {
-                                vec![window_id]
-                            } else {
-                                Vec::new()
-                            };
-                            (Ok(()), Vec::new(), Vec::new(), skipped)
-                        }
-                        TestApplyPlacementsBehavior::SucceedWithSizeViolations(
-                            width_violations,
-                            height_violations,
-                        ) => (Ok(()), width_violations, height_violations, Vec::new()),
-                    };
+                            ),
+                            TestApplyPlacementsBehavior::Scripted(steps) => {
+                                let step = steps.get(call_index).cloned().unwrap_or(
+                                    TestApplyPlacementsStep {
+                                        delay: std::time::Duration::ZERO,
+                                        outcome: TestApplyPlacementsOutcome::Succeed {
+                                            landings: Vec::new(),
+                                        },
+                                    },
+                                );
+                                std::thread::sleep(step.delay);
+                                match step.outcome {
+                                    TestApplyPlacementsOutcome::Succeed { landings } => {
+                                        (Ok(()), Vec::new(), Vec::new(), Vec::new(), landings)
+                                    }
+                                    TestApplyPlacementsOutcome::Fail => (
+                                        Err(anyhow!("injected apply_placements failure")),
+                                        Vec::new(),
+                                        Vec::new(),
+                                        Vec::new(),
+                                        Vec::new(),
+                                    ),
+                                }
+                            }
+                        };
                     if should_cancel() {
                         run_layout_apply_recovery_pass(
                             &apply_window_ids,
@@ -863,7 +1017,7 @@ impl AppState {
                         );
                         #[cfg(test)]
                         late_worker_recovery_count.fetch_add(1, Ordering::SeqCst);
-                        let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new()));
+                        let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
                         return;
                     }
                     let _ = tx.send((
@@ -871,34 +1025,42 @@ impl AppState {
                         width_violations,
                         height_violations,
                         maximized_skipped_window_ids,
+                        landings,
                     ));
                     return;
                 }
 
                 if should_cancel() {
-                    let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new()));
+                    let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
                     return;
                 }
-                let (result, width_violations, height_violations, maximized_skipped_window_ids) =
-                    match leopardwm_platform_win32::apply_placements(
-                        &all_placements,
-                        &platform_config,
-                        None,
-                        post_animation_nudge,
-                    ) {
-                        Ok(r) => (
-                            Ok(()),
-                            r.width_violations,
-                            r.height_violations,
-                            r.maximized_skipped_window_ids,
-                        ),
-                        Err(e) => (
-                            Err(anyhow!(e.to_string())),
-                            Vec::new(),
-                            Vec::new(),
-                            Vec::new(),
-                        ),
-                    };
+                let (
+                    result,
+                    width_violations,
+                    height_violations,
+                    maximized_skipped_window_ids,
+                    landings,
+                ) = match leopardwm_platform_win32::apply_placements(
+                    &all_placements,
+                    &platform_config,
+                    None,
+                    post_animation_nudge,
+                ) {
+                    Ok(r) => (
+                        Ok(()),
+                        r.width_violations,
+                        r.height_violations,
+                        r.maximized_skipped_window_ids,
+                        r.landings,
+                    ),
+                    Err(e) => (
+                        Err(anyhow!(e.to_string())),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                };
                 if should_cancel() {
                     run_layout_apply_recovery_pass(
                         &apply_window_ids,
@@ -906,7 +1068,7 @@ impl AppState {
                     );
                     #[cfg(test)]
                     late_worker_recovery_count.fetch_add(1, Ordering::SeqCst);
-                    let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new()));
+                    let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
                     return;
                 }
                 let _ = tx.send((
@@ -914,6 +1076,7 @@ impl AppState {
                     width_violations,
                     height_violations,
                     maximized_skipped_window_ids,
+                    landings,
                 ));
             });
 
@@ -1102,7 +1265,7 @@ impl AppState {
 
 #[cfg(test)]
 mod park_tests {
-    use super::offscreen_park_rect;
+    use crate::physical_placement::offscreen_park_rect;
     use leopardwm_core_layout::Rect;
 
     // A window scrolled off the owning monitor keeps its size when re-parked.
@@ -1188,7 +1351,7 @@ mod park_tests {
         assert_eq!((parked.x, parked.y), (sentinel, sentinel));
     }
 
-    use super::park_offscreen_avoiding_neighbors;
+    use crate::physical_placement::park_offscreen_avoiding_neighbors;
     use leopardwm_core_layout::{Visibility, WindowPlacement};
     use leopardwm_platform_win32::{MonitorId, MonitorInfo};
     use std::collections::HashMap;

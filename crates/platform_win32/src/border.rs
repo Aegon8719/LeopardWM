@@ -238,6 +238,52 @@ impl BorderFrame {
         }
     }
 
+    /// Show the border at an already-final overlay rectangle (no expansion).
+    pub fn show_final_overlay(
+        &self,
+        overlay: leopardwm_core_layout::Rect,
+        width: u32,
+        position: BorderPosition,
+        color_bgr: u32,
+        corner_radius: f32,
+    ) {
+        if let Ok(mut state) = BORDER_STATE.lock() {
+            state.color_bgr = color_bgr;
+            state.corner_radius = corner_radius;
+        }
+
+        let x = overlay.x;
+        let y = overlay.y;
+        let w = overlay.width;
+        let h = overlay.height;
+        let needs_render = {
+            let state = BORDER_STATE.lock().unwrap();
+            w != state.cached_w
+                || h != state.cached_h
+                || width != state.cached_width
+                || position != state.cached_position
+                || state.color_bgr != state.cached_color
+                || (state.corner_radius - state.cached_corner_radius).abs() > f32::EPSILON
+        };
+
+        if needs_render {
+            self.render_and_update(x, y, w, h, width, position);
+        } else {
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOP),
+                    x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE,
+                );
+                let _ = ShowWindow(self.hwnd, SW_SHOWNA);
+            }
+        }
+    }
+
     /// Hide the border frame.
     pub fn hide(&self) {
         unsafe {
