@@ -1087,8 +1087,10 @@ fn test_outer_animation_pump_preserves_newer_frame_and_resumes_after_sync_supers
     };
     state.apply_physical_projection(vec![placement.clone()]);
     let (old_request, old_invalidation) = state.physical_request_ids();
+    state.animation_inflight_request_id = Some(old_request);
     let newer = state.apply_physical_projection(vec![placement]);
     let (new_request, new_invalidation) = state.physical_request_ids();
+    state.animation_inflight_request_id = Some(new_request);
     let stale = animation_worker::FrameResult {
         apply_result: Ok(()),
         frame_time: std::time::Duration::ZERO,
@@ -1106,7 +1108,7 @@ fn test_outer_animation_pump_preserves_newer_frame_and_resumes_after_sync_supers
     assert_eq!(
         interrupted_animation_frame_action(
             AnimationPlacementResult::Stale,
-            state.inflight_request_id
+            state.animation_inflight_request_id
         ),
         Some(InterruptedAnimationFrameAction::LeaveNewerFrame),
         "an old completion must not supersede the newer outstanding frame"
@@ -1127,8 +1129,12 @@ fn test_outer_animation_pump_preserves_newer_frame_and_resumes_after_sync_supers
         &newer,
     );
     assert_eq!(state.inflight_request_id, None);
+    state.animation_inflight_request_id = None;
     assert_eq!(
-        interrupted_animation_frame_action(AnimationPlacementResult::Stale, state.inflight_request_id),
+        interrupted_animation_frame_action(
+            AnimationPlacementResult::Stale,
+            state.animation_inflight_request_id,
+        ),
         Some(InterruptedAnimationFrameAction::Resume),
         "after synchronous apply consumes the newer request, the stale acknowledgement restarts the pump"
     );
@@ -1140,6 +1146,51 @@ fn test_outer_animation_pump_preserves_newer_frame_and_resumes_after_sync_supers
     assert_eq!(
         interrupted_animation_frame_action(AnimationPlacementResult::Current, None),
         None
+    );
+}
+
+#[test]
+fn test_stale_animation_result_resumes_after_unconsumed_sync_supersession() {
+    use crate::layout_apply::AnimationPlacementResult;
+    use crate::{interrupted_animation_frame_action, InterruptedAnimationFrameAction};
+
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    let placement = leopardwm_core_layout::WindowPlacement {
+        window_id: 100,
+        rect: Rect::new(1800, 0, 400, 600),
+        visibility: leopardwm_core_layout::Visibility::Visible,
+        column_index: 0,
+    };
+    state.apply_physical_projection(vec![placement.clone()]);
+    let (old_request, old_invalidation) = state.physical_request_ids();
+    state.animation_inflight_request_id = Some(old_request);
+    state.apply_physical_projection(vec![placement]);
+    state.animation_inflight_request_id = None;
+
+    let stale = animation_worker::FrameResult {
+        apply_result: Ok(()),
+        frame_time: std::time::Duration::ZERO,
+        width_violations: Vec::new(),
+        height_violations: Vec::new(),
+        maximized_skipped_window_ids: Vec::new(),
+        physical_request_id: old_request,
+        physical_invalidation_id: old_invalidation,
+        landings: Vec::new(),
+    };
+    assert!(matches!(
+        state.handle_animation_placement_result(&stale),
+        AnimationPlacementResult::Stale
+    ));
+    assert_eq!(
+        interrupted_animation_frame_action(
+            AnimationPlacementResult::Stale,
+            state.animation_inflight_request_id,
+        ),
+        Some(InterruptedAnimationFrameAction::Resume),
+        "a synchronous supersession without an async completion must not strand the animation pump"
     );
 }
 
@@ -1259,6 +1310,156 @@ fn test_direct_and_reduced_motion_apply_park_rejected_adjacent_slice_without_wid
             "reduce_motion={reduce_motion}: direct landing and bounded parking both dispatch"
         );
     }
+}
+
+#[test]
+fn test_primary_feedback_survives_failed_parking_follow_up() {
+    use crate::state::{
+        TestApplyPlacementsBehavior, TestApplyPlacementsOutcome, TestApplyPlacementsStep,
+    };
+
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = false;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(2200))
+        .unwrap();
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(200, Some(400))
+        .unwrap();
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::Scripted(vec![
+        TestApplyPlacementsStep {
+            delay: std::time::Duration::ZERO,
+            outcome: TestApplyPlacementsOutcome::SucceedWithFeedback {
+                width_violations: vec![leopardwm_platform_win32::WidthViolation {
+                    window_id: 200,
+                    min_width: 1200,
+                }],
+                height_violations: Vec::new(),
+                landings: vec![
+                    leopardwm_platform_win32::PlacementLanding {
+                        window_id: 100,
+                        requested_rect: Rect::new(0, 0, 1920, 1040),
+                        requested_visibility: leopardwm_core_layout::Visibility::Visible,
+                        actual_visible_rect: Some(Rect::new(0, 0, 2200, 1040)),
+                        actual_outer_rect: Some(Rect::new(0, 0, 2200, 1040)),
+                        failed: false,
+                        unreadable: false,
+                    },
+                    leopardwm_platform_win32::PlacementLanding {
+                        window_id: 200,
+                        requested_rect: Rect::new(1920, 0, 400, 1040),
+                        requested_visibility: leopardwm_core_layout::Visibility::Visible,
+                        actual_visible_rect: Some(Rect::new(1920, 0, 400, 1040)),
+                        actual_outer_rect: Some(Rect::new(1920, 0, 400, 1040)),
+                        failed: false,
+                        unreadable: false,
+                    },
+                ],
+            },
+        },
+        TestApplyPlacementsStep {
+            delay: std::time::Duration::ZERO,
+            outcome: TestApplyPlacementsOutcome::Fail,
+        },
+    ]));
+
+    assert!(state.apply_layout().is_err());
+    let workspace = &state.workspaces[&2][0];
+    assert_eq!(
+        workspace.effective_column_width(&workspace.columns()[0]),
+        1200,
+        "unconstrained primary feedback must be retained even when parking fails"
+    );
+    assert!(
+        !state.last_physical_presentations[&100].confirmed,
+        "the failed parking follow-up must remain unconfirmed"
+    );
+    assert_eq!(
+        state
+            .injected_apply_placements_call_count
+            .load(Ordering::SeqCst),
+        2,
+        "the rejected slice still receives only one parking follow-up"
+    );
+}
+
+#[test]
+fn test_failed_landing_retries_before_releasing_pending_ghost() {
+    use crate::state::{
+        TestApplyPlacementsBehavior, TestApplyPlacementsOutcome, TestApplyPlacementsStep,
+    };
+
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    let placement = state.workspaces[&1][0]
+        .compute_placements_animated(state.layout_viewport(1))
+        .into_iter()
+        .find(|placement| placement.window_id == 100)
+        .unwrap();
+    let dispatched = state.apply_physical_projection(vec![placement.clone()]);
+    let (request_id, invalidation_id) = state.physical_request_ids();
+    state.consume_physical_landings(
+        request_id,
+        invalidation_id,
+        &[leopardwm_platform_win32::PlacementLanding {
+            window_id: 100,
+            requested_rect: dispatched[0].rect,
+            requested_visibility: dispatched[0].visibility,
+            actual_visible_rect: Some(dispatched[0].rect),
+            actual_outer_rect: Some(dispatched[0].rect),
+            failed: false,
+            unreadable: false,
+        }],
+        &dispatched,
+    );
+    state.last_placed_layout_rects.insert(100, placement.rect);
+    assert!(state.physical_fast_path_ok());
+    state.post_animation_nudge_pending = true;
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::Scripted(vec![
+        TestApplyPlacementsStep {
+            delay: std::time::Duration::ZERO,
+            outcome: TestApplyPlacementsOutcome::Fail,
+        },
+        TestApplyPlacementsStep {
+            delay: std::time::Duration::ZERO,
+            outcome: TestApplyPlacementsOutcome::Succeed {
+                landings: vec![leopardwm_platform_win32::PlacementLanding {
+                    window_id: 100,
+                    requested_rect: placement.rect,
+                    requested_visibility: placement.visibility,
+                    actual_visible_rect: Some(placement.rect),
+                    actual_outer_rect: Some(placement.rect),
+                    failed: false,
+                    unreadable: false,
+                }],
+            },
+        },
+    ]));
+
+    assert!(state.apply_layout().is_err());
+    assert_eq!(state.inflight_request_id, None);
+    assert!(state.inflight_origins.is_empty());
+    assert!(state.pending_physical_presentations.is_empty());
+    assert!(
+        !state.physical_fast_path_ok(),
+        "a failed landing must invalidate the old physical confirmation before an unchanged retry"
+    );
+    leopardwm_platform_win32::mark_ghost_cloaked(100);
+    state.ghost_sources_pending_safe_landing.insert(100);
+
+    assert!(state.apply_layout().is_ok());
+    assert_eq!(
+        state
+            .injected_apply_placements_call_count
+            .load(Ordering::SeqCst),
+        2,
+        "an unchanged retry must obtain a current landing instead of trusting the failed attempt's old confirmation"
+    );
+    assert!(!state.ghost_sources_pending_safe_landing.contains(&100));
+    assert!(!leopardwm_platform_win32::is_placement_cloaked(100));
 }
 
 #[test]
@@ -1881,6 +2082,21 @@ fn test_revoked_unconfirmed_ghost_source_stays_cloaked_until_landing() {
     assert!(
         state.ghost_sources_pending_safe_landing.contains(&42),
         "revoking an unconfirmed ghost must not expose its stale source"
+    );
+}
+
+#[test]
+fn test_departing_pending_ghost_releases_ghost_cloak_after_thumbnail_drop() {
+    let wid = 0xFFFF_FFFF_FFFF_FF21;
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    leopardwm_platform_win32::mark_ghost_cloaked(wid);
+    state.ghost_sources_pending_safe_landing.insert(wid);
+
+    state.stop_ghosting_window_visuals(wid);
+
+    assert!(
+        !leopardwm_platform_win32::is_placement_cloaked(wid),
+        "pending safe-landing membership remains cloak ownership after its thumbnail has been dropped"
     );
 }
 

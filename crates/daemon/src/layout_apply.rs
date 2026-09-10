@@ -98,6 +98,9 @@ impl AppState {
         &mut self,
         frame_result: &animation_worker::FrameResult,
     ) -> AnimationPlacementResult {
+        if self.animation_inflight_request_id == Some(frame_result.physical_request_id) {
+            self.animation_inflight_request_id = None;
+        }
         if !self.physical_result_matches_inflight(
             frame_result.physical_request_id,
             frame_result.physical_invalidation_id,
@@ -419,18 +422,25 @@ impl AppState {
             &maximized,
             leopardwm_platform_win32::is_placement_parked,
         );
+        self.animation_inflight_request_id = None;
         let dispatched_placements = self.apply_physical_projection(dispatched_placements);
 
         // Partition into live placements + ghost-thumbnail updates. Ghost
         // wids are excluded from `placements` so the worker doesn't fire
         // per-frame SetWindowPos on the cloaked source HWND.
         let request = self.prepare_projected_animation_frame(dispatched_placements);
+        let (request_id, invalidation_id) = (
+            request.physical_request_id,
+            request.physical_invalidation_id,
+        );
         self.applying_layout = true;
 
         if let Err(e) = worker.send_frame(request) {
+            self.abandon_physical_request(request_id, invalidation_id);
             self.applying_layout = false;
             return Err(anyhow::anyhow!(e));
         }
+        self.animation_inflight_request_id = Some(request_id);
         // Reposition the border immediately — both the worker's
         // SetWindowPos calls below and this border SetWindowPos commit
         // before the next DwmFlush vsync, so the border arrives on screen
@@ -565,13 +575,16 @@ impl AppState {
 
         self.record_last_placed_rects(&all_placements);
         let dispatched_placements = self.filter_application_fullscreen_placements(all_placements);
+        self.animation_inflight_request_id = None;
         let dispatched_placements = self.prepare_physical_placements(dispatched_placements);
+        let (physical_request_id, physical_invalidation_id) = self.physical_request_ids();
         #[cfg(test)]
         let invoke_injected_empty_worker =
             self.injected_apply_placements_behavior.is_some() && dispatched_placements.is_empty();
         #[cfg(not(test))]
         let invoke_injected_empty_worker = false;
         if dispatched_placements.is_empty() && !invoke_injected_empty_worker {
+            self.abandon_physical_request(physical_request_id, physical_invalidation_id);
             self.applying_layout = false;
             self.finalize_layout_success();
             return Ok(());
@@ -589,9 +602,15 @@ impl AppState {
         );
 
         let timeout = self.layout_apply_timeout;
-        let (physical_request_id, physical_invalidation_id) = self.physical_request_ids();
         let dispatched_for_landing = dispatched_placements.clone();
-        let (rx, worker_handle) = self.spawn_apply_worker(dispatched_placements)?;
+        let (rx, worker_handle) = match self.spawn_apply_worker(dispatched_placements) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.abandon_physical_request(physical_request_id, physical_invalidation_id);
+                self.applying_layout = false;
+                return Err(error);
+            }
+        };
 
         let result = match rx.recv_timeout(timeout) {
             Ok((
@@ -622,8 +641,10 @@ impl AppState {
                         )
                     })
                     .collect();
+                let primary_succeeded = result.is_ok();
                 let result = if result.is_err() {
                     self.moved_or_resized_suppression.clear();
+                    self.abandon_physical_request(physical_request_id, physical_invalidation_id);
                     result
                 } else {
                     self.handle_maximized_placement_skips(&maximized_skipped_window_ids);
@@ -635,7 +656,7 @@ impl AppState {
                     );
                     self.apply_physical_follow_up(follow_up)
                 };
-                let constraints_changed = result.is_ok()
+                let constraints_changed = primary_succeeded
                     && self.propagate_size_violations(&width_violations, &height_violations);
                 let restored_during_apply = result.is_ok()
                     && maximized_skipped_window_ids.iter().any(|window_id| {
@@ -656,7 +677,8 @@ impl AppState {
                 // surface that error in place of the outer Ok — the outer
                 // placements may have already landed, but the daemon state
                 // needs to reflect that the corrective pass didn't complete.
-                if (constraints_changed || restored_during_apply)
+                if result.is_ok()
+                    && (constraints_changed || restored_during_apply)
                     && !self.reapplying_after_violation
                 {
                     self.reapplying_after_violation = true;
@@ -674,6 +696,7 @@ impl AppState {
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.abandon_physical_request(physical_request_id, physical_invalidation_id);
                 self.paused = true;
                 // Invalidate this apply epoch so late-starting workers bail before placement calls.
                 self.apply_epoch.fetch_add(1, Ordering::SeqCst);
@@ -706,6 +729,7 @@ impl AppState {
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = worker_handle.join();
+                self.abandon_physical_request(physical_request_id, physical_invalidation_id);
                 self.moved_or_resized_suppression.clear();
                 Err(anyhow!(
                     "Layout worker thread exited without returning a result"
@@ -1000,6 +1024,17 @@ impl AppState {
                                     TestApplyPlacementsOutcome::Succeed { landings } => {
                                         (Ok(()), Vec::new(), Vec::new(), Vec::new(), landings)
                                     }
+                                    TestApplyPlacementsOutcome::SucceedWithFeedback {
+                                        width_violations,
+                                        height_violations,
+                                        landings,
+                                    } => (
+                                        Ok(()),
+                                        width_violations,
+                                        height_violations,
+                                        Vec::new(),
+                                        landings,
+                                    ),
                                     TestApplyPlacementsOutcome::Fail => (
                                         Err(anyhow!("injected apply_placements failure")),
                                         Vec::new(),

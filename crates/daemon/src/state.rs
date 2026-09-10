@@ -182,6 +182,11 @@ pub(crate) enum TestApplyPlacementsOutcome {
     Succeed {
         landings: Vec<leopardwm_platform_win32::PlacementLanding>,
     },
+    SucceedWithFeedback {
+        width_violations: Vec<leopardwm_platform_win32::WidthViolation>,
+        height_violations: Vec<leopardwm_platform_win32::HeightViolation>,
+        landings: Vec<leopardwm_platform_win32::PlacementLanding>,
+    },
     Fail,
 }
 
@@ -519,6 +524,8 @@ pub(crate) struct AppState {
     pub(crate) physical_dispatch_request_id: Arc<AtomicU64>,
     pub(crate) physical_invalidation_id: Arc<AtomicU64>,
     pub(crate) inflight_request_id: Option<u64>,
+    /// The one physical request that can still produce an asynchronous animation completion.
+    pub(crate) animation_inflight_request_id: Option<u64>,
     pub(crate) pending_physical_request_id: u64,
     pub(crate) pending_physical_invalidation_id: u64,
     pub(crate) last_applied_physical_invalidation: u64,
@@ -910,6 +917,7 @@ impl AppState {
             physical_dispatch_request_id: Arc::new(AtomicU64::new(0)),
             physical_invalidation_id: Arc::new(AtomicU64::new(0)),
             inflight_request_id: None,
+            animation_inflight_request_id: None,
             pending_physical_request_id: 0,
             pending_physical_invalidation_id: 0,
             last_applied_physical_invalidation: 0,

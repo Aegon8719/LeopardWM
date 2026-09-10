@@ -766,6 +766,31 @@ impl AppState {
         physical
     }
 
+    pub(crate) fn abandon_physical_request(&mut self, request_id: u64, invalidation_id: u64) {
+        if request_id == 0
+            || self.pending_physical_request_id != request_id
+            || self.pending_physical_invalidation_id != invalidation_id
+        {
+            return;
+        }
+
+        if let Some(mut origins) = self.inflight_origins.remove(&request_id) {
+            for presentation in origins.values_mut() {
+                presentation.confirmed = false;
+            }
+            self.last_physical_presentations = origins;
+            self.last_applied_physical_invalidation =
+                self.physical_invalidation_id.load(Ordering::SeqCst);
+            self.last_topology_signature = topology_signature(&self.monitors);
+        }
+        if self.inflight_request_id == Some(request_id) {
+            self.inflight_request_id = None;
+        }
+        self.pending_physical_presentations.clear();
+        self.pending_physical_request_id = 0;
+        self.pending_physical_invalidation_id = 0;
+    }
+
     pub(crate) fn physical_request_ids(&self) -> (u64, u64) {
         (
             self.pending_physical_request_id,

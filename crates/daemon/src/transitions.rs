@@ -204,7 +204,7 @@ impl AppState {
     }
 
     pub(crate) fn stop_ghosting_window_visuals(&mut self, hwnd: u64) {
-        self.ghost_sources_pending_safe_landing.remove(&hwnd);
+        let pending_safe_landing = self.ghost_sources_pending_safe_landing.remove(&hwnd);
         let crossfade_epochs: Vec<u64> = self
             .crossfade_sources
             .iter()
@@ -215,7 +215,8 @@ impl AppState {
                 ctrl.send_drop_crossfade_target(epoch, hwnd);
             }
         }
-        if self.ghost_handles.remove(&hwnd).is_some() {
+        let had_ghost_handle = self.ghost_handles.remove(&hwnd).is_some();
+        if pending_safe_landing || had_ghost_handle {
             leopardwm_platform_win32::unmark_ghost_cloaked(hwnd);
             leopardwm_platform_win32::apply_cloak_state(hwnd);
         }

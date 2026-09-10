@@ -2849,10 +2849,10 @@ pub(crate) enum InterruptedAnimationFrameAction {
 
 pub(crate) fn interrupted_animation_frame_action(
     result: AnimationPlacementResult,
-    inflight_request_id: Option<u64>,
+    outstanding_animation_request_id: Option<u64>,
 ) -> Option<InterruptedAnimationFrameAction> {
     match result {
-        AnimationPlacementResult::Stale if inflight_request_id.is_some() => {
+        AnimationPlacementResult::Stale if outstanding_animation_request_id.is_some() => {
             Some(InterruptedAnimationFrameAction::LeaveNewerFrame)
         }
         AnimationPlacementResult::Stale => Some(InterruptedAnimationFrameAction::Resume),
@@ -2868,12 +2868,14 @@ async fn handle_animation_frame_applied(
     ctx: &mut EventLoopCtx<'_>,
     frame_result: animation_worker::FrameResult,
 ) {
-    let (current_result, inflight_request_id) = {
+    let (current_result, outstanding_animation_request_id) = {
         let mut state = ctx.state.lock().await;
         let result = state.handle_animation_placement_result(&frame_result);
-        (result, state.inflight_request_id)
+        (result, state.animation_inflight_request_id)
     };
-    if let Some(action) = interrupted_animation_frame_action(current_result, inflight_request_id) {
+    if let Some(action) =
+        interrupted_animation_frame_action(current_result, outstanding_animation_request_id)
+    {
         if action == InterruptedAnimationFrameAction::LeaveNewerFrame {
             return;
         }
