@@ -98,7 +98,9 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::WM_USER;
 
 /// Sentinel coordinate used by MoveOffScreen strategy.
-pub const MOVE_OFFSCREEN_SENTINEL_COORD: i32 = -100_000;
+/// USER32 clamps smaller positions to the signed 16-bit minimum; recovery must
+/// recognize the coordinates that GetWindowRect actually returns.
+pub const MOVE_OFFSCREEN_SENTINEL_COORD: i32 = i16::MIN as i32;
 
 /// Custom message to signal the gesture/mouse-hook thread to stop.
 pub(crate) const WM_QUIT_LLHOOK_THREAD: u32 = WM_USER + 2;

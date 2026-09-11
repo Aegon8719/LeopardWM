@@ -9,6 +9,9 @@ use crate::{combine_operation_failures, is_benign_side_effect_error, window_id_t
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::ffi::c_void;
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::UI::HiDpi::{
+    SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, IsIconic, IsWindow, SetWindowPos, ShowWindow, HWND_TOP, SWP_NOACTIVATE,
     SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
@@ -154,11 +157,37 @@ fn restore_window_if_offscreen_to_work_area(
 // Restore / uncloak
 // ============================================================================
 
+// Recovery also runs in DPI-unaware CLI/watchdog threads. Keep monitor and window
+// coordinates physical for the entire operation, then restore the caller's context.
+// Per-monitor v1 is sufficient here and also works on Windows 10 before v2 support.
+struct RecoveryDpiContext(DPI_AWARENESS_CONTEXT);
+
+impl RecoveryDpiContext {
+    fn enter() -> Result<Self, Win32Error> {
+        let previous =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE) };
+        if previous.0.is_null() {
+            return Err(Win32Error::SetPositionFailed(format!(
+                "Failed to establish physical recovery coordinates: {}",
+                windows::core::Error::from_thread()
+            )));
+        }
+        Ok(Self(previous))
+    }
+}
+
+impl Drop for RecoveryDpiContext {
+    fn drop(&mut self) {
+        unsafe { SetThreadDpiAwarenessContext(self.0) };
+    }
+}
+
 /// Restore one window from MoveOffScreen sentinel coordinates to the primary monitor.
 ///
 /// Returns `Ok(true)` if the window was restored, `Ok(false)` if it was not at
 /// sentinel coordinates, and `Err` if restore operations failed.
 pub fn restore_window_moved_offscreen(window_id: WindowId) -> Result<bool, Win32Error> {
+    let _dpi = RecoveryDpiContext::enter()?;
     let primary = get_primary_monitor()?;
     restore_window_if_offscreen_to_work_area(window_id, &primary.work_area)
 }
@@ -208,6 +237,7 @@ pub fn restore_windows_moved_offscreen(window_ids: &[WindowId]) -> Result<usize,
         return Ok(0);
     }
 
+    let _dpi = RecoveryDpiContext::enter()?;
     let primary = get_primary_monitor()?;
     let (restored_count, failures) = restore_windows_moved_offscreen_with_work_area(
         window_ids,
@@ -257,6 +287,13 @@ pub fn uncloak_all_managed_windows(window_ids: &[WindowId]) {
 /// This helper is panic-safe and best-effort, making it suitable for panic
 /// hooks where daemon state may be unavailable or poisoned.
 pub fn restore_all_windows_moved_offscreen_best_effort() -> usize {
+    let _dpi = match RecoveryDpiContext::enter() {
+        Ok(context) => context,
+        Err(e) => {
+            eprintln!("[leopardwm] Emergency MoveOffScreen restore skipped: {}", e);
+            return 0;
+        }
+    };
     let primary = match get_primary_monitor() {
         Ok(primary) => primary,
         Err(e) => {
@@ -360,6 +397,47 @@ pub fn cascade_windows(window_ids: &[WindowId]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::HiDpi::{
+        AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_UNAWARE,
+    };
+
+    fn set_test_dpi_context(context: DPI_AWARENESS_CONTEXT) -> RecoveryDpiContext {
+        let previous = unsafe { SetThreadDpiAwarenessContext(context) };
+        assert!(!previous.0.is_null());
+        RecoveryDpiContext(previous)
+    }
+
+    fn assert_dpi_context(context: DPI_AWARENESS_CONTEXT) {
+        assert!(unsafe {
+            AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), context).as_bool()
+        });
+    }
+
+    #[test]
+    fn test_recovery_dpi_context_restores_caller_on_all_exits() {
+        let _caller = set_test_dpi_context(DPI_AWARENESS_CONTEXT_UNAWARE);
+        {
+            let _dpi = RecoveryDpiContext::enter().unwrap();
+            assert_dpi_context(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+        }
+        assert_dpi_context(DPI_AWARENESS_CONTEXT_UNAWARE);
+
+        let result = (|| -> Result<(), Win32Error> {
+            let _dpi = RecoveryDpiContext::enter()?;
+            assert_dpi_context(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+            Err(Win32Error::WindowNotFound(0))
+        })();
+        assert!(result.is_err());
+        assert_dpi_context(DPI_AWARENESS_CONTEXT_UNAWARE);
+
+        let result = std::panic::catch_unwind(|| {
+            let _dpi = RecoveryDpiContext::enter().unwrap();
+            assert_dpi_context(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+            panic!("test recovery context unwinding");
+        });
+        assert!(result.is_err());
+        assert_dpi_context(DPI_AWARENESS_CONTEXT_UNAWARE);
+    }
 
     #[test]
     fn test_is_benign_side_effect_error_only_for_nonzero_not_found() {
@@ -440,6 +518,103 @@ mod tests {
     fn test_move_offscreen_sentinel_does_not_match_minimized_coordinates() {
         // Windows commonly reports minimized windows around (-32000, -32000).
         assert!(!is_move_offscreen_sentinel_position(-32_000, -32_000));
+    }
+
+    #[test]
+    fn test_move_offscreen_native_parking_is_recoverable() {
+        let _serialize = crate::placement::lock_cloak_set_tests();
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, IsWindowVisible, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+            WS_POPUP,
+        };
+
+        struct OwnedWindow(HWND);
+        impl Drop for OwnedWindow {
+            fn drop(&mut self) {
+                let _ = unsafe { DestroyWindow(self.0) };
+            }
+        }
+
+        unsafe {
+            let _dpi = set_test_dpi_context(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+            let window = OwnedWindow(
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                    w!("STATIC"),
+                    w!("LeopardWM hidden parking test"),
+                    WS_POPUP,
+                    100,
+                    100,
+                    640,
+                    480,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+            let window_id = window.0 .0 as usize as WindowId;
+            move_window_offscreen(window_id).unwrap();
+
+            let mut parked = RECT::default();
+            GetWindowRect(window.0, &mut parked).unwrap();
+            assert!(
+                is_move_offscreen_sentinel_position(parked.left, parked.top),
+                "native parking ({}, {}) must be recognized for recovery",
+                parked.left,
+                parked.top
+            );
+            assert_eq!(
+                (parked.right - parked.left, parked.bottom - parked.top),
+                (640, 480)
+            );
+            assert!(!IsWindowVisible(window.0).as_bool());
+
+            let work_area = Rect::new(100, 100, 1920, 1080);
+            assert!(restore_window_if_offscreen_to_work_area(window_id, &work_area).unwrap());
+            let mut restored = RECT::default();
+            GetWindowRect(window.0, &mut restored).unwrap();
+            assert_eq!(
+                (restored.left, restored.top, restored.right, restored.bottom),
+                (100, 100, 740, 580)
+            );
+            assert!(!IsWindowVisible(window.0).as_bool());
+            assert!(!restore_window_if_offscreen_to_work_area(window_id, &work_area).unwrap());
+
+            let primary = get_primary_monitor().unwrap();
+            let expected =
+                compute_restore_rect_from_offscreen(&Rect::new(0, 0, 640, 480), &primary.work_area);
+            let restore_functions: [fn(WindowId) -> Result<bool, Win32Error>; 2] =
+                [restore_window_moved_offscreen, |id| {
+                    restore_windows_moved_offscreen(&[id]).map(|count| count == 1)
+                }];
+            for restore in restore_functions {
+                move_window_offscreen(window_id).unwrap();
+                {
+                    let _caller = set_test_dpi_context(DPI_AWARENESS_CONTEXT_UNAWARE);
+                    assert!(restore(window_id).unwrap());
+                    assert_dpi_context(DPI_AWARENESS_CONTEXT_UNAWARE);
+                    assert!(!restore(window_id).unwrap());
+                    assert_dpi_context(DPI_AWARENESS_CONTEXT_UNAWARE);
+                    assert!(restore(0).is_err());
+                    assert_dpi_context(DPI_AWARENESS_CONTEXT_UNAWARE);
+                }
+                GetWindowRect(window.0, &mut restored).unwrap();
+                assert_eq!(
+                    (restored.left, restored.top, restored.right, restored.bottom),
+                    (
+                        expected.x,
+                        expected.y,
+                        expected.x + expected.width,
+                        expected.y + expected.height,
+                    )
+                );
+                assert!(!IsWindowVisible(window.0).as_bool());
+                assert_dpi_context(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+            }
+        }
     }
 
     #[test]

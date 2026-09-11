@@ -15,6 +15,7 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Fixes
 
+- **Off-screen recovery recognizes Windows-clamped parking coordinates.** Parking now uses the native coordinate limit so cleanup can find and restore parked windows without mistaking ordinary minimized windows for parked ones. Recovery uses physical coordinates even when called from the CLI or watchdog, then restores the caller's DPI context.
 - **Tiled window landings respect exactly adjacent monitor edges.** LeopardWM projects only the native HWND presentation at shared physical monitor boundaries while preserving requested column widths, scrolling, focus, and saved layout state. Synchronous final landings verify containment; apps that reject a constrained landing are parked outside every monitor without changing their logical layout. Intermediate asynchronous resize attempts are not guaranteed to have no transient bleed.
 - **Boundary-affected animation ghosts wait for a confirmed landing before their live source is exposed.** Crossfades use the current physical destination and are aborted when display topology invalidates that destination.
 - **Boundary parking remains recoverable and current during transitions.** Rejected native slices use LeopardWM's shared off-screen recovery sentinel; pending native intent drives borders and strips until it lands, while stale rejection measurements are discarded when their geometry changes. Interrupted animation frames request a replacement so active transitions continue to their final landing.
