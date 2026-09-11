@@ -1149,13 +1149,13 @@ impl AppState {
             if let Some(next) = self.injected_next_foreground_hwnd.take() {
                 self.injected_foreground_hwnd = Some(next);
             }
-            return foreground.map(|foreground| {
+            foreground.map(|foreground| {
                 (
                     foreground.filter(|&id| id != 0),
                     self.injected_foreground_is_valid
                         .unwrap_or(foreground.is_some_and(|id| id != 0)),
                 )
-            });
+            })
         }
         #[cfg(not(test))]
         {

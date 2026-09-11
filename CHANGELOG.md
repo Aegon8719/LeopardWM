@@ -52,6 +52,7 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Internal
 
+- **Daemon clippy baseline warnings are cleared.** Test fixtures construct Config and ConstrainedAxes without Default reassignment, assert boolean eligibility directly, drop needless `return` in cfg(test) stubs, and iterate a one-element monitor array. Tab-action tests keep production `Arc<tokio::Mutex<AppState>>` because overlay fields hold HWND.
 - **Platform cloak-set tests serialize around the shared tracking sets.** Empty apply, shutdown uncloak, and parked-recovery fixtures no longer interleave process-global cloak membership.
 - **Desktop acceptance checks distinguish layout behavior from restoration failures.**
   Offline helpers exclude fully minimized columns from strip extent and plan bounded

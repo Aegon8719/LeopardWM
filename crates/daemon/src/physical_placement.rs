@@ -1375,14 +1375,13 @@ mod tests {
             boundary_rect,
             Visibility::Visible,
         )]);
-        assert_eq!(
-            application_fullscreen
+        assert!(
+            !application_fullscreen
                 .layout_transition
                 .as_ref()
                 .unwrap()
                 .exit_provenance[&300]
-                .eligible,
-            false
+                .eligible
         );
         assert_eq!(
             application_fullscreen
@@ -1415,14 +1414,13 @@ mod tests {
             boundary_rect,
             Visibility::Visible,
         )]);
-        assert_eq!(
-            layout_fullscreen
+        assert!(
+            !layout_fullscreen
                 .layout_transition
                 .as_ref()
                 .unwrap()
                 .exit_provenance[&400]
-                .eligible,
-            false
+                .eligible
         );
         assert_eq!(
             layout_fullscreen
@@ -1470,10 +1468,7 @@ mod tests {
             boundary_rect,
             Visibility::Visible,
         )]);
-        assert_eq!(
-            dragging.layout_transition.as_ref().unwrap().exit_provenance[&500].eligible,
-            false
-        );
+        assert!(!dragging.layout_transition.as_ref().unwrap().exit_provenance[&500].eligible);
         assert_eq!(
             dragging.layout_transition.as_ref().unwrap().exit_provenance[&500].owner,
             1
@@ -2054,8 +2049,10 @@ mod tests {
     fn containment_detects_size_and_position_overshoot() {
         let owner = owner_5120();
         let requested = Rect::new(4320, 10, 800, 1440);
-        let mut axes = ConstrainedAxes::default();
-        axes.right = true;
+        let axes = ConstrainedAxes {
+            right: true,
+            ..ConstrainedAxes::default()
+        };
         assert!(evaluate_protected_axis_containment(
             requested,
             requested,

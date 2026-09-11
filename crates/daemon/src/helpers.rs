@@ -342,7 +342,7 @@ impl AppState {
     pub(crate) fn prune_stale_windows(&mut self) -> StalePruneLayout {
         #[cfg(test)]
         {
-            return StalePruneLayout::Unchanged;
+            StalePruneLayout::Unchanged
         }
 
         #[cfg(not(test))]

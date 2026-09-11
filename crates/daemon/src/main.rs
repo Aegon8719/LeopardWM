@@ -2582,6 +2582,11 @@ async fn handle_tab_action_with_restore(
     }
 }
 
+// AppState is !Send/!Sync in every build: overlay fields store HWND
+// (BorderFrame, TabStripOverlay, OverviewOverlay). These tests still wrap
+// it in Arc<tokio::Mutex<AppState>> because handle_tab_action's production
+// signature requires that shape; Rc would change the event-loop API.
+#[allow(clippy::arc_with_non_send_sync)]
 #[cfg(test)]
 mod tab_action_tests {
     use super::*;
