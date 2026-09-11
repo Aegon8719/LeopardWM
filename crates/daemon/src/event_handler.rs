@@ -2199,7 +2199,10 @@ impl AppState {
         leopardwm_platform_win32::set_dwm_transitions_disabled(hwnd, false);
     }
 
-    fn application_fullscreen_geometry(&self, hwnd: u64) -> (Option<Rect>, Option<Rect>) {
+    pub(crate) fn application_fullscreen_geometry(
+        &self,
+        hwnd: u64,
+    ) -> (Option<Rect>, Option<Rect>) {
         let chrome_rect = leopardwm_platform_win32::get_window_chrome_rect(hwnd);
         let dwm_rect = chrome_rect
             .is_none()
@@ -2208,7 +2211,7 @@ impl AppState {
         (chrome_rect, dwm_rect)
     }
 
-    fn observe_application_fullscreen(
+    pub(crate) fn observe_application_fullscreen(
         &self,
         hwnd: u64,
         chrome_rect: Option<Rect>,

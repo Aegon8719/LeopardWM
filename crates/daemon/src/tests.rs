@@ -11661,6 +11661,322 @@ fn test_restore_structure_rejects_excluded_classes_but_keeps_hidden_windows() {
 }
 
 #[test]
+fn test_initial_layout_parks_restored_inactive_windows() {
+    use windows::core::w;
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, GetWindowRect, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_MINIMIZE, WS_POPUP,
+    };
+
+    struct TestWindow(HWND);
+    impl TestWindow {
+        fn new(minimized: bool) -> Self {
+            Self(unsafe {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                    w!("STATIC"),
+                    w!(""),
+                    if minimized {
+                        WS_POPUP | WS_MINIMIZE
+                    } else {
+                        WS_POPUP
+                    },
+                    100,
+                    100,
+                    200,
+                    100,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+        }
+
+        fn id(&self) -> u64 {
+            self.0 .0 as u64
+        }
+
+        fn rect(&self) -> Rect {
+            let mut rect = RECT::default();
+            unsafe { GetWindowRect(self.0, &mut rect).unwrap() };
+            Rect::new(
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+            )
+        }
+    }
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    let active_primary = TestWindow::new(false);
+    let active_secondary = TestWindow::new(false);
+    let inactive_tiled = TestWindow::new(false);
+    let inactive_floating = TestWindow::new(false);
+    let inactive_secondary = TestWindow::new(false);
+    let fullscreen = TestWindow::new(false);
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+        SetWindowPos(
+            fullscreen.0,
+            None,
+            0,
+            0,
+            1920,
+            1080,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+        .unwrap();
+    }
+    let minimized = TestWindow::new(true);
+    let unmanaged = TestWindow::new(false);
+    let windows = [
+        &active_primary,
+        &active_secondary,
+        &inactive_tiled,
+        &inactive_floating,
+        &inactive_secondary,
+        &fullscreen,
+        &minimized,
+        &unmanaged,
+    ];
+    let before: HashMap<_, _> = windows
+        .iter()
+        .map(|window| (window.id(), window.rect()))
+        .collect();
+    let expected_parked = HashSet::from([
+        inactive_tiled.id(),
+        inactive_floating.id(),
+        inactive_secondary.id(),
+    ]);
+    let mut primary_active = Workspace::default();
+    primary_active
+        .insert_window(active_primary.id(), Some(640))
+        .unwrap();
+    let mut primary_inactive = Workspace::default();
+    primary_inactive
+        .insert_window(inactive_tiled.id(), Some(720))
+        .unwrap();
+    primary_inactive
+        .insert_window(minimized.id(), Some(480))
+        .unwrap();
+    primary_inactive
+        .add_floating(inactive_floating.id(), before[&inactive_floating.id()])
+        .unwrap();
+    primary_inactive
+        .insert_window(fullscreen.id(), Some(800))
+        .unwrap();
+    primary_inactive.mark_minimized(inactive_tiled.id());
+    let mut secondary_active = Workspace::default();
+    secondary_active
+        .insert_window(active_secondary.id(), Some(600))
+        .unwrap();
+    let mut secondary_inactive = Workspace::default();
+    secondary_inactive
+        .insert_window(inactive_secondary.id(), Some(500))
+        .unwrap();
+    let snapshot = crate::state::StateSnapshot {
+        saved_at: "0".to_string(),
+        workspaces: vec![
+            crate::state::WorkspaceSnapshot {
+                monitor_device_name: "DISPLAY1".into(),
+                workspace_index: 0,
+                workspace: primary_active,
+            },
+            crate::state::WorkspaceSnapshot {
+                monitor_device_name: "DISPLAY1".into(),
+                workspace_index: 1,
+                workspace: primary_inactive,
+            },
+            crate::state::WorkspaceSnapshot {
+                monitor_device_name: "DISPLAY2".into(),
+                workspace_index: 0,
+                workspace: secondary_inactive,
+            },
+            crate::state::WorkspaceSnapshot {
+                monitor_device_name: "DISPLAY2".into(),
+                workspace_index: 1,
+                workspace: secondary_active,
+            },
+        ],
+        focused_monitor_name: "DISPLAY1".into(),
+        active_workspace: HashMap::from([("DISPLAY1".into(), 0), ("DISPLAY2".into(), 1)]),
+        tab_title_overrides: HashMap::new(),
+    };
+    let mut state = structure_restore_state();
+    state.config.behavior.disable_snap_layouts = false;
+    state.restore_workspace_structure(&snapshot);
+    state.restore_state(&snapshot);
+    let membership = state.all_managed_window_ids();
+
+    for _ in 0..2 {
+        crate::prepare_initial_layout(&mut state);
+        assert_eq!(state.active_workspace_idx(1), 0);
+        assert_eq!(state.active_workspace_idx(2), 1);
+        assert_eq!(state.all_managed_window_ids(), membership);
+        assert!(!state.workspaces[&1][1].is_minimized(inactive_tiled.id()));
+        assert!(state.workspaces[&1][1].is_minimized(minimized.id()));
+        assert!(state.is_application_fullscreen(fullscreen.id()));
+        for window in windows {
+            let rect = window.rect();
+            let original = before[&window.id()];
+            if expected_parked.contains(&window.id()) {
+                assert!(
+                    leopardwm_platform_win32::is_move_offscreen_sentinel_rect(&rect),
+                    "restored inactive HWND {} must be physically parked, got {rect:?}",
+                    window.id()
+                );
+                assert_eq!((rect.width, rect.height), (original.width, original.height));
+            } else {
+                assert_eq!(
+                    rect, original,
+                    "startup must not move active, minimized, application-fullscreen or unmanaged windows"
+                );
+            }
+            assert!(!leopardwm_platform_win32::is_window_visible(window.id()));
+        }
+        assert_eq!(state.workspaces[&1][1].columns()[0].width(), 720);
+        assert_eq!(
+            state.workspaces[&1][1].floating_windows()[0].rect,
+            before[&inactive_floating.id()]
+        );
+    }
+}
+
+#[test]
+fn test_restore_structure_reapplies_snap_suppression() {
+    use windows::core::w;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, GetWindowLongW, GWL_STYLE, WS_CAPTION, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    };
+
+    struct TestWindow(HWND);
+    impl TestWindow {
+        fn new(maximize_box: bool) -> Self {
+            let mut style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX;
+            if maximize_box {
+                style |= WS_MAXIMIZEBOX;
+            }
+            Self(unsafe {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                    w!("STATIC"),
+                    w!(""),
+                    style,
+                    0,
+                    0,
+                    200,
+                    100,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+        }
+
+        fn id(&self) -> u64 {
+            self.0 .0 as u64
+        }
+
+        fn style(&self) -> u32 {
+            unsafe { GetWindowLongW(self.0, GWL_STYLE) as u32 }
+        }
+    }
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            let _ = leopardwm_platform_win32::restore_maximizebox(self.id());
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    for enabled in [false, true] {
+        let tiled = TestWindow::new(true);
+        let inactive = TestWindow::new(true);
+        let floating = TestWindow::new(true);
+        let no_maximize_box = TestWindow::new(false);
+        let unmanaged = TestWindow::new(true);
+        let windows = [&tiled, &inactive, &floating, &no_maximize_box, &unmanaged];
+        let original_styles = windows.map(|window| window.style());
+        assert_ne!(original_styles[0] & WS_MAXIMIZEBOX.0, 0);
+        assert_eq!(original_styles[3] & WS_MAXIMIZEBOX.0, 0);
+
+        let mut workspace = Workspace::default();
+        workspace.insert_window(tiled.id(), Some(640)).unwrap();
+        workspace
+            .insert_window(no_maximize_box.id(), Some(480))
+            .unwrap();
+        workspace
+            .add_floating(floating.id(), Rect::new(100, 100, 200, 100))
+            .unwrap();
+        let mut inactive_workspace = Workspace::default();
+        inactive_workspace
+            .insert_window(inactive.id(), Some(720))
+            .unwrap();
+        let snapshot = crate::state::StateSnapshot {
+            saved_at: "0".to_string(),
+            workspaces: vec![
+                crate::state::WorkspaceSnapshot {
+                    monitor_device_name: "DISPLAY1".to_string(),
+                    workspace_index: 0,
+                    workspace,
+                },
+                crate::state::WorkspaceSnapshot {
+                    monitor_device_name: "DISPLAY2".to_string(),
+                    workspace_index: 1,
+                    workspace: inactive_workspace,
+                },
+            ],
+            focused_monitor_name: "DISPLAY1".to_string(),
+            active_workspace: HashMap::new(),
+            tab_title_overrides: HashMap::new(),
+        };
+        let mut state = structure_restore_state();
+        state.config.behavior.disable_snap_layouts = enabled;
+        let expected_tracked = if enabled {
+            HashSet::from([tiled.id(), inactive.id()])
+        } else {
+            HashSet::new()
+        };
+        let mut expected_styles = original_styles;
+        if enabled {
+            expected_styles[0] &= !WS_MAXIMIZEBOX.0;
+            expected_styles[1] &= !WS_MAXIMIZEBOX.0;
+        }
+
+        for _ in 0..2 {
+            let restored = state.restore_workspace_structure(&snapshot);
+            assert_eq!(restored, HashSet::from([(1, 0), (2, 1)]));
+            assert_eq!(
+                windows.map(|window| window.style()),
+                expected_styles,
+                "startup must reapply the configured restriction only to restored tiled windows"
+            );
+            assert_eq!(state.snap_disabled_hwnds, expected_tracked);
+            assert_eq!(state.workspaces[&1][0].columns()[0].width(), 640);
+            assert_eq!(state.active_workspace_idx(2), 0);
+            for window in windows {
+                assert!(!leopardwm_platform_win32::is_window_visible(window.id()));
+            }
+        }
+
+        state.restore_snap_for_all_windows();
+        assert!(state.snap_disabled_hwnds.is_empty());
+        assert_eq!(windows.map(|window| window.style()), original_styles);
+    }
+}
+
+#[test]
 fn test_restore_structure_clamps_workspace_index() {
     let mut state = structure_restore_state();
     let mut ws = leopardwm_core_layout::Workspace::default();

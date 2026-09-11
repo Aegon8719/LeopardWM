@@ -205,7 +205,7 @@ impl AppState {
         &mut self,
         snapshot: &StateSnapshot,
     ) -> HashSet<(MonitorId, usize)> {
-        self.restore_workspace_structure_with(snapshot, |hwnd| {
+        let restored_slots = self.restore_workspace_structure_with(snapshot, |hwnd| {
             // Keep a saved window only if it's still alive AND manageable. An
             // elevated window a non-elevated daemon can't reposition would
             // otherwise restore as a column we can never fill (a ghost column);
@@ -213,7 +213,9 @@ impl AppState {
             leopardwm_platform_win32::is_valid_window(hwnd)
                 && !leopardwm_platform_win32::is_excluded_window_class_hwnd(hwnd)
                 && !leopardwm_platform_win32::window_manage_block(hwnd).is_blocked()
-        })
+        });
+        self.disable_snap_for_all_tiled_windows();
+        restored_slots
     }
 
     /// Testable core of `restore_workspace_structure`: the `keep`

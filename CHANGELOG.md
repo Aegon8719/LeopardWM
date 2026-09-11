@@ -15,6 +15,8 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Fixes
 
+- **Inactive workspace windows stay offscreen after restart.** Startup parks restored tiled and floating windows on inactive workspaces after restoring each monitor's active workspace, without moving minimized windows.
+- **Snap Layout suppression survives restarts.** Saved tiled windows regain the configured Snap Layout restriction when their workspace is restored, including inactive workspaces. Floating windows remain unchanged.
 - **Off-screen recovery recognizes Windows-clamped parking coordinates.** Parking now uses the native coordinate limit so cleanup can find and restore parked windows without mistaking ordinary minimized windows for parked ones. Recovery uses physical coordinates even when called from the CLI or watchdog, then restores the caller's DPI context.
 - **Tiled window landings respect exactly adjacent monitor edges.** LeopardWM projects only the native HWND presentation at shared physical monitor boundaries while preserving requested column widths, scrolling, focus, and saved layout state. Synchronous final landings verify containment; apps that reject a constrained landing are parked outside every monitor without changing their logical layout. Intermediate asynchronous resize attempts are not guaranteed to have no transient bleed.
 - **Boundary-affected animation ghosts wait for a confirmed landing before their live source is exposed.** Crossfades use the current physical destination and are aborted when display topology invalidates that destination.
