@@ -556,6 +556,48 @@ pub enum IpcCommand {
     },
 }
 
+/// Why a window was left unmanaged at admission.
+///
+/// Unknown covers missing metadata and any future reason a newer daemon may
+/// send; clients must not treat it as higher-integrity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ElevationBlockReason {
+    HigherIntegrity,
+    Protected,
+    #[default]
+    Unknown,
+}
+
+impl Serialize for ElevationBlockReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::HigherIntegrity => "higher_integrity",
+            Self::Protected => "protected",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ElevationBlockReason {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "higher_integrity" => Self::HigherIntegrity,
+            "protected" => Self::Protected,
+            _ => Self::Unknown,
+        })
+    }
+}
+
+/// Admission-time snapshot of a privilege-blocked window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElevationBlockedWindow {
+    pub hwnd: u64,
+    pub title: String,
+    #[serde(default)]
+    pub reason: ElevationBlockReason,
+}
+
 /// Responses from the daemon to the CLI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -673,6 +715,14 @@ pub enum IpcResponse {
         /// Empty in the normal case. Surfaced by `lwm doctor`.
         #[serde(default)]
         elevation_blocked_windows: Vec<(u64, String)>,
+        /// Observed daemon process integrity RID, or `None` if unread/unavailable.
+        /// Missing on older daemons; never a synthesized Medium fallback.
+        #[serde(default)]
+        daemon_integrity: Option<u32>,
+        /// Admission-time blocked-window records. `None` means an older daemon
+        /// omitted the field; `Some` (including empty) is the current snapshot.
+        #[serde(default)]
+        elevation_blocked_records: Option<Vec<ElevationBlockedWindow>>,
     },
     /// Forward-compatibility fallback for newer daemon responses unknown to this client.
     #[serde(other)]
@@ -905,6 +955,8 @@ mod tests {
                 paused: false,
                 thumbnail_register_balance: 0,
                 elevation_blocked_windows: vec![],
+                daemon_integrity: None,
+                elevation_blocked_records: Some(vec![]),
             },
         ];
 
@@ -1313,5 +1365,82 @@ mod tests {
         assert!(all.contains(&EventKind::Config));
         assert!(all.contains(&EventKind::Heartbeat));
         assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn old_health_info_parses_without_new_fields() {
+        let json = r#"{"status":"health_info","healthy":true,"uptime_seconds":1,"total_windows":0,"monitors":1,"paused":false}"#;
+        match serde_json::from_str::<IpcResponse>(json).unwrap() {
+            IpcResponse::HealthInfo {
+                elevation_blocked_windows,
+                daemon_integrity,
+                elevation_blocked_records,
+                ..
+            } => {
+                assert!(elevation_blocked_windows.is_empty());
+                assert_eq!(daemon_integrity, None);
+                assert_eq!(elevation_blocked_records, None);
+            }
+            other => panic!("expected HealthInfo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_health_info_legacy_field_readable_by_old_shape() {
+        let resp = IpcResponse::HealthInfo {
+            healthy: true,
+            uptime_seconds: 9,
+            total_windows: 1,
+            monitors: 1,
+            paused: false,
+            thumbnail_register_balance: 0,
+            elevation_blocked_windows: vec![(0x10, "Admin".to_string())],
+            daemon_integrity: Some(0x2000),
+            elevation_blocked_records: Some(vec![ElevationBlockedWindow {
+                hwnd: 0x10,
+                title: "Admin".to_string(),
+                reason: ElevationBlockReason::HigherIntegrity,
+            }]),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["elevation_blocked_windows"][0][0], 16);
+        assert_eq!(json["elevation_blocked_windows"][0][1], "Admin");
+        assert_eq!(json["daemon_integrity"], 0x2000);
+        assert_eq!(
+            json["elevation_blocked_records"][0]["reason"],
+            "higher_integrity"
+        );
+
+        #[derive(Deserialize)]
+        struct LegacyHealth {
+            elevation_blocked_windows: Vec<(u64, String)>,
+        }
+        let legacy: LegacyHealth = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            legacy.elevation_blocked_windows,
+            vec![(0x10, "Admin".to_string())]
+        );
+    }
+
+    #[test]
+    fn unknown_elevation_block_reason_deserializes_as_unknown() {
+        let rec: ElevationBlockedWindow =
+            serde_json::from_str(r#"{"hwnd":1,"title":"X","reason":"system"}"#).unwrap();
+        assert_eq!(rec.reason, ElevationBlockReason::Unknown);
+        let missing: ElevationBlockedWindow =
+            serde_json::from_str(r#"{"hwnd":2,"title":"Y"}"#).unwrap();
+        assert_eq!(missing.reason, ElevationBlockReason::Unknown);
+    }
+
+    #[test]
+    fn empty_records_are_distinct_from_missing_records() {
+        let with_empty = r#"{"status":"health_info","healthy":true,"uptime_seconds":1,"total_windows":0,"monitors":1,"paused":false,"elevation_blocked_records":[]}"#;
+        match serde_json::from_str::<IpcResponse>(with_empty).unwrap() {
+            IpcResponse::HealthInfo {
+                elevation_blocked_records,
+                ..
+            } => assert_eq!(elevation_blocked_records, Some(vec![])),
+            other => panic!("expected HealthInfo, got {other:?}"),
+        }
     }
 }

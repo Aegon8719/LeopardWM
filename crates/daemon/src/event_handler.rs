@@ -2,8 +2,8 @@
 
 use crate::config;
 use crate::state::{
-    AppState, ApplicationFullscreenState, DragHintAction, DragState, EDIT_CONFIG_PULL_TTL,
-    FALLBACK_VIEWPORT_HEIGHT, FALLBACK_VIEWPORT_WIDTH, RECENTLY_HIDDEN_TTL,
+    AppState, ApplicationFullscreenState, DragHintAction, DragState, ElevationBlockedRecord,
+    EDIT_CONFIG_PULL_TTL, FALLBACK_VIEWPORT_HEIGHT, FALLBACK_VIEWPORT_WIDTH, RECENTLY_HIDDEN_TTL,
     TRANSIENT_WINDOW_THRESHOLD,
 };
 use leopardwm_core_layout::Rect;
@@ -402,28 +402,30 @@ impl AppState {
     }
 
     /// Update the session elevation-block record for `hwnd` given the live
-    /// `blocked` verdict, returning what the caller should do. Pure map logic
+    /// admission verdict, returning what the caller should do. Pure map logic
     /// (no Win32, no toast) so the dedup / clear / recycle behavior is
     /// unit-testable; the Win32 verdict and the one-shot toast live in
-    /// `skip_if_elevation_blocked`. Always refreshes the stored title so
-    /// `lwm doctor` reflects the current window even across HWND recycle.
+    /// `skip_if_elevation_blocked`. First sighting or a changed title/reason
+    /// refreshes the snapshot; an identical known record is deduped.
     pub(crate) fn note_elevation_block(
         &mut self,
         hwnd: u64,
         title: &str,
-        blocked: bool,
+        block: leopardwm_platform_win32::ManageBlock,
     ) -> ElevationCheck {
-        if !blocked {
+        if !block.is_blocked() {
             // Manageable now: clear any stale record (e.g. a recycled HWND now
             // owned by a normal window) so it tiles again.
             self.elevation_blocked.remove(&hwnd);
             return ElevationCheck::Manageable;
         }
-        match self.elevation_blocked.insert(hwnd, title.to_string()) {
-            // First sighting, or a recycled HWND now owned by a *different*
-            // window (title changed) → notify again.
+        let record = ElevationBlockedRecord {
+            title: title.to_string(),
+            reason: block,
+        };
+        match self.elevation_blocked.insert(hwnd, record) {
             None => ElevationCheck::BlockedNew,
-            Some(prev) if prev != title => ElevationCheck::BlockedNew,
+            Some(prev) if prev.title != title || prev.reason != block => ElevationCheck::BlockedNew,
             Some(_) => ElevationCheck::BlockedKnown,
         }
     }
@@ -444,7 +446,7 @@ impl AppState {
     ) -> bool {
         use leopardwm_platform_win32::ManageBlock;
         let block = leopardwm_platform_win32::manage_block(pid);
-        match self.note_elevation_block(hwnd, title, block.is_blocked()) {
+        match self.note_elevation_block(hwnd, title, block) {
             ElevationCheck::Manageable => false,
             ElevationCheck::BlockedNew => {
                 warn!(

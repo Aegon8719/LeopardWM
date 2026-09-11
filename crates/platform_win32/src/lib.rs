@@ -46,7 +46,10 @@ pub use keyboard_hook::*;
 pub use mouse_hook::*;
 
 // Re-export public API from submodules
-pub use elevation::{manage_block, window_manage_block, ManageBlock};
+pub use elevation::{
+    current_process_integrity, manage_block, window_manage_block, ManageBlock, INTEGRITY_HIGH,
+    INTEGRITY_MEDIUM,
+};
 pub use enumeration::{
     enumerate_monitors, enumerate_windows, find_monitor_by_id, find_monitor_for_rect,
     get_primary_monitor, get_process_executable, get_window_info, is_excluded_tool_window_hwnd,

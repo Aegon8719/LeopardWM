@@ -141,6 +141,8 @@ fn test_all_responses_roundtrip() {
             paused: false,
             thumbnail_register_balance: 0,
             elevation_blocked_windows: vec![],
+            daemon_integrity: None,
+            elevation_blocked_records: Some(vec![]),
         },
     ];
 

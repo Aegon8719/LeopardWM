@@ -4,11 +4,12 @@ use crate::daemon_cmds::find_daemon_binary;
 use crate::ipc_client::{probe_daemon_running, send_command};
 use anyhow::Result;
 use directories::ProjectDirs;
-use leopardwm_ipc::{IpcCommand, IpcResponse};
+use leopardwm_ipc::{ElevationBlockReason, ElevationBlockedWindow, IpcCommand, IpcResponse};
 use std::fs;
 use std::path::PathBuf;
 
 /// Result of a single diagnostic check.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CheckResult {
     Pass(String),
     Warn(String),
@@ -60,16 +61,82 @@ pub(crate) fn validate_toml_file(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Check if the current process is running as administrator.
-fn is_running_as_admin() -> bool {
-    #[cfg(windows)]
-    {
-        use windows::Win32::UI::Shell::IsUserAnAdmin;
-        unsafe { IsUserAnAdmin().as_bool() }
+pub(crate) fn format_integrity_rid(rid: Option<u32>) -> String {
+    match rid {
+        Some(leopardwm_platform_win32::INTEGRITY_MEDIUM) => "Medium".to_string(),
+        Some(leopardwm_platform_win32::INTEGRITY_HIGH) => "High".to_string(),
+        Some(rid) => format!("0x{rid:X}"),
+        None => "unavailable".to_string(),
     }
-    #[cfg(not(windows))]
-    {
-        false
+}
+
+pub(crate) fn format_integrity_line(label: &str, rid: Option<u32>) -> String {
+    format!("{label} integrity: {}", format_integrity_rid(rid))
+}
+
+pub(crate) fn integrity_check(label: &str, rid: Option<u32>) -> CheckResult {
+    let line = format_integrity_line(label, rid);
+    if rid.is_some() {
+        CheckResult::Pass(line)
+    } else {
+        CheckResult::Warn(line)
+    }
+}
+
+fn format_blocked_record(record: &ElevationBlockedWindow) -> String {
+    let hwnd = format!("{:#x}", record.hwnd);
+    match record.reason {
+        ElevationBlockReason::HigherIntegrity => format!(
+            "\"{}\" (hwnd {hwnd}, higher integrity; running LeopardWM elevated can help, but is not guaranteed if the target is System)",
+            record.title
+        ),
+        ElevationBlockReason::Protected => format!(
+            "\"{}\" (hwnd {hwnd}, protected/access-denied/unreadable token; elevation may not help)",
+            record.title
+        ),
+        ElevationBlockReason::Unknown => {
+            format!("\"{}\" (hwnd {hwnd}, unknown admission-time reason)", record.title)
+        }
+    }
+}
+
+fn format_nonempty_blocked_records(records: &[ElevationBlockedWindow]) -> String {
+    format!(
+        "{} window(s) currently recorded as privilege-blocked at admission (snapshot, not a live reclassification): {}",
+        records.len(),
+        records
+            .iter()
+            .map(format_blocked_record)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn format_legacy_blocked_windows(legacy: &[(u64, String)]) -> String {
+    format!(
+        "{} window(s) currently recorded as privilege-blocked at admission (snapshot, not a live reclassification; admission-time reason unavailable): {}",
+        legacy.len(),
+        legacy
+            .iter()
+            .map(|(hwnd, title)| format!("\"{title}\" (hwnd {hwnd:#x})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+pub(crate) fn blocked_windows_check(
+    records: Option<&[ElevationBlockedWindow]>,
+    legacy: &[(u64, String)],
+) -> CheckResult {
+    match records {
+        Some([]) => CheckResult::Pass(
+            "No privilege-blocked windows currently recorded by the daemon".to_string(),
+        ),
+        Some(records) => CheckResult::Warn(format_nonempty_blocked_records(records)),
+        None if legacy.is_empty() => CheckResult::Pass(
+            "No privilege-blocked windows currently recorded by the daemon".to_string(),
+        ),
+        None => CheckResult::Warn(format_legacy_blocked_windows(legacy)),
     }
 }
 
@@ -171,11 +238,15 @@ pub(crate) async fn handle_doctor() -> Result<()> {
     }
 
     // A non-zero thumbnail balance at rest means a DWM thumbnail leaked.
+    let mut printed_daemon_integrity = false;
+    let mut blocked_windows_result = None;
     if matches!(probe_daemon_running(), Ok(true)) {
         match send_command(IpcCommand::HealthCheck).await {
             Ok(IpcResponse::HealthInfo {
                 thumbnail_register_balance,
                 elevation_blocked_windows,
+                daemon_integrity,
+                elevation_blocked_records,
                 ..
             }) => {
                 if thumbnail_register_balance == 0 {
@@ -190,38 +261,35 @@ pub(crate) async fn handle_doctor() -> Result<()> {
                 }
                 .print();
 
-                if elevation_blocked_windows.is_empty() {
-                    CheckResult::Pass("No windows blocked by privilege level".to_string())
-                } else {
-                    CheckResult::Warn(format!(
-                        "{} window(s) left floating because they run at a higher privilege level \
-                         than the daemon (run LeopardWM as administrator to tile elevated ones; \
-                         protected processes can't be tiled regardless): {}",
-                        elevation_blocked_windows.len(),
-                        elevation_blocked_windows
-                            .iter()
-                            .map(|(hwnd, title)| format!("\"{title}\" (hwnd {hwnd:#x})"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
-                }
+                integrity_check("Daemon", daemon_integrity).print();
+                printed_daemon_integrity = true;
+                blocked_windows_result = Some(blocked_windows_check(
+                    elevation_blocked_records.as_deref(),
+                    &elevation_blocked_windows,
+                ));
+            }
+            Ok(other) => {
+                CheckResult::Warn(format!(
+                    "Daemon health payload is unavailable (unexpected response: {:?}); daemon integrity and blocked-window diagnostics are incomplete",
+                    other
+                ))
                 .print();
             }
-            Ok(_) | Err(_) => {
-                // Older daemon without the field, or transient IPC issue;
-                // not worth failing the doctor over.
+            Err(e) => {
+                CheckResult::Warn(format!(
+                    "Daemon health query failed: {e}; daemon integrity and blocked-window diagnostics are incomplete"
+                ))
+                .print();
             }
         }
     }
-
-    if is_running_as_admin() {
-        CheckResult::Warn(
-            "Running as administrator (may cause issues with non-elevated windows)".to_string(),
-        )
-    } else {
-        CheckResult::Pass("Running as standard user".to_string())
+    if !printed_daemon_integrity {
+        integrity_check("Daemon", None).print();
     }
-    .print();
+    integrity_check("CLI", leopardwm_platform_win32::current_process_integrity()).print();
+    if let Some(blocked) = blocked_windows_result {
+        blocked.print();
+    }
 
     let version = get_windows_version();
     CheckResult::Pass(format!("Windows version: {}", version)).print();

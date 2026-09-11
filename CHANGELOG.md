@@ -12,6 +12,8 @@ All notable changes to LeopardWM will be documented in this file.
 
 - **The default width preset selector matches the other Settings dropdowns.** The "Default preset for new windows" control now uses the same custom combobox as Centering mode, keeping its dynamic preset list, selection tracking, and disabled empty state.
 - **Empty tiled layouts stop retrying a current physical request.** A genuinely empty apply consumes stale display stamps so the next layout can take the fast path, while filtered-empty batches still wait for a later landing.
+- **Doctor reports daemon and CLI integrity separately and lists privilege-blocked windows with their admission-time reason.**
+  Integrity is the observed mandatory level (Medium, High, a numeric RID, or unavailable), not an administrator proxy. Empty output says no privilege-blocked windows are currently recorded. Nonempty output keeps HWND, title, and reason; only higher-integrity windows get elevation-can-help advice.
 
 ### Fixes
 

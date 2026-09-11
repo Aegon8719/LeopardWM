@@ -204,6 +204,13 @@ pub(crate) struct LayoutApplyTimeoutReport {
     pub(crate) candidates: Vec<LayoutApplyTimeoutCandidate>,
 }
 
+/// Admission-time snapshot for a window the daemon left unmanaged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ElevationBlockedRecord {
+    pub title: String,
+    pub reason: leopardwm_platform_win32::ManageBlock,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ApplicationFullscreenState {
     pub(crate) monitor_id: MonitorId,
@@ -554,10 +561,11 @@ pub(crate) struct AppState {
     /// active workspace instead of following focus to it. Never persisted.
     pub(crate) pending_edit_config_pull: Option<(std::time::Instant, String)>,
     /// Windows skipped this session because UIPI blocks the non-elevated daemon
-    /// from managing them (an elevated window). HWND -> title (for `lwm
-    /// doctor`). Kept until the window dies so it's never re-tiled and the user
-    /// is notified only once. Session-only, never persisted.
-    pub(crate) elevation_blocked: HashMap<u64, String>,
+    /// from managing them (higher-integrity or protected). HWND-keyed admission
+    /// snapshot (title + reason) for `lwm doctor`. Kept until the window dies so
+    /// it's never re-tiled and the user is notified only once. Session-only,
+    /// never persisted.
+    pub(crate) elevation_blocked: HashMap<u64, ElevationBlockedRecord>,
     /// Column width a tiled window had when it was hidden, keyed by HWND, so a
     /// window that disappears and reappears (e.g. a third-party virtual-desktop
     /// tool hiding/showing windows on switch) re-tiles at its prior width

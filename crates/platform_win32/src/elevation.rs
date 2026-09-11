@@ -23,9 +23,12 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 
 /// `SECURITY_MANDATORY_MEDIUM_RID` — the normal non-elevated integrity level.
-/// Assumed for our own process if we can't read it, erring toward "we're low"
-/// so higher-integrity windows are still blocked.
-const INTEGRITY_MEDIUM: u32 = 0x2000;
+/// Assumed for our own process by [`manage_block`] if we can't read it, erring
+/// toward "we're low" so higher-integrity windows are still blocked. Never
+/// reported as an observed RID by [`current_process_integrity`].
+pub const INTEGRITY_MEDIUM: u32 = 0x2000;
+/// `SECURITY_MANDATORY_HIGH_RID` — elevated / high mandatory integrity.
+pub const INTEGRITY_HIGH: u32 = 0x3000;
 
 /// Why a window can (or can't) be managed by this daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,13 +50,26 @@ impl ManageBlock {
     }
 }
 
-/// Our own process integrity level (RID), cached. A process's integrity is
-/// fixed for its lifetime.
+/// Observed integrity RID of this process, cached. A process's integrity is
+/// fixed for its lifetime. `None` stays `None` — the Medium admission fallback
+/// is applied only by [`daemon_integrity`].
+fn observed_current_process_integrity() -> Option<u32> {
+    static IL: OnceLock<Option<u32>> = OnceLock::new();
+    *IL.get_or_init(|| unsafe { process_integrity(GetCurrentProcess()) })
+}
+
+/// Integrity RID used for UIPI admission. Falls back to Medium when the token
+/// cannot be read so higher-integrity windows are still blocked.
 fn daemon_integrity() -> u32 {
-    static IL: OnceLock<u32> = OnceLock::new();
-    *IL.get_or_init(|| unsafe {
-        process_integrity(GetCurrentProcess()).unwrap_or(INTEGRITY_MEDIUM)
-    })
+    observed_current_process_integrity().unwrap_or(INTEGRITY_MEDIUM)
+}
+
+/// Observed mandatory integrity RID of this process.
+///
+/// `None` means the process token or integrity label could not be read. This
+/// does not report the Medium fallback used by [`manage_block`].
+pub fn current_process_integrity() -> Option<u32> {
+    observed_current_process_integrity()
 }
 
 /// Read a process handle's mandatory integrity level (the RID of the integrity
@@ -166,5 +182,22 @@ mod tests {
         // not be reported as blocked, or a window whose process is racing
         // shutdown would be wrongly skipped. PID 0xFFFF_FFF0 is reserved/unused.
         assert_eq!(manage_block(0xFFFF_FFF0), ManageBlock::No);
+    }
+
+    #[test]
+    fn current_process_integrity_is_observed_not_assumed() {
+        let observed = current_process_integrity();
+        assert_eq!(observed, current_process_integrity());
+        match observed {
+            Some(_) => {
+                assert!(!manage_block(std::process::id()).is_blocked());
+            }
+            None => {
+                // Admission still falls back to Medium, but the observation
+                // stays unavailable. Our own process can be opened; an
+                // unreadable token is classified as Protected.
+                assert_eq!(manage_block(std::process::id()), ManageBlock::Protected);
+            }
+        }
     }
 }

@@ -8,7 +8,9 @@ use crate::doctor::*;
 use crate::ipc_client::*;
 use anyhow::Context;
 use clap::Parser;
-use leopardwm_ipc::{IpcCommand, IpcResponse, MAX_IPC_MESSAGE_SIZE};
+use leopardwm_ipc::{
+    ElevationBlockReason, ElevationBlockedWindow, IpcCommand, IpcResponse, MAX_IPC_MESSAGE_SIZE,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -947,6 +949,147 @@ fn test_check_result_variants() {
     pass.print();
     warn.print();
     fail.print();
+}
+
+#[test]
+fn test_integrity_rendering_medium_daemon_high_cli() {
+    assert_eq!(
+        format_integrity_line("Daemon", Some(leopardwm_platform_win32::INTEGRITY_MEDIUM)),
+        "Daemon integrity: Medium"
+    );
+    assert_eq!(
+        format_integrity_line("CLI", Some(leopardwm_platform_win32::INTEGRITY_HIGH)),
+        "CLI integrity: High"
+    );
+    assert_eq!(
+        integrity_check("Daemon", Some(leopardwm_platform_win32::INTEGRITY_MEDIUM)),
+        CheckResult::Pass("Daemon integrity: Medium".to_string())
+    );
+    assert_eq!(
+        integrity_check("CLI", Some(leopardwm_platform_win32::INTEGRITY_HIGH)),
+        CheckResult::Pass("CLI integrity: High".to_string())
+    );
+}
+
+#[test]
+fn test_integrity_rendering_high_daemon_medium_cli() {
+    assert_eq!(
+        format_integrity_line("Daemon", Some(leopardwm_platform_win32::INTEGRITY_HIGH)),
+        "Daemon integrity: High"
+    );
+    assert_eq!(
+        format_integrity_line("CLI", Some(leopardwm_platform_win32::INTEGRITY_MEDIUM)),
+        "CLI integrity: Medium"
+    );
+}
+
+#[test]
+fn test_integrity_unavailable_missing_and_unknown_rid() {
+    assert_eq!(format_integrity_rid(None), "unavailable");
+    assert_eq!(
+        integrity_check("Daemon", None),
+        CheckResult::Warn("Daemon integrity: unavailable".to_string())
+    );
+    assert_eq!(
+        format_integrity_line("CLI", None),
+        "CLI integrity: unavailable"
+    );
+    assert_eq!(format_integrity_rid(Some(0x4000)), "0x4000");
+    assert_eq!(
+        format_integrity_line("Daemon", Some(0x4000)),
+        "Daemon integrity: 0x4000"
+    );
+    let cli = leopardwm_platform_win32::current_process_integrity();
+    assert_ne!(
+        format_integrity_line("Daemon", None),
+        format_integrity_line("CLI", cli)
+    );
+}
+
+#[test]
+fn test_blocked_windows_empty_current_record_wording() {
+    let empty = blocked_windows_check(Some(&[]), &[]);
+    assert_eq!(
+        empty,
+        CheckResult::Pass(
+            "No privilege-blocked windows currently recorded by the daemon".to_string()
+        )
+    );
+    assert_eq!(blocked_windows_check(None, &[]), empty);
+    match empty {
+        CheckResult::Pass(msg) | CheckResult::Warn(msg) | CheckResult::Fail(msg) => {
+            assert!(!msg.contains("since daemon start"));
+        }
+    }
+}
+
+#[test]
+fn test_blocked_windows_nonempty_mixed_reasons_and_advice() {
+    let records = [
+        ElevationBlockedWindow {
+            hwnd: 0x10,
+            title: "Admin".to_string(),
+            reason: ElevationBlockReason::HigherIntegrity,
+        },
+        ElevationBlockedWindow {
+            hwnd: 0x20,
+            title: "Zed".to_string(),
+            reason: ElevationBlockReason::Protected,
+        },
+        ElevationBlockedWindow {
+            hwnd: 0x30,
+            title: "Mystery".to_string(),
+            reason: ElevationBlockReason::Unknown,
+        },
+    ];
+    let result = blocked_windows_check(Some(&records), &[(0x10, "Admin".to_string())]);
+    let CheckResult::Warn(msg) = result else {
+        panic!("expected Warn, got {result:?}");
+    };
+    assert!(msg.contains("3 window(s) currently recorded as privilege-blocked at admission"));
+    assert!(msg.contains("snapshot, not a live reclassification"));
+    assert!(msg.contains("\"Admin\" (hwnd 0x10, higher integrity"));
+    assert!(msg.contains(
+        "running LeopardWM elevated can help, but is not guaranteed if the target is System"
+    ));
+    assert!(msg.contains(
+        "\"Zed\" (hwnd 0x20, protected/access-denied/unreadable token; elevation may not help)"
+    ));
+    assert!(msg.contains("\"Mystery\" (hwnd 0x30, unknown admission-time reason)"));
+    assert!(!msg.contains("since daemon start"));
+    assert!(!msg.contains("can't be tiled regardless"));
+
+    let CheckResult::Warn(protected_msg) = blocked_windows_check(Some(&records[1..2]), &[]) else {
+        panic!("expected Warn for Protected");
+    };
+    assert!(protected_msg.contains("may not help"));
+    assert!(!protected_msg.contains("can help"));
+    assert!(!protected_msg.contains("administrator"));
+    assert!(!protected_msg.contains("can't be tiled regardless"));
+
+    let CheckResult::Warn(unknown_msg) = blocked_windows_check(Some(&records[2..]), &[]) else {
+        panic!("expected Warn for Unknown");
+    };
+    assert!(unknown_msg.contains("unknown admission-time reason"));
+    assert!(!unknown_msg.contains("can help"));
+    assert!(!unknown_msg.contains("administrator"));
+    assert!(!unknown_msg.contains("elevat"));
+}
+
+#[test]
+fn test_blocked_windows_legacy_old_ipc_does_not_guess_reason() {
+    let legacy = vec![(0x10, "Admin".to_string()), (0x20, "Zed".to_string())];
+    let result = blocked_windows_check(None, &legacy);
+    let CheckResult::Warn(msg) = result else {
+        panic!("expected Warn, got {result:?}");
+    };
+    assert!(msg.contains("admission-time reason unavailable"));
+    assert!(msg.contains("\"Admin\" (hwnd 0x10)"));
+    assert!(msg.contains("\"Zed\" (hwnd 0x20)"));
+    assert!(!msg.contains("higher integrity"));
+    assert!(!msg.contains("can help"));
+    assert!(!msg.contains("administrator"));
+    assert!(!msg.contains("protected"));
 }
 
 #[test]

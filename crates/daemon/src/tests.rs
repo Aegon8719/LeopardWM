@@ -2144,49 +2144,77 @@ fn test_app_state_startup_reduce_motion_matches_all_workspaces() {
 #[test]
 fn test_note_elevation_block_lifecycle() {
     use crate::event_handler::ElevationCheck;
+    use leopardwm_platform_win32::ManageBlock;
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     let hwnd = 0xABCD_u64;
 
     // First block: recorded + flagged as new (caller toasts).
     assert_eq!(
-        state.note_elevation_block(hwnd, "Admin: term", true),
+        state.note_elevation_block(hwnd, "Admin: term", ManageBlock::HigherIntegrity),
         ElevationCheck::BlockedNew
     );
-    assert_eq!(
-        state.elevation_blocked.get(&hwnd).map(String::as_str),
-        Some("Admin: term")
-    );
+    let recorded = state.elevation_blocked.get(&hwnd).unwrap();
+    assert_eq!(recorded.title, "Admin: term");
+    assert_eq!(recorded.reason, ManageBlock::HigherIntegrity);
 
     // Same window blocked again: already known, no re-notify.
     assert_eq!(
-        state.note_elevation_block(hwnd, "Admin: term", true),
+        state.note_elevation_block(hwnd, "Admin: term", ManageBlock::HigherIntegrity),
         ElevationCheck::BlockedKnown
     );
 
     // Recycled HWND now owned by a different blocked window (title changed):
     // re-notify and refresh the stored title.
     assert_eq!(
-        state.note_elevation_block(hwnd, "Admin: other", true),
+        state.note_elevation_block(hwnd, "Admin: other", ManageBlock::HigherIntegrity),
         ElevationCheck::BlockedNew
     );
     assert_eq!(
-        state.elevation_blocked.get(&hwnd).map(String::as_str),
+        state.elevation_blocked.get(&hwnd).map(|r| r.title.as_str()),
         Some("Admin: other")
+    );
+
+    // Same title, changed reason: refresh and re-notify.
+    assert_eq!(
+        state.note_elevation_block(hwnd, "Admin: other", ManageBlock::Protected),
+        ElevationCheck::BlockedNew
+    );
+    assert_eq!(
+        state.elevation_blocked.get(&hwnd).map(|r| r.reason),
+        Some(ManageBlock::Protected)
     );
 
     // Now manageable (e.g. recycled HWND owned by a normal window): record cleared.
     assert_eq!(
-        state.note_elevation_block(hwnd, "Notepad", false),
+        state.note_elevation_block(hwnd, "Notepad", ManageBlock::No),
         ElevationCheck::Manageable
     );
     assert!(!state.elevation_blocked.contains_key(&hwnd));
 
     // Manageable when never recorded is a no-op clear.
     assert_eq!(
-        state.note_elevation_block(0x1234, "Other", false),
+        state.note_elevation_block(0x1234, "Other", ManageBlock::No),
         ElevationCheck::Manageable
     );
     assert!(state.elevation_blocked.is_empty());
+}
+
+#[test]
+fn test_elevation_block_hidden_retained_destroyed_cleared() {
+    use crate::event_handler::ElevationCheck;
+    use leopardwm_platform_win32::ManageBlock;
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let hwnd = 0xBEEF_u64;
+    assert_eq!(
+        state.note_elevation_block(hwnd, "Elevated", ManageBlock::HigherIntegrity),
+        ElevationCheck::BlockedNew
+    );
+
+    state.handle_window_event(WindowEvent::Hidden(hwnd));
+    assert!(state.elevation_blocked.contains_key(&hwnd));
+
+    state.handle_window_event(WindowEvent::Destroyed(hwnd));
+    assert!(!state.elevation_blocked.contains_key(&hwnd));
 }
 
 #[test]
@@ -9785,12 +9813,21 @@ fn test_cmd_health_check() {
             total_windows,
             monitors,
             paused,
+            daemon_integrity,
+            elevation_blocked_windows,
+            elevation_blocked_records,
             ..
         } => {
             assert!(healthy);
             assert_eq!(total_windows, 0);
             assert_eq!(monitors, 1);
             assert!(!paused);
+            assert_eq!(
+                daemon_integrity,
+                leopardwm_platform_win32::current_process_integrity()
+            );
+            assert!(elevation_blocked_windows.is_empty());
+            assert_eq!(elevation_blocked_records, Some(Vec::new()));
         }
         other => panic!("Expected HealthInfo, got {:?}", other),
     }
@@ -9804,6 +9841,60 @@ fn test_cmd_health_check_paused() {
     match resp {
         IpcResponse::HealthInfo { paused, .. } => {
             assert!(paused, "paused flag should be true");
+        }
+        other => panic!("Expected HealthInfo, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_cmd_health_check_elevation_records_sorted_with_daemon_integrity() {
+    use leopardwm_ipc::{ElevationBlockReason, ElevationBlockedWindow};
+    use leopardwm_platform_win32::ManageBlock;
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.note_elevation_block(0x20, "Zed", ManageBlock::Protected);
+    state.note_elevation_block(0x30, "Admin", ManageBlock::HigherIntegrity);
+    state.note_elevation_block(0x10, "Admin", ManageBlock::HigherIntegrity);
+
+    let resp = state.handle_command(IpcCommand::HealthCheck);
+    match resp {
+        IpcResponse::HealthInfo {
+            daemon_integrity,
+            elevation_blocked_windows,
+            elevation_blocked_records,
+            ..
+        } => {
+            assert_eq!(
+                daemon_integrity,
+                leopardwm_platform_win32::current_process_integrity()
+            );
+            assert_eq!(
+                elevation_blocked_windows,
+                vec![
+                    (0x10, "Admin".to_string()),
+                    (0x30, "Admin".to_string()),
+                    (0x20, "Zed".to_string()),
+                ]
+            );
+            assert_eq!(
+                elevation_blocked_records,
+                Some(vec![
+                    ElevationBlockedWindow {
+                        hwnd: 0x10,
+                        title: "Admin".to_string(),
+                        reason: ElevationBlockReason::HigherIntegrity,
+                    },
+                    ElevationBlockedWindow {
+                        hwnd: 0x30,
+                        title: "Admin".to_string(),
+                        reason: ElevationBlockReason::HigherIntegrity,
+                    },
+                    ElevationBlockedWindow {
+                        hwnd: 0x20,
+                        title: "Zed".to_string(),
+                        reason: ElevationBlockReason::Protected,
+                    },
+                ])
+            );
         }
         other => panic!("Expected HealthInfo, got {:?}", other),
     }

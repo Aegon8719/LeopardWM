@@ -2,12 +2,16 @@
 
 use crate::config::Config;
 use crate::hotkey_resolution::resolve_hotkeys;
-use crate::state::{validate_set_width_fraction, AppState, PendingWorkspaceSwitchFocus};
+use crate::state::{
+    validate_set_width_fraction, AppState, ElevationBlockedRecord, PendingWorkspaceSwitchFocus,
+};
 use leopardwm_core_layout::{LayoutError, Rect, Workspace};
-use leopardwm_ipc::{HotkeyBindingInfo, IpcCommand, IpcResponse};
+use leopardwm_ipc::{
+    ElevationBlockReason, ElevationBlockedWindow, HotkeyBindingInfo, IpcCommand, IpcResponse,
+};
 use leopardwm_platform_win32::{
     enumerate_windows, get_process_executable, monitor_above, monitor_below, monitor_to_left,
-    monitor_to_right, move_window_offscreen, MonitorId, MonitorInfo,
+    monitor_to_right, move_window_offscreen, ManageBlock, MonitorId, MonitorInfo,
 };
 use std::collections::HashMap;
 use tracing::{debug, info};
@@ -91,6 +95,35 @@ fn fullscreen_policy(cmd: &IpcCommand) -> FullscreenPolicy {
         | EqualizeColumnHeights => FullscreenPolicy::Suppress,
         _ => FullscreenPolicy::Allow,
     }
+}
+
+fn ipc_elevation_block_reason(block: ManageBlock) -> ElevationBlockReason {
+    match block {
+        ManageBlock::HigherIntegrity => ElevationBlockReason::HigherIntegrity,
+        ManageBlock::Protected => ElevationBlockReason::Protected,
+        ManageBlock::No => ElevationBlockReason::Unknown,
+    }
+}
+
+fn elevation_blocked_health_views(
+    blocked: &HashMap<u64, ElevationBlockedRecord>,
+) -> (Vec<(u64, String)>, Vec<ElevationBlockedWindow>) {
+    let mut entries: Vec<(u64, &ElevationBlockedRecord)> = blocked
+        .iter()
+        .map(|(&hwnd, record)| (hwnd, record))
+        .collect();
+    entries.sort_by(|a, b| a.1.title.cmp(&b.1.title).then(a.0.cmp(&b.0)));
+    let mut legacy = Vec::with_capacity(entries.len());
+    let mut records = Vec::with_capacity(entries.len());
+    for (hwnd, record) in entries {
+        legacy.push((hwnd, record.title.clone()));
+        records.push(ElevationBlockedWindow {
+            hwnd,
+            title: record.title.clone(),
+            reason: ipc_elevation_block_reason(record.reason),
+        });
+    }
+    (legacy, records)
 }
 
 impl AppState {
@@ -1481,6 +1514,7 @@ impl AppState {
             .flat_map(|ws_vec| ws_vec.iter())
             .map(|ws| ws.window_count() + ws.floating_count())
             .sum();
+        let (legacy, records) = elevation_blocked_health_views(&self.elevation_blocked);
         IpcResponse::HealthInfo {
             healthy: true,
             uptime_seconds: uptime,
@@ -1489,17 +1523,9 @@ impl AppState {
             paused: self.paused,
             thumbnail_register_balance:
                 leopardwm_platform_win32::thumbnail::current_register_balance(),
-            elevation_blocked_windows: {
-                // (hwnd, title), sorted for stable doctor/IPC output (HashMap
-                // order is random); sort by title then hwnd.
-                let mut windows: Vec<(u64, String)> = self
-                    .elevation_blocked
-                    .iter()
-                    .map(|(&hwnd, title)| (hwnd, title.clone()))
-                    .collect();
-                windows.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-                windows
-            },
+            elevation_blocked_windows: legacy,
+            daemon_integrity: leopardwm_platform_win32::current_process_integrity(),
+            elevation_blocked_records: Some(records),
         }
     }
 
