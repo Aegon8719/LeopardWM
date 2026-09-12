@@ -54,6 +54,7 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Internal
 
+- **Diagnostics validation hosts are opt-in and isolated from ordinary tests.** A unique-pipe test host and exact-pipe CLI consumer can record Medium/High integrity evidence without starting the full daemon or falling back to the daily-driver pipe.
 - **Daemon clippy baseline warnings are cleared.** Test fixtures construct Config and ConstrainedAxes without Default reassignment, assert boolean eligibility directly, drop needless `return` in cfg(test) stubs, and iterate a one-element monitor array. Tab-action tests keep production `Arc<tokio::Mutex<AppState>>` because overlay fields hold HWND.
 - **Platform cloak-set tests serialize around the shared tracking sets.** Empty apply, shutdown uncloak, and parked-recovery fixtures no longer interleave process-global cloak membership.
 - **Desktop acceptance checks distinguish layout behavior from restoration failures.**

@@ -14,6 +14,8 @@
 mod animation_worker;
 mod command_handler;
 mod config;
+#[cfg(test)]
+mod diagnostics_validation;
 mod drag;
 mod event_handler;
 mod events;

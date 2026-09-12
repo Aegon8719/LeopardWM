@@ -8,6 +8,8 @@ mod args;
 mod command_map;
 mod config_cmds;
 mod daemon_cmds;
+#[cfg(test)]
+mod diagnostics_validation;
 mod doctor;
 mod ipc_client;
 mod output;

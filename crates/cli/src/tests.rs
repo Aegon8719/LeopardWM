@@ -999,11 +999,6 @@ fn test_integrity_unavailable_missing_and_unknown_rid() {
         format_integrity_line("Daemon", Some(0x4000)),
         "Daemon integrity: 0x4000"
     );
-    let cli = leopardwm_platform_win32::current_process_integrity();
-    assert_ne!(
-        format_integrity_line("Daemon", None),
-        format_integrity_line("CLI", cli)
-    );
 }
 
 #[test]
