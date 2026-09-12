@@ -20,6 +20,12 @@ if ($null -eq $Data.runDir -or $null -eq $Data.stopPath -or $null -eq $Data.chil
     throw 'runner data missing runDir, stopPath, or children'
 }
 
+$WorkingDir = [string]$Data.runDir
+if ($Data.PSObject.Properties.Name -contains 'workingDir' -and -not [string]::IsNullOrWhiteSpace([string]$Data.workingDir)) {
+    $WorkingDir = [string]$Data.workingDir
+}
+if (-not (Test-Path -LiteralPath $WorkingDir)) { throw "runner working directory missing: $WorkingDir" }
+
 $TimeoutSec = 90
 if ($null -ne $Data.timeoutSec) { $TimeoutSec = [int]$Data.timeoutSec }
 if ($TimeoutSec -lt 1) { $TimeoutSec = 1 }
@@ -40,7 +46,7 @@ function Convert-EnvMap($EnvObject) {
 
 function Join-ProcessArguments([string[]]$Arguments) {
     $parts = foreach ($argument in $Arguments) {
-        $escaped = ([string]$argument -replace '(\\*)"', '$1$1\\"') -replace '(\\+)$', '$1$1'
+        $escaped = ([string]$argument -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1'
         '"' + $escaped + '"'
     }
     return $parts -join ' '
@@ -93,7 +99,7 @@ function Start-ChildSpec($Spec) {
             [Environment]::SetEnvironmentVariable($name, [string]$envMap[$name], 'Process')
         }
         $arguments = Join-ProcessArguments @($Spec.args)
-        $process = Start-Process -FilePath ([string]$Spec.exe) -ArgumentList $arguments -PassThru -WindowStyle Hidden -RedirectStandardOutput ([string]$Spec.stdout) -RedirectStandardError ([string]$Spec.stderr) -WorkingDirectory ([string]$Data.runDir)
+        $process = Start-Process -FilePath ([string]$Spec.exe) -ArgumentList $arguments -PassThru -WindowStyle Hidden -RedirectStandardOutput ([string]$Spec.stdout) -RedirectStandardError ([string]$Spec.stderr) -WorkingDirectory $WorkingDir
         if ($null -eq $process) {
             throw "Start-Process returned no handle for $($Spec.name)"
         }
