@@ -1,6 +1,6 @@
 # Bounded diagnostics validation child runner.
 # Reads a JSON data file; cleans only children it started via retained Process objects.
-# The parent is the sole coordinator of the shared session stop file.
+# The parent alone writes the shared High stop; Medium runners may relay it only to local stops.
 
 [CmdletBinding()]
 param(
@@ -25,6 +25,30 @@ if ($Data.PSObject.Properties.Name -contains 'workingDir' -and -not [string]::Is
     $WorkingDir = [string]$Data.workingDir
 }
 if (-not (Test-Path -LiteralPath $WorkingDir)) { throw "runner working directory missing: $WorkingDir" }
+
+$RunDir = [string]$Data.runDir
+$CreateRunDir = $Data.PSObject.Properties.Name -contains 'createRunDir' -and [bool]$Data.createRunDir
+if ($CreateRunDir) {
+    if (Test-Path -LiteralPath $RunDir) { throw "runner output directory already exists: $RunDir" }
+    New-Item -ItemType Directory -Path $RunDir -ErrorAction Stop | Out-Null
+} elseif (-not (Test-Path -LiteralPath $RunDir)) {
+    throw "runner output directory missing: $RunDir"
+}
+
+$FixtureCopySource = $null
+if ($Data.PSObject.Properties.Name -contains 'fixtureCopySource' -and -not [string]::IsNullOrWhiteSpace([string]$Data.fixtureCopySource)) {
+    $FixtureCopySource = [string]$Data.fixtureCopySource
+    if (-not (Test-Path -LiteralPath $FixtureCopySource)) { throw "runner fixture source missing: $FixtureCopySource" }
+    $fixtureDestination = Join-Path $RunDir 'fixture.json'
+    if (Test-Path -LiteralPath $fixtureDestination) { throw "runner fixture destination already exists: $fixtureDestination" }
+    [IO.File]::Copy($FixtureCopySource, $fixtureDestination, $false)
+}
+
+$SharedStopPath = $null
+if ($Data.PSObject.Properties.Name -contains 'sharedStopPath' -and -not [string]::IsNullOrWhiteSpace([string]$Data.sharedStopPath)) {
+    $SharedStopPath = [string]$Data.sharedStopPath
+    if ($SharedStopPath -eq [string]$Data.stopPath) { throw 'runner shared stop must differ from local stop' }
+}
 
 $TimeoutSec = 90
 if ($null -ne $Data.timeoutSec) { $TimeoutSec = [int]$Data.timeoutSec }
@@ -183,6 +207,9 @@ try {
     $flagSpecs = @($Data.children | Where-Object { [string]$_.start -eq 'flag' })
     $flagsStarted = $false
     while ([datetime]::UtcNow -lt $Deadline) {
+        if ($null -ne $SharedStopPath -and (Test-Path -LiteralPath $SharedStopPath) -and -not (Test-Path -LiteralPath ([string]$Data.stopPath))) {
+            Set-Content -LiteralPath ([string]$Data.stopPath) -Value 'stop'
+        }
         if (Test-Path -LiteralPath ([string]$Data.stopPath)) { break }
         foreach ($record in $Started) {
             if ($record.Process.HasExited -and [int]$record.Process.ExitCode -ne 0) {

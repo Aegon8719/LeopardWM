@@ -1,5 +1,6 @@
 # Opt-in Medium/High diagnostics validation driver.
-# Default / -SelfTest: fail-closed checks plus harmless runner orchestration. No UAC or native hosts.
+# Default / -SelfTest requires an already elevated Full High shell; no UAC is requested.
+# It runs fail-closed checks plus harmless runner orchestration, never native hosts.
 # -RunNative is parent-owned after safety inspection. This script does not
 # start the full daemon, load live config, or fall back to \\.\pipe\leopardwm.
 #
@@ -281,19 +282,21 @@ public static class DiagValExecutionDirectory {
     [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern uint GetNamedSecurityInfoW(string path, uint objectType, uint securityInformation, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr securityDescriptor);
     [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr securityDescriptor, uint revision, uint securityInformation, out IntPtr text, out uint length);
     [DllImport("kernel32.dll")] public static extern IntPtr LocalFree(IntPtr memory);
-    const string Sddl = "D:(A;;FA;;;OW)(A;OICI;FA;;;OW)(A;;FA;;;SY)(A;OICI;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;BA)S:(ML;;NW;;;HI)(ML;OICI;NW;;;HI)";
-    public static bool CreateHighIntegrityDirectory(string path, out int error) {
+    static string Sddl(string userSid) {
+        return "D:(A;;FA;;;" + userSid + ")(A;OICI;FA;;;" + userSid + ")(A;;FA;;;SY)(A;OICI;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;BA)S:(ML;OICI;NW;;;HI)";
+    }
+    public static bool CreateHighIntegrityDirectory(string path, string userSid, out int error) {
         IntPtr descriptor = IntPtr.Zero; uint size;
-        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(Sddl, 1, out descriptor, out size)) { error = Marshal.GetLastWin32Error(); return false; }
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(Sddl(userSid), 1, out descriptor, out size)) { error = Marshal.GetLastWin32Error(); return false; }
         try {
             SECURITY_ATTRIBUTES attributes = new SECURITY_ATTRIBUTES { nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), lpSecurityDescriptor = descriptor, bInheritHandle = false };
             if (!CreateDirectoryW(path, ref attributes)) { error = Marshal.GetLastWin32Error(); return false; }
             error = 0; return true;
         } finally { LocalFree(descriptor); }
     }
-    public static bool CreateHighIntegrityFile(string path, out int error) {
+    public static bool CreateHighIntegrityFile(string path, string userSid, out int error) {
         IntPtr descriptor = IntPtr.Zero; uint size;
-        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(Sddl, 1, out descriptor, out size)) { error = Marshal.GetLastWin32Error(); return false; }
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(Sddl(userSid), 1, out descriptor, out size)) { error = Marshal.GetLastWin32Error(); return false; }
         try {
             SECURITY_ATTRIBUTES attributes = new SECURITY_ATTRIBUTES { nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), lpSecurityDescriptor = descriptor, bInheritHandle = false };
             IntPtr file = CreateFileW(path, 0x40000000, 0, ref attributes, 1, 0x80, IntPtr.Zero);
@@ -315,11 +318,17 @@ public static class DiagValExecutionDirectory {
 "@
 }
 
+function Get-CurrentUserSid {
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    if ($null -eq $sid) { throw 'current token user SID is unavailable' }
+    return $sid.Value
+}
+
 function Assert-ProtectedExecutionPath([string]$Path) {
     Initialize-DiagValExecutionDirectoryNative
     $error = 0
     $label = [DiagValExecutionDirectory]::GetLabelSddl($Path, [ref]$error)
-    if ($null -eq $label -or $label -notmatch 'ML;;NW;;;HI') {
+    if ($null -eq $label -or $label -notmatch 'ML;[^;]*;NW;;;HI') {
         throw "protected execution path mandatory label verification failed for ${Path}: $error"
     }
 }
@@ -327,7 +336,7 @@ function Assert-ProtectedExecutionPath([string]$Path) {
 function New-ProtectedExecutionFile([string]$Path) {
     Initialize-DiagValExecutionDirectoryNative
     $error = 0
-    if (-not [DiagValExecutionDirectory]::CreateHighIntegrityFile($Path, [ref]$error)) {
+    if (-not [DiagValExecutionDirectory]::CreateHighIntegrityFile($Path, (Get-CurrentUserSid), [ref]$error)) {
         throw "could not create protected execution file ${Path}: $error"
     }
     Assert-ProtectedExecutionPath $Path
@@ -363,7 +372,7 @@ function New-ProtectedExecutionDirectory {
     Initialize-DiagValExecutionDirectoryNative
     $path = Join-Path ([IO.Path]::GetTempPath()) ("leopardwm-diagval-exec-" + [guid]::NewGuid().ToString('N'))
     $error = 0
-    if (-not [DiagValExecutionDirectory]::CreateHighIntegrityDirectory($path, [ref]$error)) {
+    if (-not [DiagValExecutionDirectory]::CreateHighIntegrityDirectory($path, (Get-CurrentUserSid), [ref]$error)) {
         throw "could not create protected execution directory: $error"
     }
     Assert-ProtectedExecutionPath $path
@@ -446,6 +455,13 @@ function Get-CurrentIntegrityRid {
     $info = Get-CurrentTokenInfo
     if ($null -eq $info) { return $null }
     return $info.Rid
+}
+
+function Assert-ElevatedShell([string]$Operation) {
+    $info = Get-CurrentTokenInfo
+    if ($null -eq $info -or [uint32]$info.Rid -ne $HighRid -or [int]$info.ElevationType -ne 2) {
+        throw "$Operation requires an already elevated Full High PowerShell session; no UAC is requested"
+    }
 }
 
 function Test-WindowExists([uint64]$Hwnd) {
@@ -665,14 +681,14 @@ function Assert-RenderedIntegrity([string]$Line, [string]$Label, [string]$Expect
 }
 
 function Assert-NativeMatrix {
-    param($RunDir)
-    $fixture = Read-JsonFile (Join-Path $RunDir 'fixture.json')
+    param($HighRunDir, $MediumHostRunDir, $MediumClientRunDir)
+    $fixture = Read-JsonFile (Join-Path $HighRunDir 'fixture.json')
     if (-not (Test-FixtureIdentityComplete $fixture)) { throw 'fixture identity incomplete' }
     if ([bool]$fixture.visible) { throw 'fixture was visible' }
-    $highHost = Read-JsonFile (Join-Path $RunDir 'high-host.json')
-    $mediumHost = Read-JsonFile (Join-Path $RunDir 'medium-host.json')
-    $mediumClient = Read-JsonFile (Join-Path $RunDir 'medium-client.json')
-    $highClient = Read-JsonFile (Join-Path $RunDir 'high-client.json')
+    $highHost = Read-JsonFile (Join-Path $HighRunDir 'high-host.json')
+    $mediumHost = Read-JsonFile (Join-Path $MediumHostRunDir 'medium-host.json')
+    $mediumClient = Read-JsonFile (Join-Path $MediumClientRunDir 'medium-client.json')
+    $highClient = Read-JsonFile (Join-Path $HighRunDir 'high-client.json')
     Assert-RidObserved $highHost $HighRid 'high-host'
     Assert-RidObserved $mediumHost $MediumRid 'medium-host'
     Assert-RidObserved $mediumClient $MediumRid 'medium-client'
@@ -731,15 +747,21 @@ function New-RunnerData {
         [string]$StopPath,
         [string]$AuditPath,
         $Children,
-        [string]$WorkingDir = $RunDir
+        [string]$WorkingDir = $RunDir,
+        [switch]$CreateRunDir,
+        [string]$SharedStopPath = $null,
+        [string]$FixtureCopySource = $null
     )
     return [ordered]@{
-        runDir     = $RunDir
-        workingDir = $WorkingDir
-        timeoutSec = 90
-        stopPath   = $StopPath
-        auditPath  = $AuditPath
-        children   = @($Children)
+        runDir            = $RunDir
+        workingDir        = $WorkingDir
+        timeoutSec        = 90
+        stopPath          = $StopPath
+        auditPath         = $AuditPath
+        createRunDir      = [bool]$CreateRunDir
+        sharedStopPath    = $SharedStopPath
+        fixtureCopySource = $FixtureCopySource
+        children          = @($Children)
     }
 }
 
@@ -747,6 +769,7 @@ function Invoke-RunnerOrchestrationSelfTest([string]$Root) {
     $shell = (Get-Process -Id $PID).Path
     if ($shell -notmatch '\s') { throw "SelfTest requires the actual spaced pwsh path: $shell" }
     $executionRoot = New-ProtectedExecutionDirectory
+    Write-Host "SelfTest protected execution dir: $executionRoot"
     $runner = Join-Path $executionRoot 'runner with spaces.ps1'
     Copy-TrustedFileToProtected -Source (Join-Path $RepoRoot 'tools\diagnostics_validation_runner.ps1') -Destination $runner
     $selfOwned = New-Object System.Collections.Generic.List[object]
@@ -777,24 +800,33 @@ while ($true) { Start-Sleep -Milliseconds 50 }
     Assert-ProtectedExecutionPath $child
     $stop = Join-Path $Root 'shared stop'
     $hostEvidence = Join-Path $Root 'host evidence.json'
-    $mediumEvidence = Join-Path $Root 'medium evidence.json'
     $highEvidence = Join-Path $Root 'high evidence.json'
     $flag = Join-Path $executionRoot 'high client.flag'
     $hostAudit = Join-Path $Root 'host runner audit.json'
-    $mediumAudit = Join-Path $Root 'medium runner audit.json'
+    $mediumHostRoot = New-ProtectedExecutionDirectory
+    $mediumClientRoot = New-ProtectedExecutionDirectory
+    Write-Host "SelfTest protected simulated Medium-host output dir: $mediumHostRoot"
+    Write-Host "SelfTest protected simulated Medium-client output dir: $mediumClientRoot"
+    $mediumHostStop = Join-Path $mediumHostRoot 'stop'
+    $mediumClientStop = Join-Path $mediumClientRoot 'stop'
+    $mediumFixture = Join-Path $mediumHostRoot 'fixture.json'
+    $mediumHostEvidence = Join-Path $mediumHostRoot 'medium host evidence.json'
+    $mediumEvidence = Join-Path $mediumClientRoot 'medium evidence.json'
+    $mediumHostAudit = Join-Path $mediumHostRoot 'medium host runner audit.json'
+    $mediumAudit = Join-Path $mediumClientRoot 'medium client runner audit.json'
     $topologyOwned = New-Object System.Collections.Generic.List[object]
     $childSpec = {
-        param([string]$Name, [string]$Mode, [string]$Evidence, [string]$Start = 'immediate')
+        param([string]$Name, [string]$Mode, [string]$Evidence, [string]$OutputRoot = $Root, [string]$LocalStop = $stop, [string]$HostSource = $hostEvidence, [string]$Start = 'immediate')
         $spec = [ordered]@{
-            name = $Name; exe = $shell; args = @('-NoProfile', '-File', $child, '-Mode', $Mode, '-Evidence', $Evidence, '-StopPath', $stop, '-HostEvidence', $hostEvidence)
-            env = [ordered]@{}; start = $Start; stdout = (Join-Path $Root "$Name.out"); stderr = (Join-Path $Root "$Name.err")
+            name = $Name; exe = $shell; args = @('-NoProfile', '-File', $child, '-Mode', $Mode, '-Evidence', $Evidence, '-StopPath', $LocalStop, '-HostEvidence', $HostSource)
+            env = [ordered]@{}; start = $Start; stdout = (Join-Path $OutputRoot "$Name.out"); stderr = (Join-Path $OutputRoot "$Name.err")
         }
         if ($Start -eq 'flag') { $spec.flagPath = $flag }
         return $spec
     }
     $hostData = New-RunnerData -RunDir $Root -WorkingDir $executionRoot -StopPath $stop -AuditPath $hostAudit -Children @(
-        (& $childSpec 'host' 'host' $hostEvidence),
-        (& $childSpec 'high-client' 'client' $highEvidence 'flag')
+        (& $childSpec 'host' 'host' $hostEvidence $Root $stop $hostEvidence),
+        (& $childSpec 'high-client' 'client' $highEvidence $Root $stop $hostEvidence 'flag')
     )
     $hostData.timeoutSec = 15
     $hostDataPath = Join-Path $executionRoot 'host runner data with spaces.json'
@@ -802,16 +834,27 @@ while ($true) { Start-Sleep -Milliseconds 50 }
     $hostRunner = Start-DiagRunner -Name 'selftest-host-runner' -Shell $shell -RunnerPath $runner -DataPath $hostDataPath -RunDir $executionRoot -AuditPath $hostAudit -ExpectedChildren @('host', 'high-client') -Owned $topologyOwned
     $null = Wait-DiagJson -Path $hostEvidence -TimeoutSec 5 -Process $hostRunner
 
-    $mediumData = New-RunnerData -RunDir $Root -WorkingDir $executionRoot -StopPath $stop -AuditPath $mediumAudit -Children @(
-        (& $childSpec 'medium-client' 'client' $mediumEvidence)
+    $mediumHostData = New-RunnerData -RunDir $mediumHostRoot -WorkingDir $executionRoot -StopPath $mediumHostStop -AuditPath $mediumHostAudit -SharedStopPath $stop -FixtureCopySource $hostEvidence -Children @(
+        (& $childSpec 'medium-host' 'host' $mediumHostEvidence $mediumHostRoot $mediumHostStop $mediumFixture)
+    )
+    $mediumHostData.timeoutSec = 15
+    $mediumHostDataPath = Join-Path $executionRoot 'medium host runner data with spaces.json'
+    Write-ProtectedJson $mediumHostDataPath $mediumHostData
+    $mediumHostRunner = Start-DiagRunner -Name 'selftest-medium-host-runner' -Shell $shell -RunnerPath $runner -DataPath $mediumHostDataPath -RunDir $executionRoot -AuditPath $mediumHostAudit -ExpectedChildren @('medium-host') -Owned $topologyOwned
+    $null = Wait-DiagJson -Path $mediumHostEvidence -TimeoutSec 5 -Process $mediumHostRunner
+    if (-not (Test-Path -LiteralPath $mediumFixture)) { throw 'medium host did not copy the protected high fixture before launch' }
+
+    $mediumData = New-RunnerData -RunDir $mediumClientRoot -WorkingDir $executionRoot -StopPath $mediumClientStop -AuditPath $mediumAudit -SharedStopPath $stop -Children @(
+        (& $childSpec 'medium-client' 'client' $mediumEvidence $mediumClientRoot $mediumClientStop $hostEvidence)
     )
     $mediumData.timeoutSec = 15
-    $mediumDataPath = Join-Path $executionRoot 'medium runner data with spaces.json'
+    $mediumDataPath = Join-Path $executionRoot 'medium client runner data with spaces.json'
     Write-ProtectedJson $mediumDataPath $mediumData
-    $mediumRunner = Start-DiagRunner -Name 'selftest-medium-runner' -Shell $shell -RunnerPath $runner -DataPath $mediumDataPath -RunDir $executionRoot -AuditPath $mediumAudit -ExpectedChildren @('medium-client') -Owned $topologyOwned
+    $mediumRunner = Start-DiagRunner -Name 'selftest-medium-client-runner' -Shell $shell -RunnerPath $runner -DataPath $mediumDataPath -RunDir $executionRoot -AuditPath $mediumAudit -ExpectedChildren @('medium-client') -Owned $topologyOwned
     $null = Wait-DiagJson -Path $mediumEvidence -TimeoutSec 5 -Process $mediumRunner
     if ((Stop-RetainedProcess -Record $mediumRunner -WaitMs 10000) -ne 0) { throw 'completed medium runner did not exit 0' }
     if (Test-Path -LiteralPath $stop) { throw 'completed medium runner wrote the shared stop file' }
+    if (Test-Path -LiteralPath $mediumHostStop) { throw 'completed medium client stopped the medium host' }
 
     if (Test-Path -LiteralPath $flag) { throw 'high client flag was visible before publication' }
     Write-ProtectedJson $flag ([ordered]@{ pipe = 'selftest'; expected_pid = 1; expected_creation = 1 })
@@ -827,14 +870,30 @@ while ($true) { Start-Sleep -Milliseconds 50 }
     $publishedFlag = Read-JsonFile $flag
     if ([string]$publishedFlag.pipe -ne 'selftest') { throw 'protected high client flag was overwritten' }
     Set-Content -LiteralPath $stop -Value 'stop'
+    $relayDeadline = [datetime]::UtcNow.AddSeconds(5)
+    while (-not (Test-Path -LiteralPath $mediumHostStop)) {
+        if ([datetime]::UtcNow -ge $relayDeadline) { throw 'medium host did not relay the parent shared stop within 5 seconds' }
+        Start-Sleep -Milliseconds 50
+    }
     $topologyCleanupErrors = @(Stop-OwnedProcesses -Owned $topologyOwned -WaitMs 10000)
     if ($topologyCleanupErrors.Count -ne 0) { throw "zero-error coordinator cleanup failed: $($topologyCleanupErrors -join '; ')" }
     $topologyAuditErrors = @(Assert-OwnedRunnerAudits $topologyOwned)
     if ($topologyAuditErrors.Count -ne 0) { throw "successful runner audits failed: $($topologyAuditErrors -join '; ')" }
-    foreach ($name in @('host', 'medium-client', 'high-client')) {
-        $stderr = Join-Path $Root "$name.err"
-        if ((Test-Path -LiteralPath $stderr) -and -not [string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $stderr -Raw))) {
-            throw "$name child stderr was not empty"
+    foreach ($path in @($Root, $mediumHostRoot, $mediumClientRoot, $hostEvidence, $highEvidence, $mediumFixture, $mediumHostEvidence, $mediumEvidence, $hostAudit, $mediumHostAudit, $mediumAudit, $mediumHostStop)) {
+        Assert-ProtectedExecutionPath $path
+    }
+    foreach ($entry in @(
+        [pscustomobject]@{ Name = 'host'; Root = $Root },
+        [pscustomobject]@{ Name = 'high-client'; Root = $Root },
+        [pscustomobject]@{ Name = 'medium-host'; Root = $mediumHostRoot },
+        [pscustomobject]@{ Name = 'medium-client'; Root = $mediumClientRoot }
+    )) {
+        $stdout = Join-Path $entry.Root "$($entry.Name).out"
+        $stderr = Join-Path $entry.Root "$($entry.Name).err"
+        Assert-ProtectedExecutionPath $stdout
+        Assert-ProtectedExecutionPath $stderr
+        if (-not [string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $stderr -Raw))) {
+            throw "$($entry.Name) child stderr was not empty"
         }
     }
 
@@ -981,6 +1040,7 @@ while ($true) { Start-Sleep -Milliseconds 50 }
 }
 
 function Invoke-SelfTest {
+    Assert-ElevatedShell 'SelfTest'
     if (-not (Test-OptInEnabled $null) -and -not (Test-OptInEnabled '') -and -not (Test-OptInEnabled '0') -and -not (Test-OptInEnabled 'true') -and (Test-OptInEnabled '1')) {
         # fail-closed
     } else {
@@ -1028,8 +1088,8 @@ function Invoke-SelfTest {
     $artifact = '{"reason":"compiler-artifact","profile":{"test":true},"target":{"name":"leopardwm"},"executable":"C:\\tmp\\leopardwm.exe"}'
     $exe = Get-ExecutableFromCargoJson -Lines @('noise', $artifact) -ExitCode 0 -Bin 'leopardwm'
     if ($exe -ne 'C:\tmp\leopardwm.exe') { throw 'cargo artifact parse failed' }
-    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("diagval-selftest-" + [guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $tmp | Out-Null
+    $tmp = New-ProtectedExecutionDirectory
+    Write-Host 'SelfTest simulates Medium roles with High processes; no linked token is launched.'
     try {
         Write-JsonAtomic (Join-Path $tmp 'ready.json') ([pscustomobject]@{ ready = $true; pid = 7 })
         $ready = Wait-DiagJson -Path (Join-Path $tmp 'ready.json') -TimeoutSec 2 -Process $null
@@ -1047,9 +1107,11 @@ function Invoke-SelfTest {
         $runner = Join-Path $RepoRoot 'tools\diagnostics_validation_runner.ps1'
         if (-not (Test-Path -LiteralPath $runner)) { throw "bounded runner missing: $runner" }
         Invoke-RunnerOrchestrationSelfTest $tmp
-        Write-Host "diagnostics_validation SelfTest ok; evidence left at $tmp"
+        Write-Host "diagnostics_validation SelfTest ok; protected High evidence at $tmp"
+        Write-Host 'Artifacts are retained intentionally; cleanup requires an elevated shell.'
     } catch {
-        Write-Host "diagnostics_validation SelfTest evidence left at $tmp"
+        Write-Host "diagnostics_validation SelfTest evidence left at protected High path $tmp"
+        Write-Host 'Artifacts are retained intentionally; cleanup requires an elevated shell.'
         throw
     }
 }
@@ -1058,9 +1120,7 @@ function Invoke-NativeValidation {
     Write-Host 'NATIVE VALIDATION IS PARENT-OWNED AFTER SAFETY INSPECTION.'
     Write-Host $Gap
     $savedEnv = Save-ProcessEnv $LeopardWmEnvNames
-    $runDir = Join-Path ([IO.Path]::GetTempPath()) ("leopardwm-diagval-" + [guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $runDir | Out-Null
-    Write-Host "evidence dir: $runDir"
+    $runDir = $null
     $owned = New-Object System.Collections.Generic.List[object]
     $nativeError = $null
     try {
@@ -1072,15 +1132,17 @@ function Invoke-NativeValidation {
             $linked = Get-OwnLinkedMediumToken
             try { $linkedRid = Get-TokenIntegrityRid $linked } finally { [void][DiagValToken]::CloseHandle($linked) }
         }
+        if (-not (Test-HighLinkedMediumLauncher $launcherRid $launcherElevationType $linkedRid)) {
+            throw 'launcher must be Full High with its own verified Medium linked token; refusing UAC or any other token source'
+        }
+        $runDir = New-ProtectedExecutionDirectory
+        Write-Host "protected High evidence dir: $runDir"
         Write-JsonAtomic (Join-Path $runDir 'launcher.json') ([pscustomobject]@{
             oracle_integrity_rid = $launcherRid
             elevation_type       = $launcherElevationType
             linked_integrity_rid = $linkedRid
             gap                  = $Gap
         })
-        if (-not (Test-HighLinkedMediumLauncher $launcherRid $launcherElevationType $linkedRid)) {
-            throw 'launcher must be Full High with its own verified Medium linked token; refusing UAC or any other token source'
-        }
 
         $scopeHigh = New-DiagValScope
         $scopeMedium = New-DiagValScope
@@ -1093,6 +1155,7 @@ function Invoke-NativeValidation {
         $daemonSrc = Get-TestExecutable -Package 'leopardwm-daemon' -Bin 'leopardwm' -RepoRoot $RepoRoot -LogPath (Join-Path $runDir 'cargo-daemon.json')
         $cliSrc = Get-TestExecutable -Package 'leopardwm-cli' -Bin 'leopardwm-cli' -RepoRoot $RepoRoot -LogPath (Join-Path $runDir 'cargo-cli.json')
         $executionDir = New-ProtectedExecutionDirectory
+        Write-Host "protected execution dir: $executionDir"
         $daemonExe = Join-Path $executionDir 'daemon-test.exe'
         $cliExe = Join-Path $executionDir 'cli-test.exe'
         $runnerPath = Join-Path $executionDir 'diagnostics_validation_runner.ps1'
@@ -1109,6 +1172,11 @@ function Invoke-NativeValidation {
         )
         $shell = (Get-Process -Id $PID).Path
         $stopPath = Join-Path $runDir 'stop'
+        $mediumRootBase = Join-Path ([IO.Path]::GetTempPath()) ("leopardwm-diagval-medium-" + [guid]::NewGuid().ToString('N'))
+        $mediumHostRunDir = Join-Path $mediumRootBase 'host'
+        $mediumClientRunDir = Join-Path $mediumRootBase 'client'
+        $mediumHostStopPath = Join-Path $mediumHostRunDir 'stop'
+        $mediumClientStopPath = Join-Path $mediumClientRunDir 'stop'
         $highFlagPath = Join-Path $executionDir 'run-high-client.flag'
 
         $elevatedDataPath = Join-Path $executionDir 'high-data.json'
@@ -1145,42 +1213,45 @@ function Invoke-NativeValidation {
         $null = Wait-NativeEvidence -Path (Join-Path $runDir 'high-host-ready.json') -Process $highRunner -Deadline $parentDeadline -Phase 'high host readiness'
 
         $mediumDataPath = Join-Path $executionDir 'medium-host-data.json'
-        Write-ProtectedJson $mediumDataPath (New-RunnerData -RunDir $runDir -WorkingDir $executionDir -StopPath $stopPath -AuditPath (Join-Path $runDir 'medium-host-audit.json') -Children @(
+        $highFixturePath = Join-Path $runDir 'fixture.json'
+        Write-ProtectedJson $mediumDataPath (New-RunnerData -RunDir $mediumHostRunDir -WorkingDir $executionDir -StopPath $mediumHostStopPath -AuditPath (Join-Path $mediumHostRunDir 'medium-host-audit.json') -CreateRunDir -SharedStopPath $stopPath -FixtureCopySource $highFixturePath -Children @(
             [ordered]@{
                 name   = 'medium-host'
                 exe    = $daemonExe
                 args   = $testArgs
-                env    = New-HostEnv -RunDir $runDir -Scope $scopeMedium -Prefix 'medium-host' -OwnHwnd '0'
+                env    = New-HostEnv -RunDir $mediumHostRunDir -Scope $scopeMedium -Prefix 'medium-host' -OwnHwnd '0'
                 start  = 'immediate'
-                stdout = Join-Path $runDir 'medium-host.out'
-                stderr = Join-Path $runDir 'medium-host.err'
+                stdout = Join-Path $mediumHostRunDir 'medium-host.out'
+                stderr = Join-Path $mediumHostRunDir 'medium-host.err'
             }
         ))
         Assert-ProtectedExecutionPath $mediumDataPath
-        $mediumHostAudit = Join-Path $runDir 'medium-host-audit.json'
+        $mediumHostAudit = Join-Path $mediumHostRunDir 'medium-host-audit.json'
+        Write-Host "Medium host evidence dir will be created by the linked Medium runner: $mediumHostRunDir"
         $mediumHostRunner = Start-LinkedTokenDiagRunner -Name 'medium-host-runner' -Shell $shell -RunnerPath $runnerPath -DataPath $mediumDataPath -RunDir $executionDir -AuditPath $mediumHostAudit -ExpectedChildren @('medium-host') -Owned $owned
-        $mediumHost = Wait-NativeEvidence -Path (Join-Path $runDir 'medium-host.json') -Process $mediumHostRunner -Deadline $parentDeadline -Phase 'medium host'
+        $mediumHost = Wait-NativeEvidence -Path (Join-Path $mediumHostRunDir 'medium-host.json') -Process $mediumHostRunner -Deadline $parentDeadline -Phase 'medium host'
 
         $mediumClientDataPath = Join-Path $executionDir 'medium-client-data.json'
-        $mediumClientEnv = New-ClientEnv -RunDir $runDir -Prefix 'medium-client'
+        $mediumClientEnv = New-ClientEnv -RunDir $mediumClientRunDir -Prefix 'medium-client'
         $mediumClientEnv['LEOPARDWM_DIAGNOSTICS_PIPE'] = $pipeHigh
         $mediumClientEnv['LEOPARDWM_DIAGNOSTICS_EXPECTED_SERVER_PID'] = [string]$highHost.pid
         $mediumClientEnv['LEOPARDWM_DIAGNOSTICS_EXPECTED_SERVER_CREATION'] = [string]$highHost.creation_filetime
-        Write-ProtectedJson $mediumClientDataPath (New-RunnerData -RunDir $runDir -WorkingDir $executionDir -StopPath $stopPath -AuditPath (Join-Path $runDir 'medium-client-audit.json') -Children @(
+        Write-ProtectedJson $mediumClientDataPath (New-RunnerData -RunDir $mediumClientRunDir -WorkingDir $executionDir -StopPath $mediumClientStopPath -AuditPath (Join-Path $mediumClientRunDir 'medium-client-audit.json') -CreateRunDir -SharedStopPath $stopPath -Children @(
             [ordered]@{
                 name   = 'medium-client'
                 exe    = $cliExe
                 args   = $testArgs
                 env    = $mediumClientEnv
                 start  = 'immediate'
-                stdout = Join-Path $runDir 'medium-client.out'
-                stderr = Join-Path $runDir 'medium-client.err'
+                stdout = Join-Path $mediumClientRunDir 'medium-client.out'
+                stderr = Join-Path $mediumClientRunDir 'medium-client.err'
             }
         ))
         Assert-ProtectedExecutionPath $mediumClientDataPath
-        $mediumClientAudit = Join-Path $runDir 'medium-client-audit.json'
+        $mediumClientAudit = Join-Path $mediumClientRunDir 'medium-client-audit.json'
+        Write-Host "Medium client evidence dir will be created by the linked Medium runner: $mediumClientRunDir"
         $mediumClientRunner = Start-LinkedTokenDiagRunner -Name 'medium-client-runner' -Shell $shell -RunnerPath $runnerPath -DataPath $mediumClientDataPath -RunDir $executionDir -AuditPath $mediumClientAudit -ExpectedChildren @('medium-client') -Owned $owned
-        $null = Wait-NativeEvidence -Path (Join-Path $runDir 'medium-client.json') -Process $mediumClientRunner -Deadline $parentDeadline -Phase 'medium client'
+        $null = Wait-NativeEvidence -Path (Join-Path $mediumClientRunDir 'medium-client.json') -Process $mediumClientRunner -Deadline $parentDeadline -Phase 'medium client'
 
         Write-ProtectedJson $highFlagPath ([pscustomobject]@{
             pipe               = $pipeMedium
@@ -1190,7 +1261,7 @@ function Invoke-NativeValidation {
         Assert-ProtectedExecutionPath $highFlagPath
         $null = Wait-NativeEvidence -Path (Join-Path $runDir 'high-client.json') -Process $highRunner -Deadline $parentDeadline -Phase 'high client'
 
-        Assert-NativeMatrix -RunDir $runDir
+        Assert-NativeMatrix -HighRunDir $runDir -MediumHostRunDir $mediumHostRunDir -MediumClientRunDir $mediumClientRunDir
         $fixture = Read-JsonFile (Join-Path $runDir 'fixture.json')
         Set-Content -LiteralPath $stopPath -Value 'stop'
         $successCleanupErrors = @(Stop-OwnedProcesses -Owned $owned -WaitMs 25000)
