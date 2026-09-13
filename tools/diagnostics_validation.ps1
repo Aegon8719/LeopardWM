@@ -377,8 +377,9 @@ if($Mode -eq 'fail'){exit 9}; while($true){Start-Sleep -Milliseconds 25}
         $caseStop = Join-Path $caseRoot 'stop'
         $caseAudit = Join-Path $caseRoot 'audit.json'
         $caseHost = Join-Path $caseRoot 'host.json'
+        $caseClient = Join-Path $caseRoot 'client.json'
         $caseHostSpec = [ordered]@{ name='rejected-host'; exe=$shell; args=@('-NoProfile','-File',$child,'-Mode','host','-Evidence',$caseHost,'-StopPath',$caseStop); env=@{}; start='immediate'; stdout=(Join-Path $caseRoot 'host.out'); stderr=(Join-Path $caseRoot 'host.err') }
-        $caseClientSpec = [ordered]@{ name='rejected-client'; exe=$shell; args=@('-NoProfile','-File',$child,'-Mode','client','-Evidence',(Join-Path $caseRoot 'client.json'),'-StopPath',$caseStop); env=@{}; start='handoff'; stopAfterExit=$true; stdout=(Join-Path $caseRoot 'client.out'); stderr=(Join-Path $caseRoot 'client.err') }
+        $caseClientSpec = [ordered]@{ name='rejected-client'; exe=$shell; args=@('-NoProfile','-File',$child,'-Mode','client','-Evidence',$caseClient,'-StopPath',$caseStop); env=@{}; start='handoff'; stopAfterExit=$true; stdout=(Join-Path $caseRoot 'client.out'); stderr=(Join-Path $caseRoot 'client.err') }
         $caseData = New-RunnerData $caseRoot $root $caseStop $caseAudit @($caseHostSpec,$caseClientSpec) $controller ([ordered]@{pipe=$casePipe;run_id=$caseRunId;server_pipe=$caseServerPipe}) 15
         $caseDataPath = Join-Path $root "handoff-$Label.json"
         Write-JsonFresh $caseDataPath $caseData
@@ -398,8 +399,9 @@ if($Mode -eq 'fail'){exit 9}; while($true){Start-Sleep -Milliseconds 25}
             $null = Wait-Json $caseAudit $caseRunner ([datetime]::UtcNow.AddSeconds(12)) "$Label cleanup audit"
             $caseEvidence = Read-Json $caseAudit
             $hostAudit = @($caseEvidence.children | Where-Object { [string]$_.name -eq 'rejected-host' })
-            if ([int]$caseEvidence.exitCode -eq 0 -or @($caseEvidence.failures).Count -eq 0 -or $hostAudit.Count -ne 1 -or -not [bool]$hostAudit[0].exited) { throw "$Label handoff was accepted or did not clean its retained host" }
-            Write-Host "SelfTest rejected $Label handoff and cleaned its retained host"
+            $clientAudit = @($caseEvidence.children | Where-Object { [string]$_.name -eq 'rejected-client' })
+            if ([int]$caseEvidence.exitCode -eq 0 -or @($caseEvidence.failures).Count -eq 0 -or $hostAudit.Count -ne 1 -or -not [bool]$hostAudit[0].exited -or (Test-Path -LiteralPath $caseClient) -or $clientAudit.Count -ne 0) { throw "$Label handoff was accepted, launched its client, or did not clean its retained host" }
+            Write-Host "SelfTest rejected $Label handoff without launching its client and cleaned its retained host"
         } finally { if ($null -ne $caseControl) { $caseControl.Dispose() } }
     }
     function Invoke-CancelledHandoffSelfTest {
@@ -444,6 +446,7 @@ if($Mode -eq 'fail'){exit 9}; while($true){Start-Sleep -Milliseconds 25}
     Invoke-RejectedHandoffSelfTest 'wrong-server-pipe' { param($run, $pipe) @{kind='server_identity';run_id=$run;pipe=(Get-Pipe (New-Scope));expected_pid=1;expected_creation=1} | ConvertTo-Json -Compress }
     Invoke-RejectedHandoffSelfTest 'extra-field' { param($run, $pipe) @{kind='server_identity';run_id=$run;pipe=$pipe;expected_pid=1;expected_creation=1;unexpected='no'} | ConvertTo-Json -Compress }
     Invoke-RejectedHandoffSelfTest 'missing-identity' { param($run, $pipe) @{kind='server_identity';run_id=$run;pipe=$pipe;expected_pid=1} | ConvertTo-Json -Compress }
+    Invoke-RejectedHandoffSelfTest 'null-identity' { param($run, $pipe) return 'null' }
     Invoke-RejectedHandoffSelfTest 'oversize' { param($run, $pipe) return ('x' * 4097) }
     Invoke-CancelledHandoffSelfTest
     $receiverControl = New-HandoffControlServer (Get-Pipe ("diagval_handoff_" + (New-RunId)))
@@ -503,6 +506,19 @@ if($Mode -eq 'fail'){exit 9}; while($true){Start-Sleep -Milliseconds 25}
     $successfulChild = @($failedRunnerEvidence.children | Where-Object { [string]$_.name -eq 'successful-child' })
     if ([int]$failedRunnerEvidence.exitCode -eq 0 -or $failedRunnerEvidence.failures -notcontains 'controller identity lost' -or $successfulChild.Count -ne 1 -or -not [bool]$successfulChild[0].exited -or [int]$successfulChild[0].exitCode -ne 0) { throw 'failed runner audit did not retain its successful child truthfully' }
     Write-Host 'SelfTest verified truthful success, failed-child, and failed-runner audits'
+    $auditProbeOut = New-FreshDirectory $root 'audit-probe-failure-evidence'
+    $auditProbeAudit = Join-Path $auditProbeOut 'audit.json'
+    $auditProbeData = New-RunnerData $auditProbeOut $root (Join-Path $auditProbeOut 'stop') $auditProbeAudit @([ordered]@{name='audit-probe-child';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','client','-Evidence',(Join-Path $auditProbeOut 'client.json'),'-StopPath',(Join-Path $auditProbeOut 'stop'));env=@{};start='immediate';stdout=(Join-Path $auditProbeOut 'child.out');stderr=(Join-Path $auditProbeOut 'child.err')}) $null $null 5
+    $auditProbeData.testFailAuditProbeFor = 'audit-probe-child'
+    $auditProbePath = Join-Path $root 'audit-probe-failure.json'
+    Write-JsonFresh $auditProbePath $auditProbeData
+    $auditProbe = Start-Runner 'audit-probe-failure' $shell $runner $auditProbePath $root $auditProbeAudit $owned
+    $null = Wait-Json $auditProbeAudit $auditProbe ([datetime]::UtcNow.AddSeconds(8)) 'audit-probe failure audit'
+    $auditProbe.process.WaitForExit(8000) | Out-Null
+    $auditProbeEvidence = Read-Json $auditProbeAudit
+    $auditProbeChild = @($auditProbeEvidence.children | Where-Object { [string]$_.name -eq 'audit-probe-child' })
+    if ($auditProbe.process.ExitCode -eq 0 -or [int]$auditProbeEvidence.exitCode -eq 0 -or (@($auditProbeEvidence.failures) -join '; ') -notlike '*injected audit handle failure*' -or $auditProbeChild.Count -ne 1 -or -not [bool]$auditProbeChild[0].exited -or [int]$auditProbeChild[0].exitCode -ne 0) { throw 'audit probe failure did not preserve a successful child and nonzero aggregate result' }
+    Write-Host 'SelfTest verified audit-probe failure makes the audit and runner nonzero without changing the successful child exit'
     $launchOut=New-FreshDirectory $root 'launch-failure-evidence'; $launchData=New-RunnerData $launchOut $root (Join-Path $launchOut 'stop') (Join-Path $launchOut 'audit.json') @([ordered]@{name='missing';exe=(Join-Path $root 'missing.exe');args=@();env=@{};start='immediate';stdout=(Join-Path $launchOut 'o');stderr=(Join-Path $launchOut 'e')}) $controller $null 5; $launchPath=Join-Path $root 'launch.json'; Write-JsonFresh $launchPath $launchData; $launch=Start-Runner 'launch-failure' $shell $runner $launchPath $root (Join-Path $launchOut 'audit.json') $owned; $null=Wait-Json (Join-Path $launchOut 'audit.json') $launch ([datetime]::UtcNow.AddSeconds(8)) 'launch-failure audit'; if((Read-Json (Join-Path $launchOut 'audit.json')).exitCode -eq 0){throw 'launch failure was accepted'}
     $script:TestFailProcessMetadataFor = 'metadata-retention'
     try {

@@ -147,10 +147,13 @@ $Deadline = [datetime]::UtcNow.AddSeconds($TimeoutSec)
 $Started = New-Object System.Collections.Generic.List[object]
 $Failures = New-Object System.Collections.Generic.List[string]
 
-function Start-Child($Spec, $Identity) {
+function Start-Child($Spec, $Identity, [bool]$RequireIdentity = $false) {
     if ([string]::IsNullOrWhiteSpace([string]$Spec.name) -or -not (Test-Path -LiteralPath ([string]$Spec.exe))) { throw "child executable missing for $($Spec.name)" }
     $env = Convert-EnvMap $Spec.env
-    if ($null -ne $Identity) { $env = Merge-ServerIdentity $env $Identity $Data.handoff }
+    if ($RequireIdentity) {
+        if ($null -eq $Identity) { throw 'handoff child is missing server identity' }
+        $env = Merge-ServerIdentity $env $Identity $Data.handoff
+    } elseif ($null -ne $Identity) { $env = Merge-ServerIdentity $env $Identity $Data.handoff }
     $saved = @{}
     try {
         foreach ($name in $DiagnosticEnvNames) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process'); [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
@@ -176,13 +179,19 @@ function Stop-Child($Record) {
 function Write-Audit([int]$RunnerExitCode) {
     $children = foreach ($record in $Started) {
         $exited = $false; $childExitCode = $null
-        try { $exited = $record.Process.HasExited; if ($exited) { $childExitCode = [int]$record.Process.ExitCode } } catch { $Failures.Add("audit handle $($record.Name): $_") | Out-Null }
+        try {
+            $exited = $record.Process.HasExited
+            if ($exited) { $childExitCode = [int]$record.Process.ExitCode }
+            if ($Data.PSObject.Properties.Name -contains 'testFailAuditProbeFor' -and [string]$Data.testFailAuditProbeFor -eq $record.Name) { throw "injected audit handle failure for $($record.Name)" }
+        } catch { $Failures.Add("audit handle $($record.Name): $_") | Out-Null }
         [pscustomobject]@{ name = $record.Name; pid = $record.Pid; creation_filetime = $record.CreationFileTime; image = $record.Image; exited = $exited; exitCode = $childExitCode }
     }
+    if ($Failures.Count -ne 0) { $RunnerExitCode = 1 }
     $audit = [pscustomobject]@{ exitCode = $RunnerExitCode; failures = @($Failures); expectedChildren = @($Data.children | ForEach-Object { [string]$_.name }); children = @($children); controller = $Controller }
     $tmp = "$($Data.auditPath).$PID.tmp"
     $audit | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tmp -Encoding UTF8
     Move-Item -LiteralPath $tmp -Destination ([string]$Data.auditPath) -Force
+    return $RunnerExitCode
 }
 
 $exitCode = 1
@@ -195,7 +204,7 @@ try {
         if ($null -ne $Controller -and -not (Test-ControllerIdentityAlive $Controller)) { throw 'controller identity lost' }
         if (-not $handoffStarted) {
             $identity = Receive-ServerIdentity $Data.handoff $Controller $Deadline
-            Start-Child $handoffSpecs[0] $identity
+            Start-Child $handoffSpecs[0] $identity $true
             $handoffStarted = $true
         }
         foreach ($record in $Started) {
@@ -214,6 +223,6 @@ try {
 } catch { $Failures.Add("$_") | Out-Null } finally {
     foreach ($record in $Started) { try { $code = Stop-Child $record; if ($code -ne 0) { $Failures.Add("$($record.Name) exit $code") | Out-Null } } catch { $Failures.Add("cleanup $($record.Name): $_") | Out-Null } }
     if ($Failures.Count -eq 0) { $exitCode = 0 }
-    try { Write-Audit $exitCode } catch { $Failures.Add("audit write: $_") | Out-Null; $exitCode = 1; [Console]::Error.WriteLine("diagnostics validation audit write failed: $_") }
+    try { $exitCode = Write-Audit $exitCode } catch { $Failures.Add("audit write: $_") | Out-Null; $exitCode = 1; [Console]::Error.WriteLine("diagnostics validation audit write failed: $_") }
 }
 exit $exitCode
