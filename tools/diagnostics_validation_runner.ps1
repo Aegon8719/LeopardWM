@@ -1,6 +1,6 @@
-# Bounded diagnostics validation child runner.
-# Reads a JSON data file; cleans only children it started via retained Process objects.
-# The parent alone writes the shared High stop; Medium runners may relay it only to local stops.
+# Bounded diagnostics-validation runner.
+# It accepts only an immutable runner data file. A High instance cleans only its
+# retained children when stopped, timed out, or its identity-bound controller exits.
 
 [CmdletBinding()]
 param(
@@ -11,61 +11,26 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if (-not (Test-Path -LiteralPath $DataPath)) {
-    throw "runner data file missing: $DataPath"
+$DailyDriverPipe = '\\.\pipe\leopardwm'
+$LocalDiagValPrefix = '\\.\pipe\leopardwm_diagval_'
+$DiagnosticEnvNames = @(
+    'LEOPARDWM_DIAGNOSTICS_VALIDATION', 'LEOPARDWM_DIAGNOSTICS_RUN_DIR',
+    'LEOPARDWM_DIAGNOSTICS_TIMEOUT_SECS', 'LEOPARDWM_PIPE_SCOPE',
+    'LEOPARDWM_DIAGNOSTICS_ROLE', 'LEOPARDWM_DIAGNOSTICS_OWN_HWND',
+    'LEOPARDWM_DIAGNOSTICS_EVIDENCE_PREFIX', 'LEOPARDWM_DIAGNOSTICS_PIPE',
+    'LEOPARDWM_DIAGNOSTICS_EXPECTED_SERVER_PID', 'LEOPARDWM_DIAGNOSTICS_EXPECTED_SERVER_CREATION'
+)
+
+function Test-ExactDiagValPipe([string]$Pipe) {
+    if ([string]::IsNullOrWhiteSpace($Pipe) -or $Pipe -eq $DailyDriverPipe) { return $false }
+    if (-not $Pipe.StartsWith($LocalDiagValPrefix)) { return $false }
+    $suffix = $Pipe.Substring($LocalDiagValPrefix.Length)
+    return -not [string]::IsNullOrWhiteSpace($suffix) -and $suffix -cmatch '^[a-z0-9._-]+$'
 }
 
-$Data = Get-Content -LiteralPath $DataPath -Raw | ConvertFrom-Json
-if ($null -eq $Data.runDir -or $null -eq $Data.stopPath -or $null -eq $Data.children) {
-    throw 'runner data missing runDir, stopPath, or children'
-}
-
-$WorkingDir = [string]$Data.runDir
-if ($Data.PSObject.Properties.Name -contains 'workingDir' -and -not [string]::IsNullOrWhiteSpace([string]$Data.workingDir)) {
-    $WorkingDir = [string]$Data.workingDir
-}
-if (-not (Test-Path -LiteralPath $WorkingDir)) { throw "runner working directory missing: $WorkingDir" }
-
-$RunDir = [string]$Data.runDir
-$CreateRunDir = $Data.PSObject.Properties.Name -contains 'createRunDir' -and [bool]$Data.createRunDir
-if ($CreateRunDir) {
-    if (Test-Path -LiteralPath $RunDir) { throw "runner output directory already exists: $RunDir" }
-    New-Item -ItemType Directory -Path $RunDir -ErrorAction Stop | Out-Null
-} elseif (-not (Test-Path -LiteralPath $RunDir)) {
-    throw "runner output directory missing: $RunDir"
-}
-
-$FixtureCopySource = $null
-if ($Data.PSObject.Properties.Name -contains 'fixtureCopySource' -and -not [string]::IsNullOrWhiteSpace([string]$Data.fixtureCopySource)) {
-    $FixtureCopySource = [string]$Data.fixtureCopySource
-    if (-not (Test-Path -LiteralPath $FixtureCopySource)) { throw "runner fixture source missing: $FixtureCopySource" }
-    $fixtureDestination = Join-Path $RunDir 'fixture.json'
-    if (Test-Path -LiteralPath $fixtureDestination) { throw "runner fixture destination already exists: $fixtureDestination" }
-    [IO.File]::Copy($FixtureCopySource, $fixtureDestination, $false)
-}
-
-$SharedStopPath = $null
-if ($Data.PSObject.Properties.Name -contains 'sharedStopPath' -and -not [string]::IsNullOrWhiteSpace([string]$Data.sharedStopPath)) {
-    $SharedStopPath = [string]$Data.sharedStopPath
-    if ($SharedStopPath -eq [string]$Data.stopPath) { throw 'runner shared stop must differ from local stop' }
-}
-
-$TimeoutSec = 90
-if ($null -ne $Data.timeoutSec) { $TimeoutSec = [int]$Data.timeoutSec }
-if ($TimeoutSec -lt 1) { $TimeoutSec = 1 }
-if ($TimeoutSec -gt 120) { $TimeoutSec = 120 }
-
-$Deadline = [datetime]::UtcNow.AddSeconds($TimeoutSec)
-$Started = New-Object System.Collections.Generic.List[object]
-$Failures = New-Object System.Collections.Generic.List[string]
-
-function Convert-EnvMap($EnvObject) {
-    $map = @{}
-    if ($null -eq $EnvObject) { return $map }
-    foreach ($p in $EnvObject.PSObject.Properties) {
-        $map[$p.Name] = [string]$p.Value
-    }
-    return $map
+function Get-PipeName([string]$Pipe) {
+    if (-not (Test-ExactDiagValPipe $Pipe)) { throw "not an exact diagnostics pipe: $Pipe" }
+    return $Pipe.Substring('\\.\pipe\'.Length)
 }
 
 function Join-ProcessArguments([string[]]$Arguments) {
@@ -76,193 +41,179 @@ function Join-ProcessArguments([string[]]$Arguments) {
     return $parts -join ' '
 }
 
-function Merge-FlagEnv($EnvMap, [string]$FlagPath) {
-    if (-not (Test-Path -LiteralPath $FlagPath)) {
-        throw "client flag missing: $FlagPath"
+function Test-ImagesMatch([string]$Left, [string]$Right) {
+    if ([string]::IsNullOrWhiteSpace($Left) -or [string]::IsNullOrWhiteSpace($Right)) { return $false }
+    return ($Left.Replace('/', '\').TrimEnd('\')).Equals(($Right.Replace('/', '\').TrimEnd('\')), [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-ControllerIdentityAlive($Identity) {
+    $process = Get-Process -Id ([int]$Identity.pid) -ErrorAction SilentlyContinue
+    if ($null -eq $process) { return $false }
+    try {
+        if ([uint64]$process.StartTime.ToFileTimeUtc() -ne [uint64]$Identity.creation_filetime) { return $false }
+        try { return Test-ImagesMatch ([string]$process.Path) ([string]$Identity.image) } catch { return $false }
+    } catch { return $false }
+}
+
+function Assert-Controller($Data) {
+    if ($Data.PSObject.Properties.Name -notcontains 'controller' -or $null -eq $Data.controller) { return $null }
+    $controller = $Data.controller
+    $names = @($controller.PSObject.Properties.Name)
+    if ($names -notcontains 'pid' -or $names -notcontains 'creation_filetime' -or $names -notcontains 'image') {
+        throw 'runner controller identity must include pid, creation_filetime, and image'
     }
-    $flag = (Get-Content -LiteralPath $FlagPath -Raw) | ConvertFrom-Json
-    if ($null -eq $flag.pipe -or $null -eq $flag.expected_pid -or $null -eq $flag.expected_creation) {
-        throw 'client flag missing pipe/expected_pid/expected_creation'
+    if ([uint32]$controller.pid -eq 0 -or [uint64]$controller.creation_filetime -eq 0 -or [string]::IsNullOrWhiteSpace([string]$controller.image)) {
+        throw 'runner controller identity incomplete'
     }
-    if ([uint32]$flag.expected_pid -eq 0) { throw 'client flag expected_pid is 0' }
-    if ([uint64]$flag.expected_creation -eq 0) { throw 'client flag expected_creation is 0' }
-    $EnvMap['LEOPARDWM_DIAGNOSTICS_PIPE'] = [string]$flag.pipe
-    $EnvMap['LEOPARDWM_DIAGNOSTICS_EXPECTED_SERVER_PID'] = [string]$flag.expected_pid
-    $EnvMap['LEOPARDWM_DIAGNOSTICS_EXPECTED_SERVER_CREATION'] = [string]$flag.expected_creation
+    return $controller
+}
+
+function Convert-EnvMap($EnvObject) {
+    $map = @{}
+    if ($null -eq $EnvObject) { return $map }
+    foreach ($property in $EnvObject.PSObject.Properties) { $map[$property.Name] = [string]$property.Value }
+    return $map
+}
+
+function Merge-ServerIdentity($EnvMap, $Value, $Handoff) {
+    $properties = @($Value.PSObject.Properties.Name)
+    $allowed = @('kind', 'run_id', 'pipe', 'expected_pid', 'expected_creation')
+    foreach ($name in $properties) {
+        if ($allowed -notcontains $name) { throw "handoff has unsupported property $name" }
+    }
+    foreach ($name in $allowed) {
+        if ($properties -notcontains $name) { throw "handoff missing $name" }
+    }
+    if ([string]$Value.kind -ne 'server_identity' -or [string]$Value.run_id -cne [string]$Handoff.run_id) { throw 'handoff run binding is invalid' }
+    if ([string]$Value.pipe -cne [string]$Handoff.server_pipe) { throw 'handoff server pipe does not match the pinned target' }
+    if (-not (Test-ExactDiagValPipe ([string]$Value.pipe))) { throw 'handoff pipe is not an exact diagnostics pipe' }
+    if ([uint32]$Value.expected_pid -eq 0 -or [uint64]$Value.expected_creation -eq 0) { throw 'handoff server identity is incomplete' }
+    $EnvMap['LEOPARDWM_DIAGNOSTICS_PIPE'] = [string]$Value.pipe
+    $EnvMap['LEOPARDWM_DIAGNOSTICS_EXPECTED_SERVER_PID'] = [string]$Value.expected_pid
+    $EnvMap['LEOPARDWM_DIAGNOSTICS_EXPECTED_SERVER_CREATION'] = [string]$Value.expected_creation
     return $EnvMap
 }
 
-function New-ChildRecord($Spec, $Process) {
-    $record = [pscustomobject]@{
-        Name             = [string]$Spec.name
-        Process          = $Process
-        Pid              = $null
-        CreationFileTime = $null
-    }
-    $Started.Add($record) | Out-Null
-    $record.Pid = [uint32]$Process.Id
-    if ($Data.PSObject.Properties.Name -contains 'testFailStartTimeFor' -and [string]$Data.testFailStartTimeFor -eq $record.Name) {
-        throw "injected StartTime failure for $($record.Name)"
-    }
-    $record.CreationFileTime = [uint64]$Process.StartTime.ToFileTimeUtc()
-    return $record
+function Receive-ServerIdentity($Handoff, $Controller, [datetime]$Deadline) {
+    $properties = @($Handoff.PSObject.Properties.Name)
+    if ($properties.Count -ne 3 -or $properties -notcontains 'pipe' -or $properties -notcontains 'run_id' -or $properties -notcontains 'server_pipe') { throw 'runner handoff configuration is not fixed schema' }
+    $pipe = [string]$Handoff.pipe
+    $runId = [string]$Handoff.run_id
+    $serverPipe = [string]$Handoff.server_pipe
+    if (-not (Test-ExactDiagValPipe $pipe) -or -not (Test-ExactDiagValPipe $serverPipe) -or $runId -notmatch '^[a-f0-9]{32}$') { throw 'runner handoff configuration is invalid' }
+    $client = [IO.Pipes.NamedPipeClientStream]::new('.', (Get-PipeName $pipe), [IO.Pipes.PipeDirection]::In, [IO.Pipes.PipeOptions]::Asynchronous)
+    try {
+        while (-not $client.IsConnected) {
+            if ([datetime]::UtcNow -ge $Deadline) { throw 'runner deadline exceeded while connecting for server identity' }
+            if ($null -ne $Controller -and -not (Test-ControllerIdentityAlive $Controller)) { throw 'controller identity lost' }
+            try { $client.Connect(100) } catch [TimeoutException] {} catch [IO.IOException] {}
+        }
+        $bytes = New-Object byte[] 4097
+        $count = 0
+        while ($true) {
+            $read = $client.ReadAsync($bytes, $count, 4097 - $count)
+            while (-not $read.Wait(100)) {
+                if ([datetime]::UtcNow -ge $Deadline) { throw 'runner deadline exceeded while reading server identity' }
+                if ($null -ne $Controller -and -not (Test-ControllerIdentityAlive $Controller)) { throw 'controller identity lost' }
+            }
+            $received = $read.Result
+            if ($received -eq 0) { break }
+            $count += $received
+            if ($count -eq 4097) { throw 'server identity handoff exceeds 4096 bytes' }
+        }
+        if ($count -eq 0) { throw 'server identity handoff is empty' }
+        return ([Text.Encoding]::UTF8.GetString($bytes, 0, $count) | ConvertFrom-Json)
+    } finally { $client.Dispose() }
 }
 
-function Start-ChildSpec($Spec) {
-    if ($null -eq $Spec.exe -or -not (Test-Path -LiteralPath ([string]$Spec.exe))) {
-        throw "child exe missing: $($Spec.exe)"
-    }
-    $envMap = Convert-EnvMap $Spec.env
-    if ($Spec.start -eq 'flag') {
-        $envMap = Merge-FlagEnv $envMap ([string]$Spec.flagPath)
-    }
+if (-not (Test-Path -LiteralPath $DataPath)) { throw "runner data file missing: $DataPath" }
+$Data = Get-Content -LiteralPath $DataPath -Raw | ConvertFrom-Json
+foreach ($name in @('runDir', 'workingDir', 'stopPath', 'auditPath', 'children', 'environment_policy')) {
+    if ($Data.PSObject.Properties.Name -notcontains $name -or $null -eq $Data.$name) { throw "runner data missing $name" }
+}
+if ([string]$Data.environment_policy -ne 'clear_diagnostics') { throw 'runner environment policy is not fixed' }
+$RunDir = [string]$Data.runDir
+$WorkingDir = [string]$Data.workingDir
+if (-not (Test-Path -LiteralPath $WorkingDir)) { throw "runner working directory missing: $WorkingDir" }
+if ($Data.PSObject.Properties.Name -contains 'createRunDir' -and [bool]$Data.createRunDir) {
+    if (Test-Path -LiteralPath $RunDir) { throw "runner output directory already exists: $RunDir" }
+    New-Item -ItemType Directory -Path $RunDir -ErrorAction Stop | Out-Null
+} elseif (-not (Test-Path -LiteralPath $RunDir)) { throw "runner output directory missing: $RunDir" }
+
+$Controller = Assert-Controller $Data
+$TimeoutSec = if ($Data.PSObject.Properties.Name -contains 'timeoutSec') { [int]$Data.timeoutSec } else { 90 }
+if ($TimeoutSec -lt 1 -or $TimeoutSec -gt 120) { throw 'runner timeout must be between 1 and 120 seconds' }
+$Deadline = [datetime]::UtcNow.AddSeconds($TimeoutSec)
+$Started = New-Object System.Collections.Generic.List[object]
+$Failures = New-Object System.Collections.Generic.List[string]
+
+function Start-Child($Spec, $Identity) {
+    if ([string]::IsNullOrWhiteSpace([string]$Spec.name) -or -not (Test-Path -LiteralPath ([string]$Spec.exe))) { throw "child executable missing for $($Spec.name)" }
+    $env = Convert-EnvMap $Spec.env
+    if ($null -ne $Identity) { $env = Merge-ServerIdentity $env $Identity $Data.handoff }
     $saved = @{}
     try {
-        foreach ($name in @($envMap.Keys)) {
-            $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
-            [Environment]::SetEnvironmentVariable($name, [string]$envMap[$name], 'Process')
-        }
-        $arguments = Join-ProcessArguments @($Spec.args)
-        $process = Start-Process -FilePath ([string]$Spec.exe) -ArgumentList $arguments -PassThru -WindowStyle Hidden -RedirectStandardOutput ([string]$Spec.stdout) -RedirectStandardError ([string]$Spec.stderr) -WorkingDirectory $WorkingDir
-        if ($null -eq $process) {
-            throw "Start-Process returned no handle for $($Spec.name)"
-        }
-        return New-ChildRecord $Spec $process
-    } finally {
-        foreach ($name in @($saved.Keys)) {
-            [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process')
-        }
-    }
+        foreach ($name in $DiagnosticEnvNames) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process'); [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
+        foreach ($name in $env.Keys) { [Environment]::SetEnvironmentVariable($name, $env[$name], 'Process') }
+        $process = Start-Process -FilePath ([string]$Spec.exe) -ArgumentList (Join-ProcessArguments @($Spec.args)) -PassThru -WindowStyle Hidden -RedirectStandardOutput ([string]$Spec.stdout) -RedirectStandardError ([string]$Spec.stderr) -WorkingDirectory $WorkingDir
+        if ($null -eq $process) { throw "Start-Process returned no handle for $($Spec.name)" }
+        $record = [pscustomobject]@{ Name = [string]$Spec.name; Process = $process; Pid = [uint32]$process.Id; CreationFileTime = $null; Image = [string]$Spec.exe; StopAfterExit = [bool]($Spec.PSObject.Properties.Name -contains 'stopAfterExit' -and $Spec.stopAfterExit) }
+        $Started.Add($record) | Out-Null
+        if ($Data.PSObject.Properties.Name -contains 'testFailStartTimeFor' -and [string]$Data.testFailStartTimeFor -eq $record.Name) { throw "injected StartTime failure for $($record.Name)" }
+        $record.CreationFileTime = [uint64]$process.StartTime.ToFileTimeUtc()
+        try { $record.Image = [string]$process.Path } catch {}
+    } finally { foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') } }
 }
 
-function Stop-RetainedProcess {
-    param($Record, [int]$WaitMs)
-    if ($null -eq $Record -or $null -eq $Record.Process) {
-        throw 'missing retained process handle'
-    }
-    $process = $Record.Process
-    try {
-        if ($process.HasExited) { return [int]$process.ExitCode }
-    } catch {
-        throw "retained handle for $($Record.Name) is unusable: $_"
-    }
-    if ($process.WaitForExit($WaitMs)) {
-        return [int]$process.ExitCode
-    }
-    try {
-        $process.Kill()
-    } catch {
-        if (-not $process.HasExited) { throw }
-    }
-    if (-not $process.WaitForExit($WaitMs)) {
-        throw "process $($Record.Name) pid $($Record.Pid) did not exit after kill"
-    }
-    return [int]$process.ExitCode
+function Stop-Child($Record) {
+    if ($Record.Process.HasExited) { return [int]$Record.Process.ExitCode }
+    if ($Record.Process.WaitForExit(8000)) { return [int]$Record.Process.ExitCode }
+    $Record.Process.Kill()
+    if (-not $Record.Process.WaitForExit(8000)) { throw "process $($Record.Name) pid $($Record.Pid) did not exit after kill" }
+    return [int]$Record.Process.ExitCode
 }
 
-function Get-AuditChildren {
-    $children = @()
-    foreach ($record in $Started) {
-        $exited = $false
-        $code = $null
-        try {
-            $exited = [bool]$record.Process.HasExited
-            if ($exited) { $code = [int]$record.Process.ExitCode }
-        } catch {
-            $Failures.Add("audit handle $($record.Name): $_") | Out-Null
-        }
-        $children += [pscustomobject]@{
-            name             = $record.Name
-            pid              = $record.Pid
-            creation_filetime = $record.CreationFileTime
-            exited           = $exited
-            exitCode         = $code
-        }
+function Write-Audit([int]$RunnerExitCode) {
+    $children = foreach ($record in $Started) {
+        $exited = $false; $childExitCode = $null
+        try { $exited = $record.Process.HasExited; if ($exited) { $childExitCode = [int]$record.Process.ExitCode } } catch { $Failures.Add("audit handle $($record.Name): $_") | Out-Null }
+        [pscustomobject]@{ name = $record.Name; pid = $record.Pid; creation_filetime = $record.CreationFileTime; image = $record.Image; exited = $exited; exitCode = $childExitCode }
     }
-    return $children
-}
-
-function Write-Audit([int]$ExitCode, $Children) {
-    if ([string]::IsNullOrWhiteSpace([string]$Data.auditPath)) { return }
-    $audit = [pscustomobject]@{
-        exitCode         = $ExitCode
-        failures         = @($Failures)
-        expectedChildren = @($Data.children | ForEach-Object { [string]$_.name })
-        children         = @($Children)
-        gap              = 'skip_if_elevation_blocked is cfg(not(test)); this host is not full daemon startup/admission E2E.'
-    }
+    $audit = [pscustomobject]@{ exitCode = $RunnerExitCode; failures = @($Failures); expectedChildren = @($Data.children | ForEach-Object { [string]$_.name }); children = @($children); controller = $Controller }
     $tmp = "$($Data.auditPath).$PID.tmp"
     $audit | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tmp -Encoding UTF8
     Move-Item -LiteralPath $tmp -Destination ([string]$Data.auditPath) -Force
 }
 
-$script:RunnerExit = 1
+$exitCode = 1
 try {
-    foreach ($spec in @($Data.children)) {
-        if ([string]$spec.start -eq 'immediate') {
-            $null = Start-ChildSpec $spec
-        }
-    }
-
-    $flagSpecs = @($Data.children | Where-Object { [string]$_.start -eq 'flag' })
-    $flagsStarted = $false
+    foreach ($spec in @($Data.children | Where-Object { [string]$_.start -eq 'immediate' })) { Start-Child $spec $null }
+    $handoffSpecs = @($Data.children | Where-Object { [string]$_.start -eq 'handoff' })
+    if ($handoffSpecs.Count -gt 1) { throw 'runner permits one handoff child' }
+    $handoffStarted = $handoffSpecs.Count -eq 0
     while ([datetime]::UtcNow -lt $Deadline) {
-        if ($null -ne $SharedStopPath -and (Test-Path -LiteralPath $SharedStopPath) -and -not (Test-Path -LiteralPath ([string]$Data.stopPath))) {
-            Set-Content -LiteralPath ([string]$Data.stopPath) -Value 'stop'
+        if ($null -ne $Controller -and -not (Test-ControllerIdentityAlive $Controller)) { throw 'controller identity lost' }
+        if (-not $handoffStarted) {
+            $identity = Receive-ServerIdentity $Data.handoff $Controller $Deadline
+            Start-Child $handoffSpecs[0] $identity
+            $handoffStarted = $true
+        }
+        foreach ($record in $Started) {
+            if ($record.Process.HasExited) {
+                if ([int]$record.Process.ExitCode -ne 0) { throw "$($record.Name) exited $($record.Process.ExitCode)" }
+                if ($record.StopAfterExit -and -not (Test-Path -LiteralPath ([string]$Data.stopPath))) { Set-Content -LiteralPath ([string]$Data.stopPath) -Value 'stop' }
+            }
         }
         if (Test-Path -LiteralPath ([string]$Data.stopPath)) { break }
-        foreach ($record in $Started) {
-            if ($record.Process.HasExited -and [int]$record.Process.ExitCode -ne 0) {
-                $Failures.Add("$($record.Name) exited $($record.Process.ExitCode)") | Out-Null
-                break
-            }
-        }
-        if ($Failures.Count -gt 0) { break }
-        if (-not $flagsStarted -and $flagSpecs.Count -gt 0) {
-            $ready = $true
-            foreach ($spec in $flagSpecs) {
-                if (-not (Test-Path -LiteralPath ([string]$spec.flagPath))) { $ready = $false }
-            }
-            if ($ready) {
-                foreach ($spec in $flagSpecs) {
-                    $null = Start-ChildSpec $spec
-                }
-                $flagsStarted = $true
-            }
-        }
         $allExited = $Started.Count -gt 0
-        foreach ($record in $Started) {
-            if (-not $record.Process.HasExited) { $allExited = $false }
-        }
-        if ($allExited -and ($flagSpecs.Count -eq 0 -or $flagsStarted)) { break }
+        foreach ($record in $Started) { if (-not $record.Process.HasExited) { $allExited = $false } }
+        if ($allExited -and $handoffStarted) { break }
         Start-Sleep -Milliseconds 100
     }
-
-    if ([datetime]::UtcNow -ge $Deadline) {
-        $Failures.Add('runner deadline exceeded') | Out-Null
-    }
-} catch {
-    $Failures.Add("$_") | Out-Null
-} finally {
-    foreach ($record in $Started) {
-        try {
-            $code = Stop-RetainedProcess -Record $record -WaitMs 8000
-            if ($code -ne 0) {
-                $Failures.Add("$($record.Name) exit $code") | Out-Null
-            }
-        } catch {
-            $Failures.Add("cleanup $($record.Name): $_") | Out-Null
-        }
-    }
-    $auditChildren = @(Get-AuditChildren)
-    if ($Failures.Count -eq 0) { $script:RunnerExit = 0 }
-    try {
-        Write-Audit $script:RunnerExit $auditChildren
-    } catch {
-        $Failures.Add("audit write: $_") | Out-Null
-        $script:RunnerExit = 1
-        [Console]::Error.WriteLine("diagnostics validation audit write failed: $_")
-    }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'runner deadline exceeded' }
+} catch { $Failures.Add("$_") | Out-Null } finally {
+    foreach ($record in $Started) { try { $code = Stop-Child $record; if ($code -ne 0) { $Failures.Add("$($record.Name) exit $code") | Out-Null } } catch { $Failures.Add("cleanup $($record.Name): $_") | Out-Null } }
+    if ($Failures.Count -eq 0) { $exitCode = 0 }
+    try { Write-Audit $exitCode } catch { $Failures.Add("audit write: $_") | Out-Null; $exitCode = 1; [Console]::Error.WriteLine("diagnostics validation audit write failed: $_") }
 }
-
-exit $script:RunnerExit
+exit $exitCode

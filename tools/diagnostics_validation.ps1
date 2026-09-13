@@ -1,1307 +1,591 @@
-# Opt-in Medium/High diagnostics validation driver.
-# Default / -SelfTest requires an already elevated Full High shell; no UAC is requested.
-# It runs fail-closed checks plus harmless runner orchestration, never native hosts.
-# -RunNative is parent-owned after safety inspection. This script does not
-# start the full daemon, load live config, or fall back to \\.\pipe\leopardwm.
-#
-# Gap: skip_if_elevation_blocked is cfg(not(test)); this pipeline is not full
-# daemon startup/admission E2E.
+# Opt-in isolated Medium/High diagnostics validation.
+# -SelfTest uses only non-desktop subprocess simulations from the current Medium shell.
+# -RunNative is deliberately parent-owned: it builds exact test artifacts in Medium,
+# requests one UAC elevation for an inspected pinned High side, and never starts the
+# ordinary daemon or uses the daily-driver pipe.
 
 [CmdletBinding()]
 param(
     [switch]$SyntaxOnly,
     [switch]$SelfTest,
     [switch]$RunNative,
-    [string]$RepoRoot = $(
-        if ($PSScriptRoot) {
-            (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-        } else {
-            (Get-Location).Path
-        }
-    )
+    [switch]$HighSide,
+    [string]$PinnedSpecPath,
+    [string]$RepoRoot = $(if ($PSScriptRoot) { (Resolve-Path (Join-Path $PSScriptRoot '..')).Path } else { (Get-Location).Path })
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:TestFailRunnerStartTimeFor = $null
-
 $DailyDriverPipe = '\\.\pipe\leopardwm'
-$LocalDiagValPrefix = '\\.\pipe\leopardwm_diagval_'
+$DiagPrefix = '\\.\pipe\leopardwm_diagval_'
 $MediumRid = [uint32]0x2000
 $HighRid = [uint32]0x3000
-$Gap = 'skip_if_elevation_blocked is cfg(not(test)); this host is not full daemon startup/admission E2E. It feeds manage_block/window_manage_block into note_elevation_block then handle_command(HealthCheck) through run_ipc_server.'
-$FixtureTitle = 'LeopardWM diagnostics validation fixture'
-$LeopardWmEnvNames = @(
-    'LEOPARDWM_DIAGNOSTICS_VALIDATION',
-    'LEOPARDWM_DIAGNOSTICS_ROLE',
-    'LEOPARDWM_DIAGNOSTICS_RUN_DIR',
-    'LEOPARDWM_DIAGNOSTICS_EVIDENCE_PREFIX',
-    'LEOPARDWM_DIAGNOSTICS_OWN_HWND',
-    'LEOPARDWM_DIAGNOSTICS_TIMEOUT_SECS',
-    'LEOPARDWM_DIAGNOSTICS_PIPE',
-    'LEOPARDWM_DIAGNOSTICS_EXPECTED_SERVER_PID',
-    'LEOPARDWM_DIAGNOSTICS_EXPECTED_SERVER_CREATION',
-    'LEOPARDWM_DIAGNOSTICS_TARGET_HWND',
-    'LEOPARDWM_DIAGNOSTICS_TARGET_PID',
-    'LEOPARDWM_DIAGNOSTICS_TARGET_TITLE',
-    'LEOPARDWM_PIPE_SCOPE'
-)
+$Gap = 'skip_if_elevation_blocked is cfg(not(test)); this is platform admission state plus isolated HealthCheck/QueryStatus IPC, not full daemon startup E2E.'
+$TestArgs = @('--ignored', '--exact', 'diagnostics_validation::diagnostics_validation_native', '--test-threads=1', '--nocapture')
 
-function Test-OptInEnabled([string]$Value) {
-    return $Value -eq '1'
+function Get-Sha256([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant() }
+function Test-ExactPipe([string]$Pipe) {
+    if ([string]::IsNullOrWhiteSpace($Pipe) -or $Pipe -eq $DailyDriverPipe -or -not $Pipe.StartsWith($DiagPrefix)) { return $false }
+    return $Pipe.Substring($DiagPrefix.Length) -cmatch '^[a-z0-9._-]+$'
 }
-
-function New-DiagValScope {
-    $nsec = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    $tag = -join ((1..6) | ForEach-Object { [char](Get-Random -InputObject ([char[]](97..122))) })
-    return "diagval_${PID}_${nsec}_$tag"
+function New-RunId { return ([guid]::NewGuid().ToString('N')) }
+function New-Scope { return "diagval_$PID`_$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())_$((New-RunId).Substring(0, 8))" }
+function Get-Pipe([string]$Scope) { return "$DailyDriverPipe`_$($Scope.ToLowerInvariant())" }
+function Assert-IsolatedPipe([string]$Scope, [string]$Pipe) {
+    if ([string]::IsNullOrWhiteSpace($Scope) -or $Pipe -ne (Get-Pipe $Scope) -or -not (Test-ExactPipe $Pipe)) { throw 'generated pipe is not an exact isolated diagnostics pipe' }
 }
-
-function Get-DiagValPipe([string]$Scope) {
-    return "$DailyDriverPipe`_$($Scope.ToLowerInvariant())"
-}
-
-function Test-ExactPipe([string]$Requested) {
-    if ([string]::IsNullOrWhiteSpace($Requested)) { return $false }
-    if ($Requested -eq $DailyDriverPipe) { return $false }
-    if (-not $Requested.StartsWith($LocalDiagValPrefix)) { return $false }
-    $rest = $Requested.Substring($LocalDiagValPrefix.Length)
-    if ([string]::IsNullOrWhiteSpace($rest)) { return $false }
-    if ($rest.Contains('\') -or $rest.Contains('/')) { return $false }
-    if ($rest -cne $rest.ToLowerInvariant()) { return $false }
-    if ($rest -notmatch '^[a-z0-9._-]+$') { return $false }
-    return $true
-}
-
-function Test-IsolatedPipe([string]$Scope, [string]$Pipe) {
-    if ([string]::IsNullOrWhiteSpace($Scope)) { return $false }
-    if (-not $Scope.ToLowerInvariant().StartsWith('diagval_')) { return $false }
-    if ($Pipe -eq $DailyDriverPipe) { return $false }
-    $fromScope = Get-DiagValPipe $Scope
-    if ($Pipe -ne $fromScope) { return $false }
-    return (Test-ExactPipe $Pipe)
-}
-
-function Test-AllowedCommand([string]$Name) {
-    return @('HealthCheck', 'QueryStatus') -contains $Name
-}
-
-function Test-DeadlineExceeded([double]$Elapsed, [double]$Timeout) {
-    return $Elapsed -ge $Timeout
-}
-
-function Test-HighLinkedMediumLauncher($Rid, $ElevationType, $LinkedRid) {
-    return $null -ne $Rid -and [uint32]$Rid -eq $HighRid -and [int]$ElevationType -eq 2 -and [uint32]$LinkedRid -eq $MediumRid
-}
-
-function Test-RidPair($Oracle, $Platform, [uint32]$Expected) {
-    if ($null -eq $Oracle -or $null -eq $Platform) { return $false }
-    return ([uint32]$Oracle -eq $Expected) -and ([uint32]$Platform -eq $Expected)
-}
-
-function Get-DaemonIntegrityFromHealth($Health) {
-    if ($null -eq $Health) { return $null }
-    $status = $null
-    if ($Health.PSObject.Properties.Name -contains 'status') { $status = [string]$Health.status }
-    if ($status -ne 'health_info') { return $null }
-    if ($Health.PSObject.Properties.Name -notcontains 'daemon_integrity') { return $null }
-    return $Health.daemon_integrity
-}
-
-function Test-FixtureIdentityComplete($Fixture) {
-    if ($null -eq $Fixture) { return $false }
-    if ($null -eq $Fixture.hwnd -or [uint64]$Fixture.hwnd -eq 0) { return $false }
-    if ($null -eq $Fixture.pid -or [uint32]$Fixture.pid -eq 0) { return $false }
-    if ($null -eq $Fixture.creation_filetime -or [uint64]$Fixture.creation_filetime -eq 0) { return $false }
-    if ([string]::IsNullOrWhiteSpace([string]$Fixture.image) -or [string]$Fixture.image -eq 'unavailable') { return $false }
-    return $true
-}
-
-function Test-ClassificationsAgree([string]$Window, [string]$Process) {
-    if ([string]::IsNullOrWhiteSpace($Window) -or [string]::IsNullOrWhiteSpace($Process)) { return $false }
-    return $Window -eq $Process
-}
-
-function Get-ExecutableFromCargoJson {
-    param(
-        [object[]]$Lines,
-        [int]$ExitCode,
-        [string]$Bin
-    )
-    if ($ExitCode -ne 0) {
-        throw "cargo test --no-run failed: $ExitCode"
-    }
-    $exe = $null
-    foreach ($line in @($Lines)) {
-        $text = [string]$line
-        try {
-            $obj = $text | ConvertFrom-Json
-        } catch {
-            continue
-        }
-        if ($obj.reason -eq 'compiler-artifact' -and $obj.profile.test -and $obj.target.name -eq $Bin -and $obj.executable) {
-            $exe = [string]$obj.executable
-        }
-    }
-    if (-not $exe) { throw "could not locate test executable for $Bin" }
-    return $exe
-}
-
-function Write-JsonAtomic {
-    param([string]$Path, $Object)
-    $tmp = "$Path.$PID.tmp"
-    $Object | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $tmp -Encoding UTF8
-    Move-Item -LiteralPath $tmp -Destination $Path -Force
-}
-
-function Read-JsonFile([string]$Path) {
-    $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
-    return $raw | ConvertFrom-Json
-}
-
-function Get-RetainedProcessState($Record) {
-    if ($null -eq $Record) { return $null }
-    try {
-        if ($null -ne $Record.PSObject.Properties['NativeHandle']) {
-            $wait = [DiagValToken]::WaitForSingleObject([IntPtr]$Record.NativeHandle, 0)
-            if ($wait -eq 0) {
-                $code = [uint32]0
-                if (-not [DiagValToken]::GetExitCodeProcess([IntPtr]$Record.NativeHandle, [ref]$code)) { throw 'could not read native child exit code' }
-                return [pscustomobject]@{ Exited = $true; ExitCode = [int]$code }
-            }
-            if ($wait -ne 258) { throw 'native retained process handle is unusable' }
-            return [pscustomobject]@{ Exited = $false; ExitCode = $null }
-        }
-        if ($Record.Process.HasExited) { return [pscustomobject]@{ Exited = $true; ExitCode = [int]$Record.Process.ExitCode } }
-        return [pscustomobject]@{ Exited = $false; ExitCode = $null }
-    } catch [System.InvalidOperationException] {
-        throw 'retained process handle lost while waiting for child evidence'
-    }
-}
-
-function Wait-DiagJson {
-    param(
-        [string]$Path,
-        [int]$TimeoutSec,
-        $Process
-    )
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-        $json = $null
-        $validJson = $false
-        if (Test-Path -LiteralPath $Path) {
-            try {
-                $json = Read-JsonFile $Path
-                $validJson = $true
-            } catch {
-                # Atomic publication can be observed while the replacement is in progress.
-            }
-        }
-        if ($null -ne $Process) {
-            $state = Get-RetainedProcessState $Process
-            if ($state.Exited) {
-                if ($state.ExitCode -ne 0) { throw "child exited $($state.ExitCode) while waiting for $Path" }
-                if ($validJson) { return $json }
-                throw "child exited 0 before $Path"
-            }
-        }
-        if ($validJson) { return $json }
-        Start-Sleep -Milliseconds 100
-    }
-    throw "timed out waiting for $Path"
-}
-
-function Wait-NativeEvidence([string]$Path, $Process, [datetime]$Deadline, [string]$Phase) {
-    $remaining = [math]::Floor(($Deadline - [datetime]::UtcNow).TotalSeconds)
-    if ($remaining -lt 1) { throw "parent diagnostics deadline exceeded before $Phase" }
-    try {
-        return Wait-DiagJson -Path $Path -TimeoutSec ([int]$remaining) -Process $Process
-    } catch {
-        throw "${Phase}: $_"
-    }
-}
-
-function Get-TestExecutable {
-    param(
-        [string]$Package,
-        [string]$Bin,
-        [string]$RepoRoot,
-        [string]$LogPath
-    )
-    $manifest = Join-Path $RepoRoot 'Cargo.toml'
-    if (-not (Test-Path -LiteralPath $manifest)) {
-        throw "RepoRoot Cargo.toml missing: $manifest"
-    }
-    $lines = & cargo test -p $Package --bin $Bin --no-run --message-format=json --manifest-path $manifest 2>&1
-    $exit = $LASTEXITCODE
-    if ($LogPath) {
-        @($lines | ForEach-Object { [string]$_ }) | Set-Content -LiteralPath $LogPath -Encoding UTF8
-    }
-    return Get-ExecutableFromCargoJson -Lines $lines -ExitCode $exit -Bin $Bin
-}
-
-function Initialize-DiagValTokenNative {
-    if ('DiagValToken' -as [type]) { return }
-    Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public static class DiagValToken {
-    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
-    public struct STARTUPINFO { public int cb; public string lpReserved; public string lpDesktop; public string lpTitle; public int dwX; public int dwY; public int dwXSize; public int dwYSize; public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags; public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId; }
-    [DllImport("advapi32.dll", SetLastError=true)] public static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
-    [DllImport("advapi32.dll", SetLastError=true)] public static extern bool GetTokenInformation(IntPtr token, int tokenClass, IntPtr info, uint len, out uint ret);
-    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool CreateProcessWithTokenW(IntPtr token, int logonFlags, string applicationName, string commandLine, uint creationFlags, IntPtr environment, string currentDirectory, ref STARTUPINFO startupInfo, out PROCESS_INFORMATION processInformation);
-    [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
-    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr h);
-    [DllImport("kernel32.dll", SetLastError=true)] public static extern uint WaitForSingleObject(IntPtr h, uint milliseconds);
-    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetExitCodeProcess(IntPtr h, out uint exitCode);
-    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateProcess(IntPtr h, uint exitCode);
-    [DllImport("advapi32.dll")] public static extern IntPtr GetSidSubAuthority(IntPtr sid, uint index);
-    [DllImport("advapi32.dll")] public static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
-    public const int TokenElevationType = 18;
-    public const int TokenLinkedToken = 19;
-    public const int TokenIntegrityLevel = 25;
-    public const uint TOKEN_QUERY = 0x0008;
-}
-"@
-}
-
-function Initialize-DiagValExecutionDirectoryNative {
-    if ('DiagValExecutionDirectory' -as [type]) { return }
-    Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public static class DiagValExecutionDirectory {
-    [StructLayout(LayoutKind.Sequential)] public struct SECURITY_ATTRIBUTES { public int nLength; public IntPtr lpSecurityDescriptor; public bool bInheritHandle; }
-    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string sddl, uint revision, out IntPtr securityDescriptor, out uint size);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool CreateDirectoryW(string path, ref SECURITY_ATTRIBUTES attributes);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateFileW(string path, uint access, uint share, ref SECURITY_ATTRIBUTES attributes, uint creation, uint flags, IntPtr template);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
-    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern uint GetNamedSecurityInfoW(string path, uint objectType, uint securityInformation, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr securityDescriptor);
-    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr securityDescriptor, uint revision, uint securityInformation, out IntPtr text, out uint length);
-    [DllImport("kernel32.dll")] public static extern IntPtr LocalFree(IntPtr memory);
-    static string Sddl(string userSid) {
-        return "D:(A;;FA;;;" + userSid + ")(A;OICI;FA;;;" + userSid + ")(A;;FA;;;SY)(A;OICI;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;BA)S:(ML;OICI;NW;;;HI)";
-    }
-    public static bool CreateHighIntegrityDirectory(string path, string userSid, out int error) {
-        IntPtr descriptor = IntPtr.Zero; uint size;
-        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(Sddl(userSid), 1, out descriptor, out size)) { error = Marshal.GetLastWin32Error(); return false; }
-        try {
-            SECURITY_ATTRIBUTES attributes = new SECURITY_ATTRIBUTES { nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), lpSecurityDescriptor = descriptor, bInheritHandle = false };
-            if (!CreateDirectoryW(path, ref attributes)) { error = Marshal.GetLastWin32Error(); return false; }
-            error = 0; return true;
-        } finally { LocalFree(descriptor); }
-    }
-    public static bool CreateHighIntegrityFile(string path, string userSid, out int error) {
-        IntPtr descriptor = IntPtr.Zero; uint size;
-        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(Sddl(userSid), 1, out descriptor, out size)) { error = Marshal.GetLastWin32Error(); return false; }
-        try {
-            SECURITY_ATTRIBUTES attributes = new SECURITY_ATTRIBUTES { nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), lpSecurityDescriptor = descriptor, bInheritHandle = false };
-            IntPtr file = CreateFileW(path, 0x40000000, 0, ref attributes, 1, 0x80, IntPtr.Zero);
-            if (file == new IntPtr(-1)) { error = Marshal.GetLastWin32Error(); return false; }
-            CloseHandle(file); error = 0; return true;
-        } finally { LocalFree(descriptor); }
-    }
-    public static string GetLabelSddl(string path, out int error) {
-        IntPtr owner, group, dacl, sacl, descriptor = IntPtr.Zero, text = IntPtr.Zero;
-        uint result = GetNamedSecurityInfoW(path, 1, 0x10, out owner, out group, out dacl, out sacl, out descriptor);
-        if (result != 0) { error = (int)result; return null; }
-        try {
-            uint length;
-            if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, 0x10, out text, out length)) { error = Marshal.GetLastWin32Error(); return null; }
-            try { error = 0; return Marshal.PtrToStringUni(text); } finally { LocalFree(text); }
-        } finally { LocalFree(descriptor); }
-    }
-}
-"@
-}
-
-function Get-CurrentUserSid {
-    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
-    if ($null -eq $sid) { throw 'current token user SID is unavailable' }
-    return $sid.Value
-}
-
-function Assert-ProtectedExecutionPath([string]$Path) {
-    Initialize-DiagValExecutionDirectoryNative
-    $error = 0
-    $label = [DiagValExecutionDirectory]::GetLabelSddl($Path, [ref]$error)
-    if ($null -eq $label -or $label -notmatch 'ML;[^;]*;NW;;;HI') {
-        throw "protected execution path mandatory label verification failed for ${Path}: $error"
-    }
-}
-
-function New-ProtectedExecutionFile([string]$Path) {
-    Initialize-DiagValExecutionDirectoryNative
-    $error = 0
-    if (-not [DiagValExecutionDirectory]::CreateHighIntegrityFile($Path, (Get-CurrentUserSid), [ref]$error)) {
-        throw "could not create protected execution file ${Path}: $error"
-    }
-    Assert-ProtectedExecutionPath $Path
-}
-
-function Copy-TrustedFileToProtected([string]$Source, [string]$Destination) {
-    $sourceHash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
-    New-ProtectedExecutionFile $Destination
-    $input = [IO.File]::OpenRead($Source)
-    try {
-        $output = [IO.File]::OpenWrite($Destination)
-        try { $input.CopyTo($output) } finally { $output.Dispose() }
-    } finally { $input.Dispose() }
-    if ((Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash -ne $sourceHash) {
-        throw "protected staged file hash mismatch: $Destination"
-    }
-    Assert-ProtectedExecutionPath $Destination
-}
-
-function Write-ProtectedJson([string]$Path, $Object) {
-    if (Test-Path -LiteralPath $Path) {
-        throw "protected JSON destination already exists: $Path"
-    }
-    $temporaryPath = "$Path.$PID.$([guid]::NewGuid().ToString('N')).tmp"
-    New-ProtectedExecutionFile $temporaryPath
-    $Object | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $temporaryPath -Encoding UTF8
-    Assert-ProtectedExecutionPath $temporaryPath
-    [IO.File]::Move($temporaryPath, $Path)
-    Assert-ProtectedExecutionPath $Path
-}
-
-function New-ProtectedExecutionDirectory {
-    Initialize-DiagValExecutionDirectoryNative
-    $path = Join-Path ([IO.Path]::GetTempPath()) ("leopardwm-diagval-exec-" + [guid]::NewGuid().ToString('N'))
-    $error = 0
-    if (-not [DiagValExecutionDirectory]::CreateHighIntegrityDirectory($path, (Get-CurrentUserSid), [ref]$error)) {
-        throw "could not create protected execution directory: $error"
-    }
-    Assert-ProtectedExecutionPath $path
+function New-FreshDirectory([string]$Root, [string]$Name) {
+    $path = Join-Path $Root $Name
+    if (Test-Path -LiteralPath $path) { throw "fresh destination already exists: $path" }
+    New-Item -ItemType Directory -Path $path -ErrorAction Stop | Out-Null
     return $path
 }
-
-function Get-TokenIntegrityRid([IntPtr]$Token) {
-    $ret = [uint32]0
-    [void][DiagValToken]::GetTokenInformation($Token, [DiagValToken]::TokenIntegrityLevel, [IntPtr]::Zero, 0, [ref]$ret)
-    if ($ret -eq 0) { return $null }
-    $buf = [Runtime.InteropServices.Marshal]::AllocHGlobal([int]$ret)
-    try {
-        if (-not [DiagValToken]::GetTokenInformation($Token, [DiagValToken]::TokenIntegrityLevel, $buf, $ret, [ref]$ret)) { return $null }
-        $sid = [Runtime.InteropServices.Marshal]::ReadIntPtr($buf)
-        if ($sid -eq [IntPtr]::Zero) { return $null }
-        $count = [Runtime.InteropServices.Marshal]::ReadByte([DiagValToken]::GetSidSubAuthorityCount($sid))
-        if ($count -eq 0) { return $null }
-        return [uint32][Runtime.InteropServices.Marshal]::ReadInt32([DiagValToken]::GetSidSubAuthority($sid, [uint32]($count - 1)))
-    } finally {
-        [Runtime.InteropServices.Marshal]::FreeHGlobal($buf)
-    }
+function Write-JsonFresh([string]$Path, $Value) {
+    if (Test-Path -LiteralPath $Path) { throw "JSON destination already exists: $Path" }
+    $Value | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Path -Encoding UTF8 -NoNewline
 }
-
-function Get-CurrentTokenInfo {
-    Initialize-DiagValTokenNative
-    $token = [IntPtr]::Zero
-    if (-not [DiagValToken]::OpenProcessToken([DiagValToken]::GetCurrentProcess(), [DiagValToken]::TOKEN_QUERY, [ref]$token)) { return $null }
-    try {
-        $elevationType = 0
-        $size = [uint32]4
-        $buffer = [Runtime.InteropServices.Marshal]::AllocHGlobal(4)
-        try {
-            if (-not [DiagValToken]::GetTokenInformation($token, [DiagValToken]::TokenElevationType, $buffer, $size, [ref]$size)) { return $null }
-            $elevationType = [Runtime.InteropServices.Marshal]::ReadInt32($buffer)
-        } finally {
-            [Runtime.InteropServices.Marshal]::FreeHGlobal($buffer)
-        }
-        return [pscustomobject]@{ Rid = Get-TokenIntegrityRid $token; ElevationType = $elevationType }
-    } finally {
-        [void][DiagValToken]::CloseHandle($token)
-    }
+function Read-Json([string]$Path) { return (Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json) }
+function Get-ExecutableFromCargoJson { param([object[]]$Lines, [int]$ExitCode, [string]$Bin)
+    if ($ExitCode -ne 0) { throw "cargo test --no-run failed: $ExitCode" }
+    $exe = $null
+    foreach ($line in @($Lines)) { try { $json = ([string]$line | ConvertFrom-Json) } catch { continue }; if ($json.reason -eq 'compiler-artifact' -and $json.profile.test -and $json.target.name -eq $Bin -and $json.executable) { $exe = [string]$json.executable } }
+    if ([string]::IsNullOrWhiteSpace($exe)) { throw "could not locate test executable for $Bin" }
+    return $exe
 }
-
-function Get-OwnLinkedMediumToken {
-    Initialize-DiagValTokenNative
-    $current = [IntPtr]::Zero
-    if (-not [DiagValToken]::OpenProcessToken([DiagValToken]::GetCurrentProcess(), [DiagValToken]::TOKEN_QUERY, [ref]$current)) { throw 'could not open own process token' }
-    try {
-        $size = [uint32]4
-        $buffer = [Runtime.InteropServices.Marshal]::AllocHGlobal(4)
-        try {
-            if (-not [DiagValToken]::GetTokenInformation($current, [DiagValToken]::TokenElevationType, $buffer, $size, [ref]$size) -or [Runtime.InteropServices.Marshal]::ReadInt32($buffer) -ne 2) {
-                throw 'own token is not Full; refusing linked-token launch'
-            }
-        } finally {
-            [Runtime.InteropServices.Marshal]::FreeHGlobal($buffer)
-        }
-        $linkedBuffer = [Runtime.InteropServices.Marshal]::AllocHGlobal([IntPtr]::Size)
-        try {
-            $linkedSize = [uint32][IntPtr]::Size
-            if (-not [DiagValToken]::GetTokenInformation($current, [DiagValToken]::TokenLinkedToken, $linkedBuffer, $linkedSize, [ref]$linkedSize)) {
-                throw 'own linked token is unavailable'
-            }
-            $linked = [Runtime.InteropServices.Marshal]::ReadIntPtr($linkedBuffer)
-            if ($linked -eq [IntPtr]::Zero) { throw 'own linked token handle is invalid' }
-            if ((Get-TokenIntegrityRid $linked) -ne $MediumRid) {
-                [void][DiagValToken]::CloseHandle($linked)
-                throw 'own linked token is not Medium; refusing launch'
-            }
-            return $linked
-        } finally {
-            [Runtime.InteropServices.Marshal]::FreeHGlobal($linkedBuffer)
-        }
-    } finally {
-        [void][DiagValToken]::CloseHandle($current)
-    }
+function Get-TestExecutable { param([string]$Package, [string]$Bin, [string]$LogPath)
+    $manifest = Join-Path $RepoRoot 'Cargo.toml'
+    if (-not (Test-Path -LiteralPath $manifest)) { throw "RepoRoot Cargo.toml missing: $manifest" }
+    $lines = & cargo test -p $Package --bin $Bin --no-run --message-format=json --manifest-path $manifest 2>&1
+    $exit = $LASTEXITCODE
+    foreach ($line in @($lines)) { Write-Host ([string]$line) }
+    @($lines | ForEach-Object { [string]$_ }) | Set-Content -LiteralPath $LogPath -Encoding UTF8
+    return Get-ExecutableFromCargoJson -Lines $lines -ExitCode $exit -Bin $Bin
 }
-
-function Get-CurrentIntegrityRid {
-    $info = Get-CurrentTokenInfo
-    if ($null -eq $info) { return $null }
-    return $info.Rid
-}
-
-function Assert-ElevatedShell([string]$Operation) {
-    $info = Get-CurrentTokenInfo
-    if ($null -eq $info -or [uint32]$info.Rid -ne $HighRid -or [int]$info.ElevationType -ne 2) {
-        throw "$Operation requires an already elevated Full High PowerShell session; no UAC is requested"
-    }
-}
-
-function Test-WindowExists([uint64]$Hwnd) {
-    if ($Hwnd -eq 0) { return $false }
-    if (-not ('DiagValUser32' -as [type])) {
-        Add-Type -TypeDefinition @"
+function Initialize-TokenNative {
+    if ('DiagValIntegrity' -as [type]) { return }
+    Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
-public static class DiagValUser32 {
-    [DllImport("user32.dll")]
-    public static extern bool IsWindow(IntPtr hWnd);
+public static class DiagValIntegrity {
+ [DllImport("advapi32.dll", SetLastError=true)] public static extern bool OpenProcessToken(IntPtr p,uint a,out IntPtr t);
+ [DllImport("advapi32.dll", SetLastError=true)] public static extern bool GetTokenInformation(IntPtr t,int c,IntPtr b,uint n,out uint r);
+ [DllImport("advapi32.dll")] public static extern IntPtr GetSidSubAuthority(IntPtr s,uint i);
+ [DllImport("advapi32.dll")] public static extern IntPtr GetSidSubAuthorityCount(IntPtr s);
+ [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
+ [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+ public const uint Query=0x0008; public const int ElevationType=18; public const int Integrity=25;
 }
-"@
-    }
-    return [DiagValUser32]::IsWindow([IntPtr]$Hwnd)
+'@
 }
-
+function Get-CurrentTokenInfo {
+    Initialize-TokenNative
+    $token = [IntPtr]::Zero
+    if (-not [DiagValIntegrity]::OpenProcessToken([DiagValIntegrity]::GetCurrentProcess(), [DiagValIntegrity]::Query, [ref]$token)) { return $null }
+    try {
+        $value = [Runtime.InteropServices.Marshal]::AllocHGlobal(4)
+        try {
+            $size = [uint32]4
+            if (-not [DiagValIntegrity]::GetTokenInformation($token, [DiagValIntegrity]::ElevationType, $value, 4, [ref]$size)) { return $null }
+            $elevation = [Runtime.InteropServices.Marshal]::ReadInt32($value)
+        } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($value) }
+        $size = [uint32]0
+        [void][DiagValIntegrity]::GetTokenInformation($token, [DiagValIntegrity]::Integrity, [IntPtr]::Zero, 0, [ref]$size)
+        if ($size -eq 0) { return $null }
+        $buffer = [Runtime.InteropServices.Marshal]::AllocHGlobal([int]$size)
+        try {
+            if (-not [DiagValIntegrity]::GetTokenInformation($token, [DiagValIntegrity]::Integrity, $buffer, $size, [ref]$size)) { return $null }
+            $sid = [Runtime.InteropServices.Marshal]::ReadIntPtr($buffer)
+            $count = [Runtime.InteropServices.Marshal]::ReadByte([DiagValIntegrity]::GetSidSubAuthorityCount($sid))
+            if ($count -eq 0) { return $null }
+            return [pscustomobject]@{ rid = [uint32][Runtime.InteropServices.Marshal]::ReadInt32([DiagValIntegrity]::GetSidSubAuthority($sid, [uint32]($count - 1))); elevation_type = $elevation }
+        } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($buffer) }
+    } finally { [void][DiagValIntegrity]::CloseHandle($token) }
+}
 function Join-ProcessArguments([string[]]$Arguments) {
-    $parts = foreach ($argument in $Arguments) {
-        $escaped = ([string]$argument -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1'
-        '"' + $escaped + '"'
-    }
+    $parts = foreach ($argument in $Arguments) { $escaped = ([string]$argument -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1'; '"' + $escaped + '"' }
     return $parts -join ' '
 }
-
-function New-DotNetProcessRecord([string]$Name, $Process, [string]$AuditPath = $null, [string[]]$ExpectedChildren = @()) {
-    return [pscustomobject]@{
-        Name             = $Name
-        Process          = $Process
-        Pid              = $null
-        CreationFileTime = $null
-        AuditPath        = $AuditPath
-        ExpectedChildren = @($ExpectedChildren)
-    }
+$script:TestFailProcessMetadataFor = $null
+function Test-DescendantPath([string]$Parent, [string]$Candidate) {
+    $parentPath = [IO.Path]::GetFullPath($Parent).TrimEnd('\')
+    $candidatePath = [IO.Path]::GetFullPath($Candidate)
+    return $candidatePath.StartsWith($parentPath + '\', [StringComparison]::OrdinalIgnoreCase)
 }
-
-function Start-DiagRunner([string]$Name, [string]$Shell, [string]$RunnerPath, [string]$DataPath, [string]$RunDir, [string]$AuditPath, [string[]]$ExpectedChildren, $Owned) {
-    $arguments = Join-ProcessArguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $RunnerPath, '-DataPath', $DataPath)
-    $process = Start-Process -FilePath $Shell -ArgumentList $arguments -PassThru -WindowStyle Hidden -WorkingDirectory $RunDir
-    if ($null -eq $process) { throw "Start-Process returned no handle for $Name" }
-    $record = New-DotNetProcessRecord -Name $Name -Process $process -AuditPath $AuditPath -ExpectedChildren $ExpectedChildren
+function New-ProcessRecord([string]$Name, $Process, [string]$AuditPath = $null) {
+    return [pscustomobject]@{ name = $Name; process = $Process; pid = [uint32]$Process.Id; creation_filetime = $null; image = $null; audit_path = $AuditPath }
+}
+function Complete-ProcessRecord($Record) {
+    if ($script:TestFailProcessMetadataFor -eq $Record.name) { throw "injected process metadata failure for $($Record.name)" }
+    $Record.creation_filetime = [uint64]$Record.process.StartTime.ToFileTimeUtc()
+    try { $Record.image = [string]$Record.process.Path } catch { $Record.image = (Get-Process -Id $PID).Path }
+    return $Record
+}
+function Start-Runner([string]$Name, [string]$Shell, [string]$Runner, [string]$DataPath, [string]$WorkingDirectory, [string]$AuditPath, $Owned) {
+    $process = Start-Process -FilePath $Shell -ArgumentList (Join-ProcessArguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Runner, '-DataPath', $DataPath)) -WorkingDirectory $WorkingDirectory -WindowStyle Hidden -PassThru
+    if ($null -eq $process) { throw "runner did not start: $Name" }
+    $record = New-ProcessRecord $Name $process $AuditPath
     $Owned.Add($record) | Out-Null
-    $record.Pid = [uint32]$process.Id
-    if ($script:TestFailRunnerStartTimeFor -eq $Name) { throw "injected runner StartTime failure for $Name" }
-    $record.CreationFileTime = [uint64]$process.StartTime.ToFileTimeUtc()
-    return $record
+    return Complete-ProcessRecord $record
 }
-
-function Start-LinkedTokenDiagRunner([string]$Name, [string]$Shell, [string]$RunnerPath, [string]$DataPath, [string]$RunDir, [string]$AuditPath, [string[]]$ExpectedChildren, $Owned) {
-    $token = Get-OwnLinkedMediumToken
-    try {
-        $startup = New-Object DiagValToken+STARTUPINFO
-        $startup.cb = [Runtime.InteropServices.Marshal]::SizeOf($startup)
-        $startup.dwFlags = 1
-        $startup.wShowWindow = 0
-        $processInfo = New-Object DiagValToken+PROCESS_INFORMATION
-        $arguments = Join-ProcessArguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $RunnerPath, '-DataPath', $DataPath)
-        $commandLine = "$(Join-ProcessArguments @($Shell)) $arguments"
-        if (-not [DiagValToken]::CreateProcessWithTokenW($token, 0, $Shell, $commandLine, 0x08000000, [IntPtr]::Zero, $RunDir, [ref]$startup, [ref]$processInfo)) {
-            throw "CreateProcessWithTokenW for $Name failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-        }
-        [void][DiagValToken]::CloseHandle($processInfo.hThread)
-        $record = [pscustomobject]@{
-            Name             = $Name
-            NativeHandle     = $processInfo.hProcess
-            Pid              = [uint32]$processInfo.dwProcessId
-            CreationFileTime = $null
-            AuditPath        = $AuditPath
-            ExpectedChildren = @($ExpectedChildren)
-        }
-        $Owned.Add($record) | Out-Null
-        if ($script:TestFailRunnerStartTimeFor -eq $Name) { throw "injected runner StartTime failure for $Name" }
-        $record.CreationFileTime = [uint64](Get-Process -Id $processInfo.dwProcessId -ErrorAction Stop).StartTime.ToFileTimeUtc()
-        return $record
-    } finally {
-        [void][DiagValToken]::CloseHandle($token)
-    }
-}
-
-function Stop-RetainedProcess {
-    param($Record, [int]$WaitMs)
-    if ($null -eq $Record) { throw 'missing retained process handle' }
-    if ($null -ne $Record.PSObject.Properties['NativeHandle']) {
-        $handle = [IntPtr]$Record.NativeHandle
-        $state = Get-RetainedProcessState $Record
-        if ($state.Exited) { return [int]$state.ExitCode }
-        if ([DiagValToken]::WaitForSingleObject($handle, [uint32]$WaitMs) -eq 0) { return (Get-RetainedProcessState $Record).ExitCode }
-        if (-not [DiagValToken]::TerminateProcess($handle, 1)) { throw "could not terminate $($Record.Name) through its retained native handle" }
-        if ([DiagValToken]::WaitForSingleObject($handle, [uint32]$WaitMs) -ne 0) { throw "process $($Record.Name) pid $($Record.Pid) did not exit after kill" }
-        return (Get-RetainedProcessState $Record).ExitCode
-    }
-    if ($null -eq $Record.Process) { throw 'missing retained process handle' }
-    $process = $Record.Process
+function Stop-Retained([object]$Record, [int]$WaitMs = 12000) {
+    if ($null -eq $Record -or $null -eq $Record.process) { throw 'missing retained process record' }
+    $process = $Record.process
     if ($process.HasExited) { return [int]$process.ExitCode }
     if ($process.WaitForExit($WaitMs)) { return [int]$process.ExitCode }
-    try { $process.Kill() } catch { if (-not $process.HasExited) { throw } }
-    if (-not $process.WaitForExit($WaitMs)) { throw "process $($Record.Name) pid $($Record.Pid) did not exit after kill" }
+    $process.Kill()
+    if (-not $process.WaitForExit($WaitMs)) { throw "process $($Record.name) pid $($Record.pid) did not exit after kill" }
     return [int]$process.ExitCode
 }
-
-function Close-RetainedProcessHandle($Record) {
-    if ($null -ne $Record -and $null -ne $Record.PSObject.Properties['NativeHandle'] -and [IntPtr]$Record.NativeHandle -ne [IntPtr]::Zero) {
-        [void][DiagValToken]::CloseHandle([IntPtr]$Record.NativeHandle)
-        $Record.NativeHandle = [IntPtr]::Zero
-    }
-}
-
-function Stop-OwnedProcesses($Owned, [int]$WaitMs) {
+function Stop-Owned($Owned, [int]$WaitMs = 12000) {
     $errors = New-Object System.Collections.Generic.List[string]
-    foreach ($record in $Owned) {
-        try {
-            $code = Stop-RetainedProcess -Record $record -WaitMs $WaitMs
-            if ($code -ne 0) { $errors.Add("$($record.Name) exit $code") | Out-Null }
-        } catch {
-            $errors.Add("cleanup $($record.Name): $_") | Out-Null
-        }
-    }
+    foreach ($record in $Owned) { try { $code = Stop-Retained $record $WaitMs; if ($code -ne 0) { $errors.Add("$($record.name) exit $code") | Out-Null } } catch { $errors.Add("cleanup $($record.name): $_") | Out-Null } }
     return @($errors)
 }
-
-function Assert-RunnerAudit([string]$Path, [string[]]$ExpectedChildren, [string]$Label) {
-    if (-not (Test-Path -LiteralPath $Path)) { throw "$Label audit missing: $Path" }
-    try { $audit = Read-JsonFile $Path } catch { throw "$Label audit corrupt: $_" }
-    if ([int]$audit.exitCode -ne 0) { throw "$Label audit exit $($audit.exitCode)" }
-    if (@($audit.failures).Count -ne 0) { throw "$Label audit reports failures: $(@($audit.failures) -join '; ')" }
-    $expected = @($ExpectedChildren | Sort-Object -Unique)
-    $declared = @($audit.expectedChildren | Sort-Object -Unique)
-    if (($expected -join '|') -ne ($declared -join '|')) { throw "$Label audit expected child set mismatch" }
-    $children = @($audit.children)
-    if ($children.Count -ne $expected.Count) { throw "$Label audit launched child count mismatch" }
-    foreach ($name in $expected) {
-        $matches = @($children | Where-Object { [string]$_.name -eq $name })
-        if ($matches.Count -ne 1) { throw "$Label audit missing or duplicate child $name" }
-        $child = $matches[0]
-        if ([uint32]$child.pid -eq 0 -or [uint64]$child.creation_filetime -eq 0) { throw "$Label audit child $name lacks launch identity" }
-        if (-not [bool]$child.exited -or [int]$child.exitCode -ne 0) { throw "$Label audit child $name did not exit 0" }
+function Wait-Json([string]$Path, $Process, [datetime]$Deadline, [string]$Phase) {
+    while ([datetime]::UtcNow -lt $Deadline) {
+        if (Test-Path -LiteralPath $Path) { try { return Read-Json $Path } catch {} }
+        if ($null -ne $Process -and $Process.process.HasExited) { throw "$Phase child exited $($Process.process.ExitCode) before $Path" }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "$Phase timed out waiting for $Path"
+}
+function Assert-Audit([string]$Path, [string[]]$Children, [string]$Label) {
+    $audit = Read-Json $Path
+    if ([int]$audit.exitCode -ne 0 -or @($audit.failures).Count -ne 0) { throw "$Label runner audit failed: $(@($audit.failures) -join '; ')" }
+    foreach ($name in $Children) {
+        $child = @($audit.children | Where-Object { [string]$_.name -eq $name })
+        if ($child.Count -ne 1 -or [uint32]$child[0].pid -eq 0 -or [uint64]$child[0].creation_filetime -eq 0 -or -not [bool]$child[0].exited -or [int]$child[0].exitCode -ne 0) { throw "$Label audit lacks successful retained child $name" }
     }
 }
-
-function Assert-OwnedRunnerAudits($Owned) {
-    $errors = New-Object System.Collections.Generic.List[string]
-    foreach ($record in $Owned) {
-        if (-not [string]::IsNullOrWhiteSpace([string]$record.AuditPath)) {
-            try {
-                Assert-RunnerAudit -Path $record.AuditPath -ExpectedChildren @($record.ExpectedChildren) -Label $record.Name
-            } catch {
-                $errors.Add("$($record.Name): $_") | Out-Null
+function New-HostEnv([string]$RunDir, [string]$Scope, [string]$Prefix, [string]$OwnHwnd) { return [ordered]@{ LEOPARDWM_DIAGNOSTICS_VALIDATION='1'; LEOPARDWM_DIAGNOSTICS_RUN_DIR=$RunDir; LEOPARDWM_DIAGNOSTICS_TIMEOUT_SECS='90'; LEOPARDWM_PIPE_SCOPE=$Scope; LEOPARDWM_DIAGNOSTICS_ROLE='host'; LEOPARDWM_DIAGNOSTICS_OWN_HWND=$OwnHwnd; LEOPARDWM_DIAGNOSTICS_EVIDENCE_PREFIX=$Prefix } }
+function New-ClientEnv([string]$RunDir, [string]$Prefix) { return [ordered]@{ LEOPARDWM_DIAGNOSTICS_VALIDATION='1'; LEOPARDWM_DIAGNOSTICS_RUN_DIR=$RunDir; LEOPARDWM_DIAGNOSTICS_TIMEOUT_SECS='30'; LEOPARDWM_DIAGNOSTICS_ROLE='client'; LEOPARDWM_DIAGNOSTICS_EVIDENCE_PREFIX=$Prefix } }
+function New-RunnerData([string]$RunDir, [string]$WorkingDir, [string]$StopPath, [string]$AuditPath, $Children, $Controller = $null, $Handoff = $null, [int]$TimeoutSec = 90) { return [ordered]@{ runDir=$RunDir; workingDir=$WorkingDir; stopPath=$StopPath; auditPath=$AuditPath; timeoutSec=$TimeoutSec; environment_policy='clear_diagnostics'; controller=$Controller; handoff=$Handoff; children=@($Children) } }
+function New-HandoffControlServer([string]$Pipe) {
+    if (-not (Test-ExactPipe $Pipe)) { throw 'refusing malformed handoff control pipe' }
+    $options = [IO.Pipes.PipeOptions]::Asynchronous -bor [IO.Pipes.PipeOptions]::CurrentUserOnly
+    return [IO.Pipes.NamedPipeServerStream]::new(
+        $Pipe.Substring('\\.\pipe\'.Length),
+        [IO.Pipes.PipeDirection]::Out,
+        1,
+        [IO.Pipes.PipeTransmissionMode]::Byte,
+        $options,
+        0,
+        4096
+    )
+}
+function Wait-HandoffReceiver($Server, $Receiver, [datetime]$Deadline) {
+    $connect = $Server.BeginWaitForConnection($null, $null)
+    while (-not $connect.AsyncWaitHandle.WaitOne(100)) {
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'handoff receiver did not connect before deadline' }
+        if ($null -ne $Receiver -and $Receiver.process.HasExited) { throw "handoff receiver exited $($Receiver.process.ExitCode) before connection" }
+    }
+    $Server.EndWaitForConnection($connect)
+}
+function Send-HandoffPayload($Server, [string]$Payload, $Receiver = $null) {
+    try {
+        if ($null -eq $Server -or -not $Server.IsConnected) { throw 'handoff receiver is not connected' }
+        if ($null -ne $Receiver -and $Receiver.process.HasExited) { throw "handoff receiver exited $($Receiver.process.ExitCode) before payload" }
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Payload)
+        if ($bytes.Length -eq 0 -or $bytes.Length -gt 4096) { throw 'handoff payload is not within the fixed 4096-byte limit' }
+        $Server.Write($bytes, 0, $bytes.Length)
+        $Server.Flush()
+    } finally { if ($null -ne $Server) { $Server.Dispose() } }
+}
+function Send-ServerIdentity($Server, [string]$RunId, [string]$ServerPipe, [uint32]$ServerPid, [uint64]$Creation, $Receiver = $null) {
+    if (-not (Test-ExactPipe $ServerPipe) -or $RunId -notmatch '^[a-f0-9]{32}$' -or $ServerPid -eq 0 -or $Creation -eq 0) { throw 'refusing malformed bounded server-identity handoff' }
+    $payload = @{ kind='server_identity'; run_id=$RunId; pipe=$ServerPipe; expected_pid=$ServerPid; expected_creation=$Creation } | ConvertTo-Json -Compress
+    Send-HandoffPayload $Server $payload $Receiver
+}
+function ConvertTo-PsLiteral([string]$Value) { return "'" + $Value.Replace("'", "''") + "'" }
+function Get-ArtifactDependencies([string[]]$Executables) {
+    $dependencies = New-Object System.Collections.Generic.List[object]
+    $byName = @{}
+    foreach ($executable in $Executables) {
+        foreach ($file in @(Get-ChildItem -LiteralPath (Split-Path -Parent $executable) -Filter '*.dll' -File)) {
+            $hash = Get-Sha256 $file.FullName
+            if ($byName.ContainsKey($file.Name)) {
+                if ($byName[$file.Name] -cne $hash) { throw "conflicting DLL dependency bytes: $($file.Name)" }
+                continue
+            }
+            $byName[$file.Name] = $hash
+            $dependencies.Add([ordered]@{ source = $file.FullName; destination = $file.Name; sha256 = $hash }) | Out-Null
+        }
+    }
+    return ,([object[]]$dependencies.ToArray())
+}
+function Start-PinnedBootstrap([string]$Shell, [string]$BootstrapPath, [string]$SpecPath, [string]$SpecHash, [string]$WorkingDirectory, $Owned) {
+    $bootstrapHash = Get-Sha256 $BootstrapPath
+    $command = "`$p=$(ConvertTo-PsLiteral $BootstrapPath);`$h=$(ConvertTo-PsLiteral $bootstrapHash);`$b=[IO.File]::ReadAllBytes(`$p);`$s=[Security.Cryptography.SHA256]::Create();try {`$a=([BitConverter]::ToString(`$s.ComputeHash(`$b))).Replace('-','');if(`$a -cne `$h){throw 'pinned bootstrap hash mismatch'};& ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString(`$b)))} finally {`$s.Dispose()}"
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+    try { $process = Start-Process -FilePath $Shell -Verb RunAs -ArgumentList (Join-ProcessArguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded)) -WorkingDirectory $WorkingDirectory -WindowStyle Hidden -PassThru } catch { throw "UAC bootstrap was cancelled or failed: $_" }
+    if ($null -eq $process) { throw 'UAC bootstrap returned no process; no retry is attempted' }
+    $record = New-ProcessRecord 'high-bootstrap' $process
+    $Owned.Add($record) | Out-Null
+    return Complete-ProcessRecord $record
+}
+function Test-WindowExists([uint64]$Hwnd) {
+    if ($Hwnd -eq 0) { return $false }
+    if (-not ('DiagValWindow' -as [type])) { Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class DiagValWindow { [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hwnd); }
+'@ }
+    return [DiagValWindow]::IsWindow([IntPtr]$Hwnd)
+}
+function Assert-NativeMatrix($HighDir, $MediumHostDir, $MediumClientDir) {
+    $fixture = Read-Json (Join-Path $HighDir 'fixture.json')
+    if ([uint64]$fixture.hwnd -eq 0 -or [uint32]$fixture.pid -eq 0 -or [uint64]$fixture.creation_filetime -eq 0 -or [string]::IsNullOrWhiteSpace([string]$fixture.image) -or [bool]$fixture.visible) { throw 'High fixture identity is incomplete or visible' }
+    $highHost = Read-Json (Join-Path $HighDir 'high-host.json'); $mediumHost = Read-Json (Join-Path $MediumHostDir 'medium-host.json'); $mediumClient = Read-Json (Join-Path $MediumClientDir 'medium-client.json'); $highClient = Read-Json (Join-Path $HighDir 'high-client.json')
+    foreach ($pair in @(@($highHost,$HighRid,'high host'), @($mediumHost,$MediumRid,'medium host'), @($mediumClient,$MediumRid,'medium client'), @($highClient,$HighRid,'high client'))) { if ([uint32]$pair[0].oracle_integrity_rid -ne $pair[1] -or [uint32]$pair[0].platform_integrity_rid -ne $pair[1]) { throw "$($pair[2]) RID matrix mismatch" } }
+    if ([string]$highHost.admission.noted -ne 'No' -or [string]$mediumHost.admission.noted -ne 'HigherIntegrity') { throw 'admission matrix does not demonstrate High fixture versus Medium host' }
+    if ([uint64]$mediumHost.admission.hwnd -ne [uint64]$fixture.hwnd -or [string]$mediumHost.admission.title -ne [string]$fixture.title) { throw 'Medium host did not admit the verified High fixture' }
+    if ([uint32]$mediumClient.health.daemon_integrity -ne $HighRid -or [uint32]$highClient.health.daemon_integrity -ne $MediumRid) { throw 'HealthCheck integrity matrix mismatch' }
+    $blocked = @($highClient.health.elevation_blocked_records | Where-Object { [uint64]$_.hwnd -eq [uint64]$fixture.hwnd -and [string]$_.reason -eq 'higher_integrity' })
+    if ($blocked.Count -ne 1) { throw 'High client HealthCheck lacks higher_integrity admission record' }
+    $legacy = @($highClient.health.elevation_blocked_windows | Where-Object { @($_).Count -ge 2 -and [uint64]$_[0] -eq [uint64]$fixture.hwnd })
+    if ($legacy.Count -ne 1 -or [string]$mediumClient.query_status.status -ne 'status_info' -or [string]$highClient.query_status.status -ne 'status_info') { throw 'legacy compatibility or QueryStatus evidence missing' }
+    if ([uint32]$mediumClient.connected_server_pid -ne [uint32]$highHost.pid -or [uint64]$mediumClient.expected_server_creation -ne [uint64]$highHost.creation_filetime -or [uint32]$highClient.connected_server_pid -ne [uint32]$mediumHost.pid -or [uint64]$highClient.expected_server_creation -ne [uint64]$mediumHost.creation_filetime) { throw 'actual pipe server identity evidence mismatch' }
+    foreach ($rendered in @([string]$mediumClient.rendered.daemon, [string]$mediumClient.rendered.cli, [string]$highClient.rendered.daemon, [string]$highClient.rendered.cli)) { if ([string]::IsNullOrWhiteSpace($rendered) -or $rendered -like '*unavailable*') { throw 'doctor output evidence missing' } }
+    return $fixture
+}
+function Assert-PinnedHighSpec([string]$SpecPath) {
+    $spec = Read-Json $SpecPath
+    if ([int]$spec.version -ne 1) { throw 'unsupported pinned High specification' }
+    $execution = Split-Path -Parent $SpecPath
+    foreach ($item in @(@('diagnostics_validation.ps1',$spec.main.sha256), @('diagnostics_validation_runner.ps1',$spec.runner.sha256), @('daemon-test.exe',$spec.daemon.sha256), @('cli-test.exe',$spec.cli.sha256), @('high-runner-data.json',$spec.runner_data.sha256))) {
+        $path = Join-Path $execution $item[0]
+        if (-not (Test-Path -LiteralPath $path) -or (Get-Sha256 $path) -cne [string]$item[1]) { throw "pinned High artifact hash mismatch: $($item[0])" }
+    }
+    $names = @{}
+    foreach ($dependency in @($spec.dependencies)) {
+        $name = [string]$dependency.destination
+        if ([string]::IsNullOrWhiteSpace($name) -or [IO.Path]::GetFileName($name) -cne $name -or $names.ContainsKey($name) -or -not (Test-Path -LiteralPath (Join-Path $execution $name)) -or (Get-Sha256 (Join-Path $execution $name)) -cne [string]$dependency.sha256) { throw "pinned High dependency hash mismatch: $name" }
+        $names[$name] = $true
+    }
+    return $spec
+}
+function Assert-HighRunnerData($Data, [string]$ExecutionDir, [string]$OutputDir) {
+    if ([string]$Data.runDir -ne $OutputDir -or [string]$Data.workingDir -ne $ExecutionDir -or [string]$Data.stopPath -ne (Join-Path $OutputDir 'stop') -or [string]$Data.auditPath -ne (Join-Path $OutputDir 'high-runner-audit.json') -or [string]$Data.environment_policy -ne 'clear_diagnostics') { throw 'pinned High runner data has mutable paths or environment policy' }
+    $controller = $Data.controller
+    if ($null -eq $controller -or [uint32]$controller.pid -eq 0 -or [uint64]$controller.creation_filetime -eq 0 -or [string]::IsNullOrWhiteSpace([string]$controller.image)) { throw 'pinned High runner data lacks controller identity' }
+    if ($null -eq $Data.handoff -or -not (Test-ExactPipe ([string]$Data.handoff.pipe)) -or -not (Test-ExactPipe ([string]$Data.handoff.server_pipe)) -or [string]$Data.handoff.run_id -notmatch '^[a-f0-9]{32}$') { throw 'pinned High runner handoff is invalid' }
+    $children = @($Data.children)
+    if ($children.Count -ne 2) { throw 'pinned High runner child set is invalid' }
+    $expected = @{ 'high-host' = 'daemon-test.exe'; 'high-client' = 'cli-test.exe' }
+    foreach ($child in $children) {
+        $name = [string]$child.name
+        if (-not $expected.ContainsKey($name) -or [string]$child.exe -ne (Join-Path $ExecutionDir $expected[$name]) -or ((@($child.args) -join "`n") -cne ($TestArgs -join "`n"))) { throw "pinned High child specification is invalid: $name" }
+        foreach ($path in @([string]$child.stdout, [string]$child.stderr)) {
+            if (-not (Test-DescendantPath $OutputDir $path)) {
+                throw "pinned High child output escapes protected output: $name"
             }
         }
     }
-    return @($errors)
+    if ([string](@($children | Where-Object { $_.name -eq 'high-host' })[0].start) -ne 'immediate' -or [string](@($children | Where-Object { $_.name -eq 'high-client' })[0].start) -ne 'handoff' -or -not [bool](@($children | Where-Object { $_.name -eq 'high-client' })[0].stopAfterExit)) { throw 'pinned High child ordering is invalid' }
 }
-
-function Save-ProcessEnv([string[]]$Names) {
-    $saved = @{}
-    foreach ($name in $Names) {
-        $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
-    }
-    return $saved
+function Complete-HighSideState($State, [int]$RunnerExit) {
+    $State.status = 'exited'
+    $State.runner_exit = $RunnerExit
+    return $State
 }
-
-function Restore-ProcessEnv($Saved) {
-    foreach ($name in @($Saved.Keys)) {
-        [Environment]::SetEnvironmentVariable($name, $Saved[$name], 'Process')
-    }
-}
-
-function Assert-RidObserved($Info, [uint32]$Expected, [string]$Label) {
-    if ($null -eq $Info) { throw "$Label evidence missing" }
-    if (-not (Test-RidPair $Info.oracle_integrity_rid $Info.platform_integrity_rid $Expected)) {
-        throw "$Label oracle/platform RID $($Info.oracle_integrity_rid)/$($Info.platform_integrity_rid) != 0x$($Expected.ToString('X'))"
-    }
-}
-
-function Assert-HealthDaemonRid($Health, [uint32]$Expected, [string]$Label) {
-    $rid = Get-DaemonIntegrityFromHealth $Health
-    if ($null -eq $rid) { throw "$Label HealthInfo missing daemon integrity" }
-    if ([uint32]$rid -ne $Expected) {
-        throw "$Label daemon_integrity $rid != 0x$($Expected.ToString('X'))"
-    }
-}
-
-function Assert-NoBlocked($Health, [string]$Label) {
-    if ($null -eq $Health) { throw "$Label HealthInfo missing" }
-    if ($Health.PSObject.Properties.Name -notcontains 'elevation_blocked_records' -or $null -eq $Health.elevation_blocked_records) {
-        throw "$Label missing elevation_blocked_records"
-    }
-    $count = @($Health.elevation_blocked_records).Count
-    if ($count -ne 0) { throw "$Label expected no blocked windows, found $count" }
-}
-
-function Assert-HigherIntegrityBlock($Health, $Fixture, [string]$Label) {
-    if ($null -eq $Health) { throw "$Label HealthInfo missing" }
-    $records = @($Health.elevation_blocked_records)
-    if ($records.Count -lt 1) { throw "$Label missing blocked records" }
-    $match = $false
-    foreach ($record in $records) {
-        if ([uint64]$record.hwnd -eq [uint64]$Fixture.hwnd -and [string]$record.title -eq [string]$Fixture.title -and [string]$record.reason -eq 'higher_integrity') {
-            $match = $true
-        }
-    }
-    if (-not $match) { throw "$Label rich blocked record did not match fixture hwnd/title/reason" }
-    $legacy = @($Health.elevation_blocked_windows)
-    $legacyMatch = $false
-    foreach ($row in $legacy) {
-        if (@($row).Count -ge 2 -and [uint64]$row[0] -eq [uint64]$Fixture.hwnd -and [string]$row[1] -eq [string]$Fixture.title) {
-            $legacyMatch = $true
-        }
-    }
-    if (-not $legacyMatch) { throw "$Label legacy blocked pair did not match fixture hwnd/title" }
-}
-
-function Assert-RenderedIntegrity([string]$Line, [string]$Label, [string]$ExpectedWord) {
-    if ([string]::IsNullOrWhiteSpace($Line)) { throw "$Label rendered line missing" }
-    if ($Line -notlike "*$ExpectedWord*") { throw "$Label rendered '$Line' missing $ExpectedWord" }
-    if ($Line -like '*unavailable*') { throw "$Label rendered unavailable" }
-}
-
-function Assert-NativeMatrix {
-    param($HighRunDir, $MediumHostRunDir, $MediumClientRunDir)
-    $fixture = Read-JsonFile (Join-Path $HighRunDir 'fixture.json')
-    if (-not (Test-FixtureIdentityComplete $fixture)) { throw 'fixture identity incomplete' }
-    if ([bool]$fixture.visible) { throw 'fixture was visible' }
-    $highHost = Read-JsonFile (Join-Path $HighRunDir 'high-host.json')
-    $mediumHost = Read-JsonFile (Join-Path $MediumHostRunDir 'medium-host.json')
-    $mediumClient = Read-JsonFile (Join-Path $MediumClientRunDir 'medium-client.json')
-    $highClient = Read-JsonFile (Join-Path $HighRunDir 'high-client.json')
-    Assert-RidObserved $highHost $HighRid 'high-host'
-    Assert-RidObserved $mediumHost $MediumRid 'medium-host'
-    Assert-RidObserved $mediumClient $MediumRid 'medium-client'
-    Assert-RidObserved $highClient $HighRid 'high-client'
-    if (-not (Test-ClassificationsAgree ([string]$highHost.admission.window_manage_block) ([string]$highHost.admission.manage_block))) {
-        throw 'high-host window/process classification disagree'
-    }
-    if ([string]$highHost.admission.noted -ne 'No') { throw 'high-host/high-fixture should not be blocked' }
-    if (-not (Test-ClassificationsAgree ([string]$mediumHost.admission.window_manage_block) ([string]$mediumHost.admission.manage_block))) {
-        throw 'medium-host window/process classification disagree'
-    }
-    if ([string]$mediumHost.admission.noted -ne 'HigherIntegrity') { throw 'medium-host/high-fixture must be HigherIntegrity' }
-    if ([uint64]$mediumHost.admission.hwnd -ne [uint64]$fixture.hwnd) { throw 'medium-host admission hwnd mismatch' }
-    if ([string]$mediumHost.admission.title -ne [string]$fixture.title) { throw 'medium-host admission title mismatch' }
-    Assert-HealthDaemonRid $mediumClient.health $HighRid 'medium-client'
-    Assert-HealthDaemonRid $highClient.health $MediumRid 'high-client'
-    Assert-NoBlocked $mediumClient.health 'medium-client'
-    Assert-HigherIntegrityBlock $highClient.health $fixture 'high-client'
-    Assert-RenderedIntegrity ([string]$mediumClient.rendered.daemon) 'medium-client daemon' 'High'
-    Assert-RenderedIntegrity ([string]$mediumClient.rendered.cli) 'medium-client cli' 'Medium'
-    Assert-RenderedIntegrity ([string]$highClient.rendered.daemon) 'high-client daemon' 'Medium'
-    Assert-RenderedIntegrity ([string]$highClient.rendered.cli) 'high-client cli' 'High'
-    if ([string]$mediumClient.query_status.status -ne 'status_info') { throw 'medium-client QueryStatus missing' }
-    if ([string]$highClient.query_status.status -ne 'status_info') { throw 'high-client QueryStatus missing' }
-    if ([uint32]$mediumClient.connected_server_pid -ne [uint32]$highHost.pid) { throw 'medium-client server pid mismatch' }
-    if ([uint32]$highClient.connected_server_pid -ne [uint32]$mediumHost.pid) { throw 'high-client server pid mismatch' }
-}
-
-function New-HostEnv {
-    param([string]$RunDir, [string]$Scope, [string]$Prefix, [string]$OwnHwnd)
-    return [ordered]@{
-        LEOPARDWM_DIAGNOSTICS_VALIDATION     = '1'
-        LEOPARDWM_DIAGNOSTICS_RUN_DIR        = $RunDir
-        LEOPARDWM_DIAGNOSTICS_TIMEOUT_SECS   = '90'
-        LEOPARDWM_PIPE_SCOPE                 = $Scope
-        LEOPARDWM_DIAGNOSTICS_ROLE           = 'host'
-        LEOPARDWM_DIAGNOSTICS_OWN_HWND       = $OwnHwnd
-        LEOPARDWM_DIAGNOSTICS_EVIDENCE_PREFIX = $Prefix
-    }
-}
-
-function New-ClientEnv {
-    param([string]$RunDir, [string]$Prefix)
-    return [ordered]@{
-        LEOPARDWM_DIAGNOSTICS_VALIDATION     = '1'
-        LEOPARDWM_DIAGNOSTICS_RUN_DIR        = $RunDir
-        LEOPARDWM_DIAGNOSTICS_TIMEOUT_SECS   = '30'
-        LEOPARDWM_DIAGNOSTICS_ROLE           = 'client'
-        LEOPARDWM_DIAGNOSTICS_EVIDENCE_PREFIX = $Prefix
-    }
-}
-
-function New-RunnerData {
-    param(
-        [string]$RunDir,
-        [string]$StopPath,
-        [string]$AuditPath,
-        $Children,
-        [string]$WorkingDir = $RunDir,
-        [switch]$CreateRunDir,
-        [string]$SharedStopPath = $null,
-        [string]$FixtureCopySource = $null
-    )
-    return [ordered]@{
-        runDir            = $RunDir
-        workingDir        = $WorkingDir
-        timeoutSec        = 90
-        stopPath          = $StopPath
-        auditPath         = $AuditPath
-        createRunDir      = [bool]$CreateRunDir
-        sharedStopPath    = $SharedStopPath
-        fixtureCopySource = $FixtureCopySource
-        children          = @($Children)
-    }
-}
-
-function Invoke-RunnerOrchestrationSelfTest([string]$Root) {
+function Invoke-HighSide {
+    if ([string]::IsNullOrWhiteSpace($PinnedSpecPath) -or -not (Test-Path -LiteralPath $PinnedSpecPath)) { throw 'High side requires its protected pinned specification' }
+    $token = Get-CurrentTokenInfo
+    if ($null -eq $token -or [uint32]$token.rid -ne $HighRid) { throw 'High side is not High integrity' }
+    $spec = Assert-PinnedHighSpec $PinnedSpecPath
+    $exec = Split-Path -Parent $PinnedSpecPath
+    $output = [string]$spec.high_output_dir
+    if (-not (Test-Path -LiteralPath $output) -or -not $output.StartsWith($exec, [StringComparison]::OrdinalIgnoreCase)) { throw 'High output path is not the protected execution destination' }
+    $data = Read-Json (Join-Path $exec 'high-runner-data.json')
+    Assert-HighRunnerData $data $exec $output
+    $runner = Join-Path $exec 'diagnostics_validation_runner.ps1'
     $shell = (Get-Process -Id $PID).Path
-    if ($shell -notmatch '\s') { throw "SelfTest requires the actual spaced pwsh path: $shell" }
-    $executionRoot = New-ProtectedExecutionDirectory
-    Write-Host "SelfTest protected execution dir: $executionRoot"
-    $runner = Join-Path $executionRoot 'runner with spaces.ps1'
-    Copy-TrustedFileToProtected -Source (Join-Path $RepoRoot 'tools\diagnostics_validation_runner.ps1') -Destination $runner
-    $selfOwned = New-Object System.Collections.Generic.List[object]
-    $child = Join-Path $executionRoot 'harmless child with spaces.ps1'
-    New-ProtectedExecutionFile $child
-    @'
-param([string]$Mode, [string]$Evidence, [string]$StopPath, [string]$HostEvidence)
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-if ($Mode -eq 'host') {
-    @{ pid = $PID } | ConvertTo-Json | Set-Content -LiteralPath $Evidence -Encoding UTF8
-    while (-not (Test-Path -LiteralPath $StopPath)) { Start-Sleep -Milliseconds 50 }
-    exit 0
+    $side = Join-Path $output 'high-side.json'
+    Write-JsonFresh $side ([ordered]@{ pid=$PID; creation_filetime=[uint64](Get-Process -Id $PID).StartTime.ToFileTimeUtc(); integrity=$token.rid; status='starting'; runner_exit=$null })
+    $runnerProcess = Start-Process -FilePath $shell -ArgumentList (Join-ProcessArguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$runner,'-DataPath',(Join-Path $exec 'high-runner-data.json'))) -WorkingDirectory $exec -WindowStyle Hidden -PassThru
+    $runnerProcess.WaitForExit()
+    $sideState = Complete-HighSideState (Read-Json $side) ([int]$runnerProcess.ExitCode)
+    $sideState | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $side -Encoding UTF8
+    exit $runnerProcess.ExitCode
 }
-if ($Mode -eq 'client') {
-    $fixtureHost = Get-Content -LiteralPath $HostEvidence -Raw | ConvertFrom-Json
-    $alive = $null -ne (Get-Process -Id ([int]$fixtureHost.pid) -ErrorAction SilentlyContinue)
-    @{ hostAlive = $alive } | ConvertTo-Json | Set-Content -LiteralPath $Evidence -Encoding UTF8
-    exit 0
-}
-if ($Mode -eq 'args') {
-    @{ values = @($args) } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Evidence -Encoding UTF8
-    exit 0
-}
-if ($Mode -eq 'fail') { exit 9 }
-while ($true) { Start-Sleep -Milliseconds 50 }
-'@ | Set-Content -LiteralPath $child -Encoding UTF8
-    Assert-ProtectedExecutionPath $child
-    $stop = Join-Path $Root 'shared stop'
-    $hostEvidence = Join-Path $Root 'host evidence.json'
-    $highEvidence = Join-Path $Root 'high evidence.json'
-    $flag = Join-Path $executionRoot 'high client.flag'
-    $hostAudit = Join-Path $Root 'host runner audit.json'
-    $mediumHostRoot = New-ProtectedExecutionDirectory
-    $mediumClientRoot = New-ProtectedExecutionDirectory
-    Write-Host "SelfTest protected simulated Medium-host output dir: $mediumHostRoot"
-    Write-Host "SelfTest protected simulated Medium-client output dir: $mediumClientRoot"
-    $mediumHostStop = Join-Path $mediumHostRoot 'stop'
-    $mediumClientStop = Join-Path $mediumClientRoot 'stop'
-    $mediumFixture = Join-Path $mediumHostRoot 'fixture.json'
-    $mediumHostEvidence = Join-Path $mediumHostRoot 'medium host evidence.json'
-    $mediumEvidence = Join-Path $mediumClientRoot 'medium evidence.json'
-    $mediumHostAudit = Join-Path $mediumHostRoot 'medium host runner audit.json'
-    $mediumAudit = Join-Path $mediumClientRoot 'medium client runner audit.json'
-    $topologyOwned = New-Object System.Collections.Generic.List[object]
-    $childSpec = {
-        param([string]$Name, [string]$Mode, [string]$Evidence, [string]$OutputRoot = $Root, [string]$LocalStop = $stop, [string]$HostSource = $hostEvidence, [string]$Start = 'immediate')
-        $spec = [ordered]@{
-            name = $Name; exe = $shell; args = @('-NoProfile', '-File', $child, '-Mode', $Mode, '-Evidence', $Evidence, '-StopPath', $LocalStop, '-HostEvidence', $HostSource)
-            env = [ordered]@{}; start = $Start; stdout = (Join-Path $OutputRoot "$Name.out"); stderr = (Join-Path $OutputRoot "$Name.err")
-        }
-        if ($Start -eq 'flag') { $spec.flagPath = $flag }
-        return $spec
-    }
-    $hostData = New-RunnerData -RunDir $Root -WorkingDir $executionRoot -StopPath $stop -AuditPath $hostAudit -Children @(
-        (& $childSpec 'host' 'host' $hostEvidence $Root $stop $hostEvidence),
-        (& $childSpec 'high-client' 'client' $highEvidence $Root $stop $hostEvidence 'flag')
-    )
-    $hostData.timeoutSec = 15
-    $hostDataPath = Join-Path $executionRoot 'host runner data with spaces.json'
-    Write-ProtectedJson $hostDataPath $hostData
-    $hostRunner = Start-DiagRunner -Name 'selftest-host-runner' -Shell $shell -RunnerPath $runner -DataPath $hostDataPath -RunDir $executionRoot -AuditPath $hostAudit -ExpectedChildren @('host', 'high-client') -Owned $topologyOwned
-    $null = Wait-DiagJson -Path $hostEvidence -TimeoutSec 5 -Process $hostRunner
-
-    $mediumHostData = New-RunnerData -RunDir $mediumHostRoot -WorkingDir $executionRoot -StopPath $mediumHostStop -AuditPath $mediumHostAudit -SharedStopPath $stop -FixtureCopySource $hostEvidence -Children @(
-        (& $childSpec 'medium-host' 'host' $mediumHostEvidence $mediumHostRoot $mediumHostStop $mediumFixture)
-    )
-    $mediumHostData.timeoutSec = 15
-    $mediumHostDataPath = Join-Path $executionRoot 'medium host runner data with spaces.json'
-    Write-ProtectedJson $mediumHostDataPath $mediumHostData
-    $mediumHostRunner = Start-DiagRunner -Name 'selftest-medium-host-runner' -Shell $shell -RunnerPath $runner -DataPath $mediumHostDataPath -RunDir $executionRoot -AuditPath $mediumHostAudit -ExpectedChildren @('medium-host') -Owned $topologyOwned
-    $null = Wait-DiagJson -Path $mediumHostEvidence -TimeoutSec 5 -Process $mediumHostRunner
-    if (-not (Test-Path -LiteralPath $mediumFixture)) { throw 'medium host did not copy the protected high fixture before launch' }
-
-    $mediumData = New-RunnerData -RunDir $mediumClientRoot -WorkingDir $executionRoot -StopPath $mediumClientStop -AuditPath $mediumAudit -SharedStopPath $stop -Children @(
-        (& $childSpec 'medium-client' 'client' $mediumEvidence $mediumClientRoot $mediumClientStop $hostEvidence)
-    )
-    $mediumData.timeoutSec = 15
-    $mediumDataPath = Join-Path $executionRoot 'medium client runner data with spaces.json'
-    Write-ProtectedJson $mediumDataPath $mediumData
-    $mediumRunner = Start-DiagRunner -Name 'selftest-medium-client-runner' -Shell $shell -RunnerPath $runner -DataPath $mediumDataPath -RunDir $executionRoot -AuditPath $mediumAudit -ExpectedChildren @('medium-client') -Owned $topologyOwned
-    $null = Wait-DiagJson -Path $mediumEvidence -TimeoutSec 5 -Process $mediumRunner
-    if ((Stop-RetainedProcess -Record $mediumRunner -WaitMs 10000) -ne 0) { throw 'completed medium runner did not exit 0' }
-    if (Test-Path -LiteralPath $stop) { throw 'completed medium runner wrote the shared stop file' }
-    if (Test-Path -LiteralPath $mediumHostStop) { throw 'completed medium client stopped the medium host' }
-
-    if (Test-Path -LiteralPath $flag) { throw 'high client flag was visible before publication' }
-    Write-ProtectedJson $flag ([ordered]@{ pipe = 'selftest'; expected_pid = 1; expected_creation = 1 })
-    Assert-ProtectedExecutionPath $flag
-    $high = Wait-DiagJson -Path $highEvidence -TimeoutSec 5 -Process $hostRunner
-    if (-not [bool]$high.hostAlive) { throw 'completed medium runner stopped the host before high client ran' }
-    try {
-        Write-ProtectedJson $flag ([ordered]@{ pipe = 'replacement'; expected_pid = 2; expected_creation = 2 })
-        throw 'protected high client flag overwrite was accepted'
-    } catch {
-        if ("$_" -notlike '*protected JSON destination already exists*') { throw }
-    }
-    $publishedFlag = Read-JsonFile $flag
-    if ([string]$publishedFlag.pipe -ne 'selftest') { throw 'protected high client flag was overwritten' }
-    Set-Content -LiteralPath $stop -Value 'stop'
-    $relayDeadline = [datetime]::UtcNow.AddSeconds(5)
-    while (-not (Test-Path -LiteralPath $mediumHostStop)) {
-        if ([datetime]::UtcNow -ge $relayDeadline) { throw 'medium host did not relay the parent shared stop within 5 seconds' }
-        Start-Sleep -Milliseconds 50
-    }
-    $topologyCleanupErrors = @(Stop-OwnedProcesses -Owned $topologyOwned -WaitMs 10000)
-    if ($topologyCleanupErrors.Count -ne 0) { throw "zero-error coordinator cleanup failed: $($topologyCleanupErrors -join '; ')" }
-    $topologyAuditErrors = @(Assert-OwnedRunnerAudits $topologyOwned)
-    if ($topologyAuditErrors.Count -ne 0) { throw "successful runner audits failed: $($topologyAuditErrors -join '; ')" }
-    foreach ($path in @($Root, $mediumHostRoot, $mediumClientRoot, $hostEvidence, $highEvidence, $mediumFixture, $mediumHostEvidence, $mediumEvidence, $hostAudit, $mediumHostAudit, $mediumAudit, $mediumHostStop)) {
-        Assert-ProtectedExecutionPath $path
-    }
-    foreach ($entry in @(
-        [pscustomobject]@{ Name = 'host'; Root = $Root },
-        [pscustomobject]@{ Name = 'high-client'; Root = $Root },
-        [pscustomobject]@{ Name = 'medium-host'; Root = $mediumHostRoot },
-        [pscustomobject]@{ Name = 'medium-client'; Root = $mediumClientRoot }
-    )) {
-        $stdout = Join-Path $entry.Root "$($entry.Name).out"
-        $stderr = Join-Path $entry.Root "$($entry.Name).err"
-        Assert-ProtectedExecutionPath $stdout
-        Assert-ProtectedExecutionPath $stderr
-        if (-not [string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $stderr -Raw))) {
-            throw "$($entry.Name) child stderr was not empty"
-        }
-    }
-
-    $roundTripValues = @('', 'plain', 'with space', 'a"b', 'C:\trailing\', 'odd\"quote')
-    $directArgsEvidence = Join-Path $Root 'direct argv.json'
-    $directArgsStdout = Join-Path $Root 'direct argv.out'
-    $directArgsStderr = Join-Path $Root 'direct argv.err'
-    $directArgs = @('-NoProfile', '-File', $child, '-Mode', 'args', '-Evidence', $directArgsEvidence, '-StopPath', 'unused-stop', '-HostEvidence', 'unused-host') + $roundTripValues
-    $directArgsOwned = New-Object System.Collections.Generic.List[object]
-    try {
-        $directArgsProcess = Start-Process -FilePath $shell -ArgumentList (Join-ProcessArguments $directArgs) -PassThru -WindowStyle Hidden -RedirectStandardOutput $directArgsStdout -RedirectStandardError $directArgsStderr
-        if ($null -eq $directArgsProcess) { throw 'direct argv test returned no process handle' }
-        $directArgsRecord = New-DotNetProcessRecord -Name 'direct-argv' -Process $directArgsProcess
-        $directArgsOwned.Add($directArgsRecord) | Out-Null
-        $directArgsRecord.Pid = [uint32]$directArgsProcess.Id
-        $directArgsRecord.CreationFileTime = [uint64]$directArgsProcess.StartTime.ToFileTimeUtc()
-        if (-not $directArgsProcess.WaitForExit(10000)) { throw 'direct argv test did not exit within 10 seconds' }
-        if ($directArgsProcess.ExitCode -ne 0) { throw "direct argv test exited $($directArgsProcess.ExitCode)" }
-        $directArgsResult = Wait-DiagJson -Path $directArgsEvidence -TimeoutSec 5 -Process $directArgsRecord
-        if ((@($directArgsResult.values).Count -ne $roundTripValues.Count) -or (@($directArgsResult.values) -join "`n") -cne ($roundTripValues -join "`n")) { throw 'driver argument quoting did not round-trip' }
-        if ((Test-Path -LiteralPath $directArgsStderr) -and -not [string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $directArgsStderr -Raw))) { throw 'direct argv child stderr was not empty' }
-    } finally {
-        $directArgsCleanupErrors = @(Stop-OwnedProcesses -Owned $directArgsOwned -WaitMs 10000)
-        if ($directArgsCleanupErrors.Count -ne 0) { throw "direct argv cleanup failed: $($directArgsCleanupErrors -join '; ')" }
-    }
-
-    $runnerArgsEvidence = Join-Path $Root 'runner argv.json'
-    $runnerArgsAudit = Join-Path $Root 'runner argv audit.json'
-    $runnerArgsStop = Join-Path $Root 'runner argv stop'
-    $runnerChildArgs = @('-NoProfile', '-File', $child, '-Mode', 'args', '-Evidence', $runnerArgsEvidence, '-StopPath', 'unused-stop', '-HostEvidence', 'unused-host') + $roundTripValues
-    $runnerArgsData = New-RunnerData -RunDir $Root -WorkingDir $executionRoot -StopPath $runnerArgsStop -AuditPath $runnerArgsAudit -Children @(
-        [ordered]@{ name = 'argv-child'; exe = $shell; args = $runnerChildArgs; env = [ordered]@{}; start = 'immediate'; stdout = (Join-Path $Root 'argv-child.out'); stderr = (Join-Path $Root 'argv-child.err') }
-    )
-    $runnerArgsDataPath = Join-Path $executionRoot 'runner argv data.json'
-    Write-ProtectedJson $runnerArgsDataPath $runnerArgsData
-    $runnerArgsRunner = Start-DiagRunner -Name 'selftest-runner-argv' -Shell $shell -RunnerPath $runner -DataPath $runnerArgsDataPath -RunDir $executionRoot -AuditPath $runnerArgsAudit -ExpectedChildren @('argv-child') -Owned $selfOwned
-    $runnerArgsResult = Wait-DiagJson -Path $runnerArgsEvidence -TimeoutSec 5 -Process $runnerArgsRunner
-    if ((@($runnerArgsResult.values).Count -ne $roundTripValues.Count) -or (@($runnerArgsResult.values) -join "`n") -cne ($roundTripValues -join "`n")) { throw 'runner argument quoting did not round-trip' }
-    if ((Stop-RetainedProcess -Record $runnerArgsRunner -WaitMs 10000) -ne 0) { throw 'runner argv test did not exit 0' }
-    Assert-RunnerAudit -Path $runnerArgsAudit -ExpectedChildren @('argv-child') -Label 'runner argv'
-
-    $fastArtifact = Join-Path $Root 'fast complete.json'
-    Write-JsonAtomic $fastArtifact ([ordered]@{ complete = $true })
-    $fast = Start-Process -FilePath $shell -ArgumentList (Join-ProcessArguments @('-NoProfile', '-Command', 'exit 0')) -PassThru -WindowStyle Hidden
-    $fastRecord = New-DotNetProcessRecord -Name 'fast-exit' -Process $fast
-    $fast.WaitForExit()
-    $fastJson = Wait-DiagJson -Path $fastArtifact -TimeoutSec 5 -Process $fastRecord
-    if (-not [bool]$fastJson.complete) { throw 'completed exit-0 artifact was not accepted' }
-    $bad = Start-Process -FilePath $shell -ArgumentList (Join-ProcessArguments @('-NoProfile', '-Command', 'exit 7')) -PassThru -WindowStyle Hidden
-    $badRecord = New-DotNetProcessRecord -Name 'nonzero-exit' -Process $bad
-    $bad.WaitForExit()
-    try {
-        $null = Wait-DiagJson -Path $fastArtifact -TimeoutSec 5 -Process $badRecord
-        throw 'nonzero child artifact was accepted'
-    } catch {
-        if ("$_" -notlike '*child exited 7 while waiting*') { throw }
-    }
-
-    $failureStop = Join-Path $Root 'failure stop'
-    $failureAudit = Join-Path $Root 'failure audit.json'
-    $failureData = New-RunnerData -RunDir $Root -StopPath $failureStop -AuditPath $failureAudit -Children @(
-        (& $childSpec 'fails-first' 'fail' (Join-Path $Root 'fail evidence.json')),
-        (& $childSpec 'cleaned-second' 'hang' (Join-Path $Root 'hang evidence.json'))
-    )
-    $failureData.timeoutSec = 5
-    $failureDataPath = Join-Path $Root 'failure data.json'
-    Write-JsonAtomic $failureDataPath $failureData
-    $failure = Start-DiagRunner -Name 'selftest-failure-runner' -Shell $shell -RunnerPath $runner -DataPath $failureDataPath -RunDir $Root -AuditPath $failureAudit -ExpectedChildren @('fails-first', 'cleaned-second') -Owned $selfOwned
-    if ((Stop-RetainedProcess -Record $failure -WaitMs 15000) -eq 0) { throw 'early nonzero child did not fail runner' }
-    $failureEvidence = Read-JsonFile $failureAudit
-    if (@($failureEvidence.children).Count -ne 2 -or @($failureEvidence.children | Where-Object { $_.name -eq 'cleaned-second' -and $_.exited }).Count -ne 1) { throw 'runner did not continue cleanup after first child failure' }
-    if (Test-Path -LiteralPath $failureStop) { throw 'runner failure wrote the parent shared stop file' }
-
-    $metadataStop = Join-Path $Root 'metadata failure stop'
-    $metadataAudit = Join-Path $Root 'metadata failure audit.json'
-    $metadataData = New-RunnerData -RunDir $Root -StopPath $metadataStop -AuditPath $metadataAudit -Children @(
-        (& $childSpec 'metadata-child' 'hang' (Join-Path $Root 'metadata evidence.json'))
-    )
-    $metadataData.timeoutSec = 5
-    $metadataData.testFailStartTimeFor = 'metadata-child'
-    $metadataDataPath = Join-Path $Root 'metadata failure data.json'
-    Write-JsonAtomic $metadataDataPath $metadataData
-    $metadataFailure = Start-DiagRunner -Name 'selftest-metadata-failure-runner' -Shell $shell -RunnerPath $runner -DataPath $metadataDataPath -RunDir $Root -AuditPath $metadataAudit -ExpectedChildren @('metadata-child') -Owned $selfOwned
-    if ((Stop-RetainedProcess -Record $metadataFailure -WaitMs 15000) -eq 0) { throw 'StartTime metadata failure did not fail runner' }
-    $metadataEvidence = Read-JsonFile $metadataAudit
-    if (@($metadataEvidence.children).Count -ne 1 -or -not [bool]$metadataEvidence.children[0].exited) { throw 'StartTime metadata failure lost its launched child cleanup record' }
-
-    $parentMetadataOwned = New-Object System.Collections.Generic.List[object]
-    $script:TestFailRunnerStartTimeFor = 'selftest-parent-metadata-failure'
-    try {
-        $null = Start-DiagRunner -Name 'selftest-parent-metadata-failure' -Shell $shell -RunnerPath $runner -DataPath $metadataDataPath -RunDir $Root -AuditPath $metadataAudit -ExpectedChildren @('metadata-child') -Owned $parentMetadataOwned
-        throw 'injected parent StartTime failure was not raised'
-    } catch {
-        if ("$_" -notlike '*injected runner StartTime failure*') { throw }
-    } finally {
-        $script:TestFailRunnerStartTimeFor = $null
-    }
-    if ($parentMetadataOwned.Count -ne 1) { throw 'parent StartTime failure lost its retained wrapper handle' }
-    $null = Stop-RetainedProcess -Record $parentMetadataOwned[0] -WaitMs 15000
-
-    $timeoutStop = Join-Path $Root 'timeout stop'
-    $timeoutAudit = Join-Path $Root 'timeout audit.json'
-    $timeoutData = New-RunnerData -RunDir $Root -StopPath $timeoutStop -AuditPath $timeoutAudit -Children @(
-        (& $childSpec 'timed-out-child' 'hang' (Join-Path $Root 'timeout evidence.json'))
-    )
-    $timeoutData.timeoutSec = 1
-    $timeoutDataPath = Join-Path $Root 'timeout data.json'
-    Write-JsonAtomic $timeoutDataPath $timeoutData
-    $timeout = Start-DiagRunner -Name 'selftest-timeout-runner' -Shell $shell -RunnerPath $runner -DataPath $timeoutDataPath -RunDir $Root -AuditPath $timeoutAudit -ExpectedChildren @('timed-out-child') -Owned $selfOwned
-    if ((Stop-RetainedProcess -Record $timeout -WaitMs 15000) -eq 0) { throw 'runner deadline did not fail a hung child' }
-    $timeoutEvidence = Read-JsonFile $timeoutAudit
-    if (@($timeoutEvidence.failures | Where-Object { $_ -eq 'runner deadline exceeded' }).Count -ne 1) { throw 'runner timeout evidence missing' }
-    if (Test-Path -LiteralPath $timeoutStop) { throw 'runner timeout wrote the parent shared stop file' }
-
-    $auditFailureStop = Join-Path $Root 'audit failure stop'
-    $auditFailureData = New-RunnerData -RunDir $Root -StopPath $auditFailureStop -AuditPath (Join-Path $Root 'missing audit parent\audit.json') -Children @(
-        (& $childSpec 'audit-child' 'client' (Join-Path $Root 'audit child.json'))
-    )
-    $auditFailureData.timeoutSec = 5
-    $auditFailureDataPath = Join-Path $Root 'audit failure data.json'
-    Write-JsonAtomic $auditFailureDataPath $auditFailureData
-    $auditFailure = Start-DiagRunner -Name 'selftest-audit-failure-runner' -Shell $shell -RunnerPath $runner -DataPath $auditFailureDataPath -RunDir $Root -AuditPath $null -ExpectedChildren @() -Owned $selfOwned
-    if ((Stop-RetainedProcess -Record $auditFailure -WaitMs 10000) -eq 0) { throw 'audit write failure did not fail runner' }
-    if (Test-Path -LiteralPath $auditFailureStop) { throw 'audit failure wrote the parent shared stop file' }
-
-    $auditCases = @(
-        [pscustomobject]@{ Name = 'absent'; Path = (Join-Path $Root 'absent audit.json'); Text = $null; Pattern = '*audit missing*' },
-        [pscustomobject]@{ Name = 'corrupt'; Path = (Join-Path $Root 'corrupt audit.json'); Text = '{broken'; Pattern = '*audit corrupt*' },
-        [pscustomobject]@{ Name = 'nonzero'; Path = (Join-Path $Root 'nonzero audit.json'); Text = '{"exitCode":1,"failures":[],"expectedChildren":[],"children":[]}'; Pattern = '*audit exit 1*' }
-    )
-    foreach ($case in $auditCases) {
-        if ($null -ne $case.Text) { Set-Content -LiteralPath $case.Path -Value $case.Text -Encoding UTF8 }
-        try { Assert-RunnerAudit -Path $case.Path -ExpectedChildren @() -Label $case.Name; throw "$($case.Name) audit was accepted" } catch {
-            if ("$_" -notlike $case.Pattern) { throw }
-        }
-    }
-    $auditErrors = @(Assert-OwnedRunnerAudits @(
-        [pscustomobject]@{ Name = 'missing-audit-runner'; AuditPath = $auditCases[0].Path; ExpectedChildren = @() },
-        [pscustomobject]@{ Name = 'corrupt-audit-runner'; AuditPath = $auditCases[1].Path; ExpectedChildren = @() }
-    ))
-    if ($auditErrors.Count -ne 2 -or ($auditErrors -join '; ') -notlike '*missing-audit-runner*' -or ($auditErrors -join '; ') -notlike '*corrupt-audit-runner*') {
-        throw 'all runner audit failures were not preserved'
-    }
-}
-
 function Invoke-SelfTest {
-    Assert-ElevatedShell 'SelfTest'
-    if (-not (Test-OptInEnabled $null) -and -not (Test-OptInEnabled '') -and -not (Test-OptInEnabled '0') -and -not (Test-OptInEnabled 'true') -and (Test-OptInEnabled '1')) {
-        # fail-closed
-    } else {
-        throw 'opt-in fail-closed assertion failed'
-    }
-    $scope = New-DiagValScope
-    $pipe = Get-DiagValPipe $scope
-    if (-not (Test-IsolatedPipe $scope $pipe)) { throw 'unique scope was not isolated' }
-    if (Test-IsolatedPipe '' $DailyDriverPipe) { throw 'empty scope must be refused' }
-    if (Test-IsolatedPipe 'diagval' $DailyDriverPipe) { throw 'daily-driver pipe must be refused' }
-    if (Test-ExactPipe '') { throw 'missing exact pipe must be refused' }
-    if (Test-ExactPipe $DailyDriverPipe) { throw 'exact daily-driver pipe must be refused' }
-    if (-not (Test-ExactPipe $pipe)) { throw 'unique exact pipe must be accepted' }
-    if (Test-ExactPipe '\\.\pipe\leopardwm_acme_jose') { throw 'user production pipe must be refused' }
-    if (Test-ExactPipe '\\.\pipe\foo_leopardwm_diagval_x') { throw 'substring diagval pipe must be refused' }
-    if (Test-ExactPipe '\\server\pipe\leopardwm_diagval_x') { throw 'remote pipe must be refused' }
-    if (Test-IsolatedPipe 'acme_jose' '\\.\pipe\leopardwm_acme_jose') { throw 'user-scoped pipe must be refused' }
-    if (-not (Test-AllowedCommand 'HealthCheck')) { throw 'HealthCheck must be allowed' }
-    if (-not (Test-AllowedCommand 'QueryStatus')) { throw 'QueryStatus must be allowed' }
-    if (Test-AllowedCommand 'Stop') { throw 'Stop must be rejected' }
-    if (Test-AllowedCommand 'PanicRevert') { throw 'PanicRevert must be rejected' }
-    if (Test-AllowedCommand 'Subscribe') { throw 'Subscribe must be rejected' }
-    if (Test-DeadlineExceeded 1 2) { throw 'deadline too early' }
-    if (-not (Test-DeadlineExceeded 2 2)) { throw 'deadline inclusive' }
-    if (-not (Test-HighLinkedMediumLauncher $HighRid 2 $MediumRid)) { throw 'Full High launcher must use its own verified Medium linked token' }
-    if (Test-HighLinkedMediumLauncher $MediumRid 3 0) { throw 'Medium launcher must fail closed without UAC elevation' }
-    if (Test-HighLinkedMediumLauncher $HighRid 2 $HighRid) { throw 'High launcher must refuse non-Medium linked token' }
-    if (Test-HighLinkedMediumLauncher $HighRid 3 $MediumRid) { throw 'non-Full High launcher must refuse linked-token launch' }
-    if (Test-HighLinkedMediumLauncher 0x1000 1 0) { throw 'Low launcher must block' }
-    if ($null -ne (Get-DaemonIntegrityFromHealth $null)) { throw 'missing health must not invent a daemon RID' }
-    $missingHealth = [pscustomobject]@{ status = 'ok' }
-    if ($null -ne (Get-DaemonIntegrityFromHealth $missingHealth)) { throw 'non-health response must not invent a daemon RID' }
-    if (Test-FixtureIdentityComplete $null) { throw 'null fixture must fail' }
-    if (Test-FixtureIdentityComplete ([pscustomobject]@{ hwnd = 1; pid = 2; creation_filetime = 0; image = 'C:\x.exe' })) {
-        throw 'zero creation fixture must fail'
-    }
-    if (-not (Test-ClassificationsAgree 'HigherIntegrity' 'HigherIntegrity')) { throw 'matching classifications must agree' }
-    if (Test-ClassificationsAgree 'HigherIntegrity' 'No') { throw 'disagreeing classifications must fail' }
-    try {
-        Get-ExecutableFromCargoJson -Lines @('not json') -ExitCode 1 -Bin 'leopardwm'
-        throw 'cargo nonzero exit must fail'
-    } catch {
-        if ("$_" -notlike '*cargo test --no-run failed: 1*') { throw "unexpected cargo exit error: $_" }
-    }
-    $artifact = '{"reason":"compiler-artifact","profile":{"test":true},"target":{"name":"leopardwm"},"executable":"C:\\tmp\\leopardwm.exe"}'
-    $exe = Get-ExecutableFromCargoJson -Lines @('noise', $artifact) -ExitCode 0 -Bin 'leopardwm'
-    if ($exe -ne 'C:\tmp\leopardwm.exe') { throw 'cargo artifact parse failed' }
-    $tmp = New-ProtectedExecutionDirectory
-    Write-Host 'SelfTest simulates Medium roles with High processes; no linked token is launched.'
-    try {
-        Write-JsonAtomic (Join-Path $tmp 'ready.json') ([pscustomobject]@{ ready = $true; pid = 7 })
-        $ready = Wait-DiagJson -Path (Join-Path $tmp 'ready.json') -TimeoutSec 2 -Process $null
-        if ([int]$ready.pid -ne 7) { throw 'atomic json wait failed' }
-        try {
-            Assert-HealthDaemonRid $null $HighRid 'missing'
-            throw 'missing health matrix must fail'
-        } catch {
-            if ("$_" -notlike '*HealthInfo missing*') { throw "unexpected matrix error: $_" }
-        }
-        try { Stop-RetainedProcess -Record $null -WaitMs 10; throw 'null retained handle must fail' } catch {
-            if ("$_" -notlike '*missing retained process handle*') { throw "unexpected stop error: $_" }
-        }
-        if (Test-WindowExists 0) { throw 'HWND 0 must not exist' }
-        $runner = Join-Path $RepoRoot 'tools\diagnostics_validation_runner.ps1'
-        if (-not (Test-Path -LiteralPath $runner)) { throw "bounded runner missing: $runner" }
-        Invoke-RunnerOrchestrationSelfTest $tmp
-        Write-Host "diagnostics_validation SelfTest ok; protected High evidence at $tmp"
-        Write-Host 'Artifacts are retained intentionally; cleanup requires an elevated shell.'
-    } catch {
-        Write-Host "diagnostics_validation SelfTest evidence left at protected High path $tmp"
-        Write-Host 'Artifacts are retained intentionally; cleanup requires an elevated shell.'
-        throw
-    }
-}
-
-function Invoke-NativeValidation {
-    Write-Host 'NATIVE VALIDATION IS PARENT-OWNED AFTER SAFETY INSPECTION.'
-    Write-Host $Gap
-    $savedEnv = Save-ProcessEnv $LeopardWmEnvNames
-    $runDir = $null
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("leopardwm-diagval-selftest-" + (New-RunId))
+    New-Item -ItemType Directory -Path $root | Out-Null
+    Write-Host "SelfTest simulates Medium and High roles; it does not request UAC or claim actual High evidence: $root"
+    if (-not (Test-ExactPipe (Get-Pipe (New-Scope))) -or (Test-ExactPipe $DailyDriverPipe) -or (Test-ExactPipe '\\server\pipe\leopardwm_diagval_x')) { throw 'exact pipe validation failed' }
+    if (-not (Test-DescendantPath 'C:\Temp\owned-high' 'C:\Temp\owned-high\output') -or (Test-DescendantPath 'C:\Temp\owned-high' 'C:\Temp\owned-high-sibling\output') -or (Test-DescendantPath 'C:\Temp\owned-high' 'C:\Temp\owned-high\..\escape')) { throw 'High destination boundary validation failed' }
+    $sideState = Complete-HighSideState ([pscustomobject]@{ status='starting'; runner_exit=$null }) 0
+    if ([string]$sideState.status -ne 'exited' -or [int]$sideState.runner_exit -ne 0) { throw 'High side-state finalization failed' }
+    $sample = Join-Path $root 'pinned.txt'; [IO.File]::WriteAllText($sample, 'pinned'); $hash = Get-Sha256 $sample; if ($hash -ne (Get-Sha256 $sample)) { throw 'pin integrity baseline failed' }; [IO.File]::WriteAllText($sample, 'substituted'); if ($hash -eq (Get-Sha256 $sample)) { throw 'substituted immutable input was accepted' }
+    $dependencyRoot = New-FreshDirectory $root 'dependency-fixtures'
+    $zeroDirectory = New-FreshDirectory $dependencyRoot 'zero'
+    $zeroExecutable = Join-Path $zeroDirectory 'zero.exe'
+    [IO.File]::WriteAllText($zeroExecutable, 'zero')
+    $zeroDependencies = Get-ArtifactDependencies @($zeroExecutable)
+    if ($zeroDependencies.GetType() -ne [object[]] -or $zeroDependencies.Count -ne 0) { throw 'empty dependency set did not remain an array' }
+    $emptyDependencySpec = @{ dependencies = $zeroDependencies } | ConvertTo-Json -Compress | ConvertFrom-Json
+    if ($null -eq $emptyDependencySpec.dependencies -or @($emptyDependencySpec.dependencies).Count -ne 0) { throw 'empty dependency set became null in the frozen specification' }
+    $oneDirectory = New-FreshDirectory $dependencyRoot 'one'
+    $oneExecutable = Join-Path $oneDirectory 'one.exe'
+    [IO.File]::WriteAllText($oneExecutable, 'one')
+    [IO.File]::WriteAllText((Join-Path $oneDirectory 'one.dll'), 'one dependency')
+    $oneDependencies = Get-ArtifactDependencies @($oneExecutable)
+    if ($oneDependencies.GetType() -ne [object[]] -or $oneDependencies.Count -ne 1 -or [string]$oneDependencies[0].destination -ne 'one.dll') { throw 'single dependency discovery failed' }
+    $multipleDirectory = New-FreshDirectory $dependencyRoot 'multiple'
+    $firstExecutable = Join-Path $multipleDirectory 'first.exe'
+    $secondExecutable = Join-Path $multipleDirectory 'second.exe'
+    [IO.File]::WriteAllText($firstExecutable, 'first')
+    [IO.File]::WriteAllText($secondExecutable, 'second')
+    [IO.File]::WriteAllText((Join-Path $multipleDirectory 'alpha.dll'), 'alpha')
+    [IO.File]::WriteAllText((Join-Path $multipleDirectory 'beta.dll'), 'beta')
+    $multipleDependencies = Get-ArtifactDependencies @($firstExecutable, $secondExecutable)
+    $multipleNames = @($multipleDependencies | ForEach-Object { [string]$_.destination } | Sort-Object)
+    if ($multipleDependencies.GetType() -ne [object[]] -or $multipleDependencies.Count -ne 2 -or ($multipleNames -join '|') -cne 'alpha.dll|beta.dll') { throw 'multiple or duplicate-samehash dependency discovery failed' }
+    $conflictOne = New-FreshDirectory $dependencyRoot 'conflict-one'
+    $conflictTwo = New-FreshDirectory $dependencyRoot 'conflict-two'
+    $conflictExecutableOne = Join-Path $conflictOne 'one.exe'
+    $conflictExecutableTwo = Join-Path $conflictTwo 'two.exe'
+    [IO.File]::WriteAllText($conflictExecutableOne, 'one')
+    [IO.File]::WriteAllText($conflictExecutableTwo, 'two')
+    [IO.File]::WriteAllText((Join-Path $conflictOne 'shared.dll'), 'first bytes')
+    [IO.File]::WriteAllText((Join-Path $conflictTwo 'shared.dll'), 'second bytes')
+    try { Get-ArtifactDependencies @($conflictExecutableOne, $conflictExecutableTwo); throw 'conflicting dependency basename was accepted' } catch { if ("$_" -notlike '*conflicting DLL dependency bytes*') { throw } }
+    Write-Host 'SelfTest verified empty, single, multiple, duplicate-samehash, and conflicting dependency discovery'
+    $child = Join-Path $root 'child.ps1'
+    @'
+param([string]$Mode,[string]$Evidence,[string]$StopPath)
+if($Mode -eq 'host') { @{pid=$PID;ready=$true}|ConvertTo-Json|Set-Content -LiteralPath $Evidence; while(-not(Test-Path -LiteralPath $StopPath)){Start-Sleep -Milliseconds 25}; exit 0 }
+if($Mode -eq 'client') { @{pid=$PID;client=$true}|ConvertTo-Json|Set-Content -LiteralPath $Evidence; exit 0 }
+if($Mode -eq 'fail'){exit 9}; while($true){Start-Sleep -Milliseconds 25}
+'@ | Set-Content -LiteralPath $child -Encoding UTF8
+    $runner = Join-Path $RepoRoot 'tools\diagnostics_validation_runner.ps1'
+    $shell = (Get-Process -Id $PID).Path
+    $bootstrap = Join-Path $RepoRoot 'tools\diagnostics_validation_uac_bootstrap.ps1'
+    $bootstrapCommand = "`$FrozenSpecPath='selftest';`$FrozenSpecHash='selftest';`$BootstrapTestOnly=`$true;. $(ConvertTo-PsLiteral $bootstrap)"
+    & $shell -NoProfile -Command $bootstrapCommand
+    if ($LASTEXITCODE -ne 0) { throw 'bootstrap helper self-test failed' }
     $owned = New-Object System.Collections.Generic.List[object]
-    $nativeError = $null
     try {
-        $launcher = Get-CurrentTokenInfo
-        $launcherRid = if ($null -eq $launcher) { $null } else { $launcher.Rid }
-        $launcherElevationType = if ($null -eq $launcher) { 0 } else { $launcher.ElevationType }
-        $linkedRid = $null
-        if ($launcherRid -eq $HighRid -and $launcherElevationType -eq 2) {
-            $linked = Get-OwnLinkedMediumToken
-            try { $linkedRid = Get-TokenIntegrityRid $linked } finally { [void][DiagValToken]::CloseHandle($linked) }
-        }
-        if (-not (Test-HighLinkedMediumLauncher $launcherRid $launcherElevationType $linkedRid)) {
-            throw 'launcher must be Full High with its own verified Medium linked token; refusing UAC or any other token source'
-        }
-        $runDir = New-ProtectedExecutionDirectory
-        Write-Host "protected High evidence dir: $runDir"
-        Write-JsonAtomic (Join-Path $runDir 'launcher.json') ([pscustomobject]@{
-            oracle_integrity_rid = $launcherRid
-            elevation_type       = $launcherElevationType
-            linked_integrity_rid = $linkedRid
-            gap                  = $Gap
-        })
-
-        $scopeHigh = New-DiagValScope
-        $scopeMedium = New-DiagValScope
-        $pipeHigh = Get-DiagValPipe $scopeHigh
-        $pipeMedium = Get-DiagValPipe $scopeMedium
-        if (-not (Test-IsolatedPipe $scopeHigh $pipeHigh) -or -not (Test-IsolatedPipe $scopeMedium $pipeMedium)) {
-            throw 'generated pipe was not isolated'
-        }
-
-        $daemonSrc = Get-TestExecutable -Package 'leopardwm-daemon' -Bin 'leopardwm' -RepoRoot $RepoRoot -LogPath (Join-Path $runDir 'cargo-daemon.json')
-        $cliSrc = Get-TestExecutable -Package 'leopardwm-cli' -Bin 'leopardwm-cli' -RepoRoot $RepoRoot -LogPath (Join-Path $runDir 'cargo-cli.json')
-        $executionDir = New-ProtectedExecutionDirectory
-        Write-Host "protected execution dir: $executionDir"
-        $daemonExe = Join-Path $executionDir 'daemon-test.exe'
-        $cliExe = Join-Path $executionDir 'cli-test.exe'
-        $runnerPath = Join-Path $executionDir 'diagnostics_validation_runner.ps1'
-        Copy-TrustedFileToProtected -Source $daemonSrc -Destination $daemonExe
-        Copy-TrustedFileToProtected -Source $cliSrc -Destination $cliExe
-        Copy-TrustedFileToProtected -Source (Join-Path $RepoRoot 'tools\diagnostics_validation_runner.ps1') -Destination $runnerPath
-
-        $testArgs = @(
-            '--ignored',
-            '--exact',
-            'diagnostics_validation::diagnostics_validation_native',
-            '--test-threads=1',
-            '--nocapture'
-        )
-        $shell = (Get-Process -Id $PID).Path
-        $stopPath = Join-Path $runDir 'stop'
-        $mediumRootBase = Join-Path ([IO.Path]::GetTempPath()) ("leopardwm-diagval-medium-" + [guid]::NewGuid().ToString('N'))
-        $mediumHostRunDir = Join-Path $mediumRootBase 'host'
-        $mediumClientRunDir = Join-Path $mediumRootBase 'client'
-        $mediumHostStopPath = Join-Path $mediumHostRunDir 'stop'
-        $mediumClientStopPath = Join-Path $mediumClientRunDir 'stop'
-        $highFlagPath = Join-Path $executionDir 'run-high-client.flag'
-
-        $elevatedDataPath = Join-Path $executionDir 'high-data.json'
-        Write-ProtectedJson $elevatedDataPath (New-RunnerData -RunDir $runDir -WorkingDir $executionDir -StopPath $stopPath -AuditPath (Join-Path $runDir 'elevated-audit.json') -Children @(
-            [ordered]@{
-                name   = 'high-host'
-                exe    = $daemonExe
-                args   = $testArgs
-                env    = New-HostEnv -RunDir $runDir -Scope $scopeHigh -Prefix 'high-host' -OwnHwnd '1'
-                start  = 'immediate'
-                stdout = Join-Path $runDir 'high-host.out'
-                stderr = Join-Path $runDir 'high-host.err'
-            },
-            [ordered]@{
-                name     = 'high-client'
-                exe      = $cliExe
-                args     = $testArgs
-                env      = New-ClientEnv -RunDir $runDir -Prefix 'high-client'
-                start    = 'flag'
-                flagPath = $highFlagPath
-                stdout   = Join-Path $runDir 'high-client.out'
-                stderr   = Join-Path $runDir 'high-client.err'
-            }
-        ))
-        Assert-ProtectedExecutionPath $elevatedDataPath
-
-        $highAudit = Join-Path $runDir 'elevated-audit.json'
-        $highRunner = Start-DiagRunner -Name 'high-runner' -Shell $shell -RunnerPath $runnerPath -DataPath $elevatedDataPath -RunDir $executionDir -AuditPath $highAudit -ExpectedChildren @('high-host', 'high-client') -Owned $owned
-        Write-JsonAtomic (Join-Path $runDir 'high-wrapper.json') ([pscustomobject]@{ pid = $highRunner.Pid; creation_filetime = $highRunner.CreationFileTime; image = $shell; execution_dir = $executionDir })
-        $parentDeadline = [datetime]::UtcNow.AddSeconds(70)
-
-        $null = Wait-NativeEvidence -Path (Join-Path $runDir 'fixture.json') -Process $highRunner -Deadline $parentDeadline -Phase 'high fixture'
-        $highHost = Wait-NativeEvidence -Path (Join-Path $runDir 'high-host.json') -Process $highRunner -Deadline $parentDeadline -Phase 'high host'
-        $null = Wait-NativeEvidence -Path (Join-Path $runDir 'high-host-ready.json') -Process $highRunner -Deadline $parentDeadline -Phase 'high host readiness'
-
-        $mediumDataPath = Join-Path $executionDir 'medium-host-data.json'
-        $highFixturePath = Join-Path $runDir 'fixture.json'
-        Write-ProtectedJson $mediumDataPath (New-RunnerData -RunDir $mediumHostRunDir -WorkingDir $executionDir -StopPath $mediumHostStopPath -AuditPath (Join-Path $mediumHostRunDir 'medium-host-audit.json') -CreateRunDir -SharedStopPath $stopPath -FixtureCopySource $highFixturePath -Children @(
-            [ordered]@{
-                name   = 'medium-host'
-                exe    = $daemonExe
-                args   = $testArgs
-                env    = New-HostEnv -RunDir $mediumHostRunDir -Scope $scopeMedium -Prefix 'medium-host' -OwnHwnd '0'
-                start  = 'immediate'
-                stdout = Join-Path $mediumHostRunDir 'medium-host.out'
-                stderr = Join-Path $mediumHostRunDir 'medium-host.err'
-            }
-        ))
-        Assert-ProtectedExecutionPath $mediumDataPath
-        $mediumHostAudit = Join-Path $mediumHostRunDir 'medium-host-audit.json'
-        Write-Host "Medium host evidence dir will be created by the linked Medium runner: $mediumHostRunDir"
-        $mediumHostRunner = Start-LinkedTokenDiagRunner -Name 'medium-host-runner' -Shell $shell -RunnerPath $runnerPath -DataPath $mediumDataPath -RunDir $executionDir -AuditPath $mediumHostAudit -ExpectedChildren @('medium-host') -Owned $owned
-        $mediumHost = Wait-NativeEvidence -Path (Join-Path $mediumHostRunDir 'medium-host.json') -Process $mediumHostRunner -Deadline $parentDeadline -Phase 'medium host'
-
-        $mediumClientDataPath = Join-Path $executionDir 'medium-client-data.json'
-        $mediumClientEnv = New-ClientEnv -RunDir $mediumClientRunDir -Prefix 'medium-client'
-        $mediumClientEnv['LEOPARDWM_DIAGNOSTICS_PIPE'] = $pipeHigh
-        $mediumClientEnv['LEOPARDWM_DIAGNOSTICS_EXPECTED_SERVER_PID'] = [string]$highHost.pid
-        $mediumClientEnv['LEOPARDWM_DIAGNOSTICS_EXPECTED_SERVER_CREATION'] = [string]$highHost.creation_filetime
-        Write-ProtectedJson $mediumClientDataPath (New-RunnerData -RunDir $mediumClientRunDir -WorkingDir $executionDir -StopPath $mediumClientStopPath -AuditPath (Join-Path $mediumClientRunDir 'medium-client-audit.json') -CreateRunDir -SharedStopPath $stopPath -Children @(
-            [ordered]@{
-                name   = 'medium-client'
-                exe    = $cliExe
-                args   = $testArgs
-                env    = $mediumClientEnv
-                start  = 'immediate'
-                stdout = Join-Path $mediumClientRunDir 'medium-client.out'
-                stderr = Join-Path $mediumClientRunDir 'medium-client.err'
-            }
-        ))
-        Assert-ProtectedExecutionPath $mediumClientDataPath
-        $mediumClientAudit = Join-Path $mediumClientRunDir 'medium-client-audit.json'
-        Write-Host "Medium client evidence dir will be created by the linked Medium runner: $mediumClientRunDir"
-        $mediumClientRunner = Start-LinkedTokenDiagRunner -Name 'medium-client-runner' -Shell $shell -RunnerPath $runnerPath -DataPath $mediumClientDataPath -RunDir $executionDir -AuditPath $mediumClientAudit -ExpectedChildren @('medium-client') -Owned $owned
-        $null = Wait-NativeEvidence -Path (Join-Path $mediumClientRunDir 'medium-client.json') -Process $mediumClientRunner -Deadline $parentDeadline -Phase 'medium client'
-
-        Write-ProtectedJson $highFlagPath ([pscustomobject]@{
-            pipe               = $pipeMedium
-            expected_pid       = $mediumHost.pid
-            expected_creation  = $mediumHost.creation_filetime
-        })
-        Assert-ProtectedExecutionPath $highFlagPath
-        $null = Wait-NativeEvidence -Path (Join-Path $runDir 'high-client.json') -Process $highRunner -Deadline $parentDeadline -Phase 'high client'
-
-        Assert-NativeMatrix -HighRunDir $runDir -MediumHostRunDir $mediumHostRunDir -MediumClientRunDir $mediumClientRunDir
-        $fixture = Read-JsonFile (Join-Path $runDir 'fixture.json')
-        Set-Content -LiteralPath $stopPath -Value 'stop'
-        $successCleanupErrors = @(Stop-OwnedProcesses -Owned $owned -WaitMs 25000)
-        if ($successCleanupErrors.Count -ne 0) { throw ($successCleanupErrors -join '; ') }
-        $successAuditErrors = @(Assert-OwnedRunnerAudits $owned)
-        if ($successAuditErrors.Count -ne 0) { throw ($successAuditErrors -join '; ') }
-        if (Test-WindowExists ([uint64]$fixture.hwnd)) { throw 'fixture HWND still exists after stop' }
-        Write-Host "native pipeline passed; evidence left at $runDir"
+    $highOut=New-FreshDirectory $root 'simulated-high-evidence'; $mediumOut=New-FreshDirectory $root 'simulated-medium-evidence'; if ($highOut -eq $mediumOut) { throw 'role evidence separation failed' }
+    $handoffPipe=Get-Pipe ("diagval_handoff_"+(New-RunId)); $runId=New-RunId; $expectedServerPipe=Get-Pipe (New-Scope); $stop=Join-Path $highOut 'stop'; $audit=Join-Path $highOut 'audit.json'; $hostEvidence=Join-Path $highOut 'host.json'; $clientEvidence=Join-Path $highOut 'client.json'
+    $controller=[ordered]@{pid=$PID;creation_filetime=[uint64](Get-Process -Id $PID).StartTime.ToFileTimeUtc();image=$shell}
+    function Invoke-RejectedHandoffSelfTest([string]$Label, $PayloadFactory) {
+        $caseRoot = New-FreshDirectory $root ("handoff-$Label-evidence")
+        $casePipe = Get-Pipe ("diagval_handoff_" + (New-RunId))
+        $caseRunId = New-RunId
+        $caseServerPipe = Get-Pipe (New-Scope)
+        $caseStop = Join-Path $caseRoot 'stop'
+        $caseAudit = Join-Path $caseRoot 'audit.json'
+        $caseHost = Join-Path $caseRoot 'host.json'
+        $caseHostSpec = [ordered]@{ name='rejected-host'; exe=$shell; args=@('-NoProfile','-File',$child,'-Mode','host','-Evidence',$caseHost,'-StopPath',$caseStop); env=@{}; start='immediate'; stdout=(Join-Path $caseRoot 'host.out'); stderr=(Join-Path $caseRoot 'host.err') }
+        $caseClientSpec = [ordered]@{ name='rejected-client'; exe=$shell; args=@('-NoProfile','-File',$child,'-Mode','client','-Evidence',(Join-Path $caseRoot 'client.json'),'-StopPath',$caseStop); env=@{}; start='handoff'; stopAfterExit=$true; stdout=(Join-Path $caseRoot 'client.out'); stderr=(Join-Path $caseRoot 'client.err') }
+        $caseData = New-RunnerData $caseRoot $root $caseStop $caseAudit @($caseHostSpec,$caseClientSpec) $controller ([ordered]@{pipe=$casePipe;run_id=$caseRunId;server_pipe=$caseServerPipe}) 15
+        $caseDataPath = Join-Path $root "handoff-$Label.json"
+        Write-JsonFresh $caseDataPath $caseData
+        $caseControl = New-HandoffControlServer $casePipe
+        try {
+            $caseRunner = Start-Runner "handoff-$Label" $shell $runner $caseDataPath $root $caseAudit $owned
+            $null = Wait-Json $caseHost $caseRunner ([datetime]::UtcNow.AddSeconds(8)) "$Label host readiness"
+            Wait-HandoffReceiver $caseControl $caseRunner ([datetime]::UtcNow.AddSeconds(8))
+            $casePayload = & $PayloadFactory $caseRunId $caseServerPipe
+            if ($Label -eq 'oversize') {
+                $caseBytes = [Text.Encoding]::UTF8.GetBytes($casePayload)
+                $caseControl.Write($caseBytes, 0, $caseBytes.Length)
+                $caseControl.Flush()
+                $caseControl.Dispose()
+                $caseControl = $null
+            } else { Send-HandoffPayload $caseControl $casePayload $caseRunner }
+            $null = Wait-Json $caseAudit $caseRunner ([datetime]::UtcNow.AddSeconds(12)) "$Label cleanup audit"
+            $caseEvidence = Read-Json $caseAudit
+            $hostAudit = @($caseEvidence.children | Where-Object { [string]$_.name -eq 'rejected-host' })
+            if ([int]$caseEvidence.exitCode -eq 0 -or @($caseEvidence.failures).Count -eq 0 -or $hostAudit.Count -ne 1 -or -not [bool]$hostAudit[0].exited) { throw "$Label handoff was accepted or did not clean its retained host" }
+            Write-Host "SelfTest rejected $Label handoff and cleaned its retained host"
+        } finally { if ($null -ne $caseControl) { $caseControl.Dispose() } }
+    }
+    function Invoke-CancelledHandoffSelfTest {
+        $caseRoot = New-FreshDirectory $root 'handoff-cancelled-evidence'
+        $casePipe = Get-Pipe ("diagval_handoff_" + (New-RunId))
+        $caseRunId = New-RunId
+        $caseServerPipe = Get-Pipe (New-Scope)
+        $caseStop = Join-Path $caseRoot 'stop'
+        $caseAudit = Join-Path $caseRoot 'audit.json'
+        $caseHost = Join-Path $caseRoot 'host.json'
+        $caseHostSpec = [ordered]@{ name='cancelled-host'; exe=$shell; args=@('-NoProfile','-File',$child,'-Mode','host','-Evidence',$caseHost,'-StopPath',$caseStop); env=@{}; start='immediate'; stdout=(Join-Path $caseRoot 'host.out'); stderr=(Join-Path $caseRoot 'host.err') }
+        $caseClientSpec = [ordered]@{ name='cancelled-client'; exe=$shell; args=@('-NoProfile','-File',$child,'-Mode','client','-Evidence',(Join-Path $caseRoot 'client.json'),'-StopPath',$caseStop); env=@{}; start='handoff'; stopAfterExit=$true; stdout=(Join-Path $caseRoot 'client.out'); stderr=(Join-Path $caseRoot 'client.err') }
+        $caseData = New-RunnerData $caseRoot $root $caseStop $caseAudit @($caseHostSpec,$caseClientSpec) $controller ([ordered]@{pipe=$casePipe;run_id=$caseRunId;server_pipe=$caseServerPipe}) 15
+        $caseDataPath = Join-Path $root 'handoff-cancelled.json'
+        Write-JsonFresh $caseDataPath $caseData
+        $caseControl = New-HandoffControlServer $casePipe
+        try {
+            $caseRunner = Start-Runner 'handoff-cancelled' $shell $runner $caseDataPath $root $caseAudit $owned
+            $null = Wait-Json $caseHost $caseRunner ([datetime]::UtcNow.AddSeconds(8)) 'cancelled host readiness'
+            Wait-HandoffReceiver $caseControl $caseRunner ([datetime]::UtcNow.AddSeconds(8))
+            $caseControl.Dispose()
+            $caseControl = $null
+            $null = Wait-Json $caseAudit $caseRunner ([datetime]::UtcNow.AddSeconds(12)) 'cancelled handoff audit'
+            $caseEvidence = Read-Json $caseAudit
+            if ([int]$caseEvidence.exitCode -eq 0 -or @($caseEvidence.failures).Count -eq 0) { throw 'cancelled handoff was accepted' }
+            Write-Host 'SelfTest rejected a cancelled Medium control server'
+        } finally { if ($null -ne $caseControl) { $caseControl.Dispose() } }
+    }
+    $specHost=[ordered]@{name='simulated-high-host';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','host','-Evidence',$hostEvidence,'-StopPath',$stop);env=@{};start='immediate';stdout=(Join-Path $highOut 'host.out');stderr=(Join-Path $highOut 'host.err')}
+    $specClient=[ordered]@{name='simulated-high-client';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','client','-Evidence',$clientEvidence,'-StopPath',$stop);env=@{};start='handoff';stopAfterExit=$true;stdout=(Join-Path $highOut 'client.out');stderr=(Join-Path $highOut 'client.err')}
+    $data=New-RunnerData $highOut $root $stop $audit @($specHost,$specClient) $controller ([ordered]@{pipe=$handoffPipe;run_id=$runId;server_pipe=$expectedServerPipe}) 15; $dataPath=Join-Path $root 'runner.json'; Write-JsonFresh $dataPath $data
+    $handoffControl = New-HandoffControlServer $handoffPipe
+    try {
+        $record=Start-Runner 'simulated-high-runner' $shell $runner $dataPath $root $audit $owned; $deadline=[datetime]::UtcNow.AddSeconds(8); $null=Wait-Json $hostEvidence $record $deadline 'simulated High host'; if(Test-Path $clientEvidence){throw 'High client started before ready/server-identity handoff'}
+        Wait-HandoffReceiver $handoffControl $record ([datetime]::UtcNow.AddSeconds(8))
+        try { Send-ServerIdentity $handoffControl ('0'*32) (Get-Pipe (New-Scope)) 1 1 $record } catch { throw "wrong-run handoff transport failed: $_" }
+        # The rejected runner proves malformed/wrong-run handling; a fresh runner proves valid ordering.
+        $null=Wait-Json $audit $record ([datetime]::UtcNow.AddSeconds(12)) 'wrong-run cleanup audit'
+        $badAudit=Read-Json $audit; if([int]$badAudit.exitCode -eq 0 -or @($badAudit.failures).Count -eq 0){throw 'wrong-run handoff did not fail and clean simulated High children'}
+        Write-Host 'SelfTest rejected wrong-run handoff and cleaned its retained host'
+    } finally { $handoffControl.Dispose() }
+    Invoke-RejectedHandoffSelfTest 'wrong-server-pipe' { param($run, $pipe) @{kind='server_identity';run_id=$run;pipe=(Get-Pipe (New-Scope));expected_pid=1;expected_creation=1} | ConvertTo-Json -Compress }
+    Invoke-RejectedHandoffSelfTest 'extra-field' { param($run, $pipe) @{kind='server_identity';run_id=$run;pipe=$pipe;expected_pid=1;expected_creation=1;unexpected='no'} | ConvertTo-Json -Compress }
+    Invoke-RejectedHandoffSelfTest 'missing-identity' { param($run, $pipe) @{kind='server_identity';run_id=$run;pipe=$pipe;expected_pid=1} | ConvertTo-Json -Compress }
+    Invoke-RejectedHandoffSelfTest 'oversize' { param($run, $pipe) return ('x' * 4097) }
+    Invoke-CancelledHandoffSelfTest
+    $receiverControl = New-HandoffControlServer (Get-Pipe ("diagval_handoff_" + (New-RunId)))
+    try {
+        $receiverProcess = Start-Process -FilePath $shell -ArgumentList (Join-ProcessArguments @('-NoProfile','-Command','exit 0')) -PassThru
+        $receiverRecord = New-ProcessRecord 'dead-handoff-receiver' $receiverProcess
+        $owned.Add($receiverRecord) | Out-Null
+        $null = Complete-ProcessRecord $receiverRecord
+        $receiverProcess.WaitForExit() | Out-Null
+        try { Wait-HandoffReceiver $receiverControl $receiverRecord ([datetime]::UtcNow.AddSeconds(2)); throw 'dead receiver was accepted' } catch { if ("$_" -notlike '*handoff receiver exited*') { throw } }
+        Write-Host 'SelfTest detected a dead High handoff receiver'
+    } finally { $receiverControl.Dispose() }
+    $unavailableOut = New-FreshDirectory $root 'handoff-unavailable-evidence'
+    $unavailablePipe = Get-Pipe ("diagval_handoff_" + (New-RunId))
+    $unavailableStop = Join-Path $unavailableOut 'stop'
+    $unavailableAudit = Join-Path $unavailableOut 'audit.json'
+    $unavailableHost = [ordered]@{name='unavailable-host';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','host','-Evidence',(Join-Path $unavailableOut 'host.json'),'-StopPath',$unavailableStop);env=@{};start='immediate';stdout=(Join-Path $unavailableOut 'host.out');stderr=(Join-Path $unavailableOut 'host.err')}
+    $unavailableClient = [ordered]@{name='unavailable-client';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','client','-Evidence',(Join-Path $unavailableOut 'client.json'),'-StopPath',$unavailableStop);env=@{};start='handoff';stopAfterExit=$true;stdout=(Join-Path $unavailableOut 'client.out');stderr=(Join-Path $unavailableOut 'client.err')}
+    $unavailableData = New-RunnerData $unavailableOut $root $unavailableStop $unavailableAudit @($unavailableHost,$unavailableClient) $controller ([ordered]@{pipe=$unavailablePipe;run_id=(New-RunId);server_pipe=(Get-Pipe (New-Scope))}) 1
+    $unavailablePath = Join-Path $root 'handoff-unavailable.json'
+    Write-JsonFresh $unavailablePath $unavailableData
+    $unavailable = Start-Runner 'handoff-unavailable' $shell $runner $unavailablePath $root $unavailableAudit $owned
+    $null = Wait-Json $unavailableAudit $unavailable ([datetime]::UtcNow.AddSeconds(10)) 'unavailable handoff audit'
+    $unavailableEvidence = Read-Json $unavailableAudit
+    if ([int]$unavailableEvidence.exitCode -eq 0 -or (@($unavailableEvidence.failures) -join '; ') -notlike '*connecting for server identity*') { throw 'unavailable Medium control server did not time out truthfully' }
+    Write-Host 'SelfTest timed out when the Medium control server disappeared'
+    $successOut=New-FreshDirectory $root 'simulated-high-success-evidence'; $successPipe=Get-Pipe ("diagval_handoff_"+(New-RunId)); $successRun=New-RunId; $successServerPipe=Get-Pipe (New-Scope); $successStop=Join-Path $successOut 'stop'; $successAudit=Join-Path $successOut 'audit.json'; $successHost=Join-Path $successOut 'host.json'; $successClient=Join-Path $successOut 'client.json'
+    $successHostSpec=[ordered]@{name='successful-high-host';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','host','-Evidence',$successHost,'-StopPath',$successStop);env=@{};start='immediate';stdout=(Join-Path $successOut 'host.out');stderr=(Join-Path $successOut 'host.err')}
+    $successClientSpec=[ordered]@{name='successful-high-client';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','client','-Evidence',$successClient,'-StopPath',$successStop);env=@{};start='handoff';stopAfterExit=$true;stdout=(Join-Path $successOut 'client.out');stderr=(Join-Path $successOut 'client.err')}
+    $successData=New-RunnerData $successOut $root $successStop $successAudit @($successHostSpec,$successClientSpec) $controller ([ordered]@{pipe=$successPipe;run_id=$successRun;server_pipe=$successServerPipe}) 15; $successDataPath=Join-Path $root 'successful-runner.json'; Write-JsonFresh $successDataPath $successData
+    $successControl = New-HandoffControlServer $successPipe
+    try {
+        $success=Start-Runner 'successful-high-runner' $shell $runner $successDataPath $root $successAudit $owned
+        $null=Wait-Json $successHost $success ([datetime]::UtcNow.AddSeconds(8)) 'simulated High host readiness'; if(Test-Path $successClient){throw 'successful High client ran before host readiness'}
+        Wait-HandoffReceiver $successControl $success ([datetime]::UtcNow.AddSeconds(8))
+        Send-ServerIdentity $successControl $successRun $successServerPipe 1 1 $success
+        $null=Wait-Json $successClient $success ([datetime]::UtcNow.AddSeconds(8)) 'simulated High client'; $null=Wait-Json $successAudit $success ([datetime]::UtcNow.AddSeconds(12)) 'successful High cleanup audit'; Assert-Audit $successAudit @('successful-high-host','successful-high-client') 'successful simulated High'
+    } finally { $successControl.Dispose() }
+    $failedChildOut = New-FreshDirectory $root 'failed-child-audit-evidence'
+    $failedChildAudit = Join-Path $failedChildOut 'audit.json'
+    $failedChildData = New-RunnerData $failedChildOut $root (Join-Path $failedChildOut 'stop') $failedChildAudit @([ordered]@{name='failing-child';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','fail','-Evidence',(Join-Path $failedChildOut 'unused.json'),'-StopPath',(Join-Path $failedChildOut 'stop'));env=@{};start='immediate';stdout=(Join-Path $failedChildOut 'child.out');stderr=(Join-Path $failedChildOut 'child.err')}) $null $null 5
+    $failedChildPath = Join-Path $root 'failed-child-audit.json'
+    Write-JsonFresh $failedChildPath $failedChildData
+    $failedChildRunner = Start-Runner 'failed-child-audit' $shell $runner $failedChildPath $root $failedChildAudit $owned
+    $null = Wait-Json $failedChildAudit $failedChildRunner ([datetime]::UtcNow.AddSeconds(8)) 'failed-child audit'
+    $failedChildEvidence = Read-Json $failedChildAudit
+    $failingChild = @($failedChildEvidence.children | Where-Object { [string]$_.name -eq 'failing-child' })
+    if ([int]$failedChildEvidence.exitCode -eq 0 -or $failingChild.Count -ne 1 -or -not [bool]$failingChild[0].exited -or [int]$failingChild[0].exitCode -ne 9) { throw 'failed child audit did not preserve aggregate and child failure separately' }
+    $failedRunnerOut = New-FreshDirectory $root 'failed-runner-audit-evidence'
+    $failedRunnerAudit = Join-Path $failedRunnerOut 'audit.json'
+    $failedRunnerData = New-RunnerData $failedRunnerOut $root (Join-Path $failedRunnerOut 'stop') $failedRunnerAudit @([ordered]@{name='successful-child';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','client','-Evidence',(Join-Path $failedRunnerOut 'client.json'),'-StopPath',(Join-Path $failedRunnerOut 'stop'));env=@{};start='immediate';stdout=(Join-Path $failedRunnerOut 'child.out');stderr=(Join-Path $failedRunnerOut 'child.err')}) ([ordered]@{pid=429496729;creation_filetime=1;image=$shell}) $null 5
+    $failedRunnerPath = Join-Path $root 'failed-runner-audit.json'
+    Write-JsonFresh $failedRunnerPath $failedRunnerData
+    $failedRunner = Start-Runner 'failed-runner-audit' $shell $runner $failedRunnerPath $root $failedRunnerAudit $owned
+    $null = Wait-Json $failedRunnerAudit $failedRunner ([datetime]::UtcNow.AddSeconds(8)) 'failed-runner audit'
+    $failedRunnerEvidence = Read-Json $failedRunnerAudit
+    $successfulChild = @($failedRunnerEvidence.children | Where-Object { [string]$_.name -eq 'successful-child' })
+    if ([int]$failedRunnerEvidence.exitCode -eq 0 -or $failedRunnerEvidence.failures -notcontains 'controller identity lost' -or $successfulChild.Count -ne 1 -or -not [bool]$successfulChild[0].exited -or [int]$successfulChild[0].exitCode -ne 0) { throw 'failed runner audit did not retain its successful child truthfully' }
+    Write-Host 'SelfTest verified truthful success, failed-child, and failed-runner audits'
+    $launchOut=New-FreshDirectory $root 'launch-failure-evidence'; $launchData=New-RunnerData $launchOut $root (Join-Path $launchOut 'stop') (Join-Path $launchOut 'audit.json') @([ordered]@{name='missing';exe=(Join-Path $root 'missing.exe');args=@();env=@{};start='immediate';stdout=(Join-Path $launchOut 'o');stderr=(Join-Path $launchOut 'e')}) $controller $null 5; $launchPath=Join-Path $root 'launch.json'; Write-JsonFresh $launchPath $launchData; $launch=Start-Runner 'launch-failure' $shell $runner $launchPath $root (Join-Path $launchOut 'audit.json') $owned; $null=Wait-Json (Join-Path $launchOut 'audit.json') $launch ([datetime]::UtcNow.AddSeconds(8)) 'launch-failure audit'; if((Read-Json (Join-Path $launchOut 'audit.json')).exitCode -eq 0){throw 'launch failure was accepted'}
+    $script:TestFailProcessMetadataFor = 'metadata-retention'
+    try {
+        $null = Start-Runner 'metadata-retention' $shell $runner $launchPath $root (Join-Path $launchOut 'audit.json') $owned
+        throw 'injected process metadata failure was accepted'
     } catch {
-        $nativeError = $_
+        if ("$_" -notlike '*injected process metadata failure*') { throw }
+    } finally { $script:TestFailProcessMetadataFor = $null }
+    $metadataRecord = $owned[$owned.Count - 1]
+    if ($metadataRecord.name -ne 'metadata-retention' -or $null -eq $metadataRecord.process) { throw 'metadata failure lost the retained runner record' }
+    $null = Stop-Retained $metadataRecord 12000
+    Write-Host 'SelfTest retained and cleaned the runner after injected metadata failure'
+    $timeoutOut=New-FreshDirectory $root 'timeout-evidence'; $timeoutData=New-RunnerData $timeoutOut $root (Join-Path $timeoutOut 'stop') (Join-Path $timeoutOut 'audit.json') @([ordered]@{name='hang';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','hang','-Evidence',(Join-Path $timeoutOut 'x'),' -StopPath',(Join-Path $timeoutOut 'stop'));env=@{};start='immediate';stdout=(Join-Path $timeoutOut 'o');stderr=(Join-Path $timeoutOut 'e')}) $controller $null 1; $timeoutPath=Join-Path $root 'timeout.json'; Write-JsonFresh $timeoutPath $timeoutData; $timeout=Start-Runner 'timeout' $shell $runner $timeoutPath $root (Join-Path $timeoutOut 'audit.json') $owned; $timeout.process.WaitForExit(12000)|Out-Null; if($timeout.process.ExitCode -eq 0 -or -not (Test-Path -LiteralPath (Join-Path $timeoutOut 'audit.json'))){throw 'timeout cleanup/audit failed'}
+    $lossOut=New-FreshDirectory $root 'controller-loss-evidence'
+    $lossStop=Join-Path $lossOut 'stop'
+    $lossAudit=Join-Path $lossOut 'audit.json'
+    $lossChild=[ordered]@{name='controller-loss-child';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','hang','-Evidence',(Join-Path $lossOut 'unused.json'),'-StopPath',$lossStop);env=@{};start='immediate';stdout=(Join-Path $lossOut 'child.out');stderr=(Join-Path $lossOut 'child.err')}
+    $lossData=New-RunnerData $lossOut $root $lossStop $lossAudit @($lossChild) ([ordered]@{pid=429496729;creation_filetime=1;image=$shell}) $null 5
+    $lossPath=Join-Path $root 'loss.json'
+    Write-JsonFresh $lossPath $lossData
+    $loss=Start-Runner 'controller-loss' $shell $runner $lossPath $root $lossAudit $owned
+    $null=Wait-Json $lossAudit $loss ([datetime]::UtcNow.AddSeconds(15)) 'controller-loss audit'
+    $lossEvidence=Read-Json $lossAudit
+    $lossChildAudit=@($lossEvidence.children | Where-Object { [string]$_.name -eq 'controller-loss-child' })
+    if($loss.process.ExitCode -eq 0 -or $lossEvidence.failures -notcontains 'controller identity lost' -or $lossChildAudit.Count -ne 1 -or -not [bool]$lossChildAudit[0].exited){throw 'controller-loss did not clean its retained child'}
+    Write-Host 'SelfTest controller loss cleaned its retained child'
+    Write-Host "diagnostics_validation SelfTest ok; simulated evidence retained at $root"
     } finally {
         $cleanupErrors = New-Object System.Collections.Generic.List[string]
-        try {
-            $stopForCleanup = Get-Variable -Name stopPath -ValueOnly -ErrorAction SilentlyContinue
-            if ($null -ne $stopForCleanup -and -not (Test-Path -LiteralPath $stopForCleanup)) {
-                Set-Content -LiteralPath $stopForCleanup -Value 'stop'
-            }
-        } catch {
-            $cleanupErrors.Add("shared stop: $_") | Out-Null
-        }
-        foreach ($error in @(Stop-OwnedProcesses -Owned $owned -WaitMs 25000)) { $cleanupErrors.Add($error) | Out-Null }
-        foreach ($error in @(Assert-OwnedRunnerAudits $owned)) { $cleanupErrors.Add("audit: $error") | Out-Null }
         foreach ($record in $owned) {
-            try { Close-RetainedProcessHandle $record } catch { $cleanupErrors.Add("close $($record.Name): $_") | Out-Null }
+            try { $null = Stop-Retained $record 12000 } catch { $cleanupErrors.Add("SelfTest cleanup $($record.name): $_") | Out-Null }
         }
-        try { Restore-ProcessEnv $savedEnv } catch { $cleanupErrors.Add("restore environment: $_") | Out-Null }
-        if ($null -ne $nativeError -and $cleanupErrors.Count -ne 0) { throw "native validation failed: $nativeError; cleanup also failed: $($cleanupErrors -join '; ')" }
-        if ($null -ne $nativeError) { throw $nativeError }
-        if ($cleanupErrors.Count -ne 0) { throw "native validation cleanup failed: $($cleanupErrors -join '; ')" }
+        if ($cleanupErrors.Count -ne 0) { throw ($cleanupErrors -join '; ') }
     }
 }
-
-if ($SyntaxOnly) {
-    Write-Host 'diagnostics_validation.ps1 parsed'
-    exit 0
+function Invoke-NativeValidation {
+    $token=Get-CurrentTokenInfo
+    if($null -eq $token -or [uint32]$token.rid -ne $MediumRid){throw 'native validation requires a Medium controller; do not run it from High'}
+    Write-Host 'NATIVE VALIDATION IS PARENT-OWNED AFTER SOURCE INSPECTION.'; Write-Host $Gap
+    $owned=New-Object System.Collections.Generic.List[object]; $mediumStopPaths=New-Object System.Collections.Generic.List[string]; $root=Join-Path ([IO.Path]::GetTempPath()) ('leopardwm-diagval-controller-'+(New-RunId)); New-Item -ItemType Directory -Path $root|Out-Null
+    $handoffControl=$null
+    $failure=$null
+    try {
+        $daemon=Get-TestExecutable 'leopardwm-daemon' 'leopardwm' (Join-Path $root 'cargo-daemon.json'); $cli=Get-TestExecutable 'leopardwm-cli' 'leopardwm-cli' (Join-Path $root 'cargo-cli.json')
+        $scopeHigh=New-Scope; $scopeMedium=New-Scope; $pipeHigh=Get-Pipe $scopeHigh; $pipeMedium=Get-Pipe $scopeMedium; Assert-IsolatedPipe $scopeHigh $pipeHigh; Assert-IsolatedPipe $scopeMedium $pipeMedium
+        $runId=New-RunId; $handoffPipe=Get-Pipe ("diagval_handoff_$runId"); Assert-IsolatedPipe ("diagval_handoff_$runId") $handoffPipe
+        $handoffControl=New-HandoffControlServer $handoffPipe
+        $highExec=Join-Path ([IO.Path]::GetTempPath()) ('leopardwm-diagval-high-'+(New-RunId)); $highOut=Join-Path $highExec 'output'; $highStop=Join-Path $highOut 'stop'
+        $controller=[ordered]@{pid=$PID;creation_filetime=[uint64](Get-Process -Id $PID).StartTime.ToFileTimeUtc();image=(Get-Process -Id $PID).Path}
+        $highData=[ordered]@{runDir=$highOut;workingDir=$highExec;stopPath=$highStop;auditPath=(Join-Path $highOut 'high-runner-audit.json');timeoutSec=90;environment_policy='clear_diagnostics';controller=$controller;handoff=[ordered]@{pipe=$handoffPipe;run_id=$runId;server_pipe=$pipeMedium};children=@(
+          [ordered]@{name='high-host';exe=(Join-Path $highExec 'daemon-test.exe');args=$TestArgs;env=(New-HostEnv $highOut $scopeHigh 'high-host' '1');start='immediate';stdout=(Join-Path $highOut 'high-host.out');stderr=(Join-Path $highOut 'high-host.err')},
+          [ordered]@{name='high-client';exe=(Join-Path $highExec 'cli-test.exe');args=$TestArgs;env=(New-ClientEnv $highOut 'high-client');start='handoff';stopAfterExit=$true;stdout=(Join-Path $highOut 'high-client.out');stderr=(Join-Path $highOut 'high-client.err')}
+        )}
+        $highDataSource=Join-Path $root 'high-runner-data.json'; Write-JsonFresh $highDataSource $highData
+        $mainSource=$PSCommandPath; $runnerSource=Join-Path $RepoRoot 'tools\diagnostics_validation_runner.ps1'; $bootstrapSource=Join-Path $RepoRoot 'tools\diagnostics_validation_uac_bootstrap.ps1'; $dependencies=Get-ArtifactDependencies @($daemon,$cli)
+        $spec=[ordered]@{version=1;high_exec_dir=$highExec;high_output_dir=$highOut;dependencies=$dependencies;main=[ordered]@{source=$mainSource;sha256=(Get-Sha256 $mainSource)};runner=[ordered]@{source=$runnerSource;sha256=(Get-Sha256 $runnerSource)};daemon=[ordered]@{source=$daemon;sha256=(Get-Sha256 $daemon)};cli=[ordered]@{source=$cli;sha256=(Get-Sha256 $cli)};runner_data=[ordered]@{source=$highDataSource;sha256=(Get-Sha256 $highDataSource)}}
+        $specPath=Join-Path $root 'high-pin-spec.json'; Write-JsonFresh $specPath $spec; $specHash=Get-Sha256 $specPath
+        $bootstrapPath=Join-Path $root 'pinned-uac-bootstrap.ps1'; "`$FrozenSpecPath = $(ConvertTo-PsLiteral $specPath)`n`$FrozenSpecHash = $(ConvertTo-PsLiteral $specHash)`n" + [IO.File]::ReadAllText($bootstrapSource) | Set-Content -LiteralPath $bootstrapPath -Encoding UTF8 -NoNewline
+        $shell=(Get-Process -Id $PID).Path; $high=Start-PinnedBootstrap $shell $bootstrapPath $specPath $specHash $root $owned; Write-JsonFresh (Join-Path $root 'controller.json') ([ordered]@{controller=$controller;high_bootstrap=[ordered]@{pid=$high.pid;creation_filetime=$high.creation_filetime;image=$high.image};high_output=$highOut;medium_root=(Join-Path $root 'medium');gap=$Gap})
+        $deadline=[datetime]::UtcNow.AddSeconds(110); $fixture=Wait-Json (Join-Path $highOut 'fixture.json') $high $deadline 'High fixture'; $highHost=Wait-Json (Join-Path $highOut 'high-host.json') $high $deadline 'High host'; $null=Wait-Json (Join-Path $highOut 'high-host-ready.json') $high $deadline 'High host readiness'; Wait-HandoffReceiver $handoffControl $high $deadline
+        $mediumRoot=New-FreshDirectory $root 'medium'; $mediumHost=New-FreshDirectory $mediumRoot 'host'; $mediumClient=New-FreshDirectory $mediumRoot 'client'; $mediumStopPaths.Add((Join-Path $mediumHost 'stop')) | Out-Null; $mediumStopPaths.Add((Join-Path $mediumClient 'stop')) | Out-Null; [IO.File]::Copy((Join-Path $highOut 'fixture.json'),(Join-Path $mediumHost 'fixture.json'),$false)
+        $mediumHostData=New-RunnerData $mediumHost $root (Join-Path $mediumHost 'stop') (Join-Path $mediumHost 'audit.json') @([ordered]@{name='medium-host';exe=$daemon;args=$TestArgs;env=(New-HostEnv $mediumHost $scopeMedium 'medium-host' '0');start='immediate';stdout=(Join-Path $mediumHost 'medium-host.out');stderr=(Join-Path $mediumHost 'medium-host.err')}) $null $null 90; $mediumHostDataPath=Join-Path $mediumRoot 'host-runner.json'; Write-JsonFresh $mediumHostDataPath $mediumHostData; $mh=Start-Runner 'medium-host-runner' $shell $runnerSource $mediumHostDataPath $root (Join-Path $mediumHost 'audit.json') $owned; $mediumHostEvidence=Wait-Json (Join-Path $mediumHost 'medium-host.json') $mh $deadline 'Medium host'; $null=Wait-Json (Join-Path $mediumHost 'medium-host-ready.json') $mh $deadline 'Medium host readiness'
+        $clientEnv=New-ClientEnv $mediumClient 'medium-client'; $clientEnv.LEOPARDWM_DIAGNOSTICS_PIPE=$pipeHigh; $clientEnv.LEOPARDWM_DIAGNOSTICS_EXPECTED_SERVER_PID=[string]$highHost.pid; $clientEnv.LEOPARDWM_DIAGNOSTICS_EXPECTED_SERVER_CREATION=[string]$highHost.creation_filetime
+        $mediumClientData=New-RunnerData $mediumClient $root (Join-Path $mediumClient 'stop') (Join-Path $mediumClient 'audit.json') @([ordered]@{name='medium-client';exe=$cli;args=$TestArgs;env=$clientEnv;start='immediate';stdout=(Join-Path $mediumClient 'medium-client.out');stderr=(Join-Path $mediumClient 'medium-client.err')}) $null $null 60; $mediumClientDataPath=Join-Path $mediumRoot 'client-runner.json'; Write-JsonFresh $mediumClientDataPath $mediumClientData; $mc=Start-Runner 'medium-client-runner' $shell $runnerSource $mediumClientDataPath $root (Join-Path $mediumClient 'audit.json') $owned; $null=Wait-Json (Join-Path $mediumClient 'medium-client.json') $mc $deadline 'Medium client'
+        Send-ServerIdentity $handoffControl $runId $pipeMedium ([uint32]$mediumHostEvidence.pid) ([uint64]$mediumHostEvidence.creation_filetime) $high; $handoffControl.Dispose(); $handoffControl=$null; $null=Wait-Json (Join-Path $highOut 'high-client.json') $high $deadline 'High client'
+        $fixture=Assert-NativeMatrix $highOut $mediumHost $mediumClient
+        Set-Content -LiteralPath (Join-Path $mediumHost 'stop') -Value 'stop'
+        $null=Stop-Retained $mh 25000; $null=Stop-Retained $mc 25000; if(-not $high.process.WaitForExit(30000)){throw 'High bootstrap did not exit after its owned client completed'}; if($high.process.ExitCode -ne 0){throw "High bootstrap exit $($high.process.ExitCode)"}; $highSide=Read-Json (Join-Path $highOut 'high-side.json'); if([string]$highSide.status -ne 'exited' -or [int]$highSide.runner_exit -ne 0){throw 'High side exit audit failed'}; if(Test-WindowExists ([uint64]$fixture.hwnd)){throw 'High fixture HWND remains after High cleanup'}; Assert-Audit (Join-Path $highOut 'high-runner-audit.json') @('high-host','high-client') 'High'; Assert-Audit (Join-Path $mediumHost 'audit.json') @('medium-host') 'Medium host'; Assert-Audit (Join-Path $mediumClient 'audit.json') @('medium-client') 'Medium client'; Write-Host "native pipeline passed; High evidence: $highOut; Medium evidence: $mediumRoot; controller evidence: $root"
+    } catch { $failure=$_ } finally {
+        $errors=New-Object System.Collections.Generic.List[string]
+        if($null -ne $handoffControl) { try { $handoffControl.Dispose() } catch { $errors.Add("handoff control disposal: $_") | Out-Null } }
+        foreach($stopPath in $mediumStopPaths) { try { if(-not(Test-Path -LiteralPath $stopPath)){Set-Content -LiteralPath $stopPath -Value 'stop'} } catch { $errors.Add("Medium stop ${stopPath}: $_") | Out-Null } }
+        $mediumOwned=New-Object System.Collections.Generic.List[object]
+        $highRecord=$null
+        foreach($record in $owned) { if($record.name -eq 'high-bootstrap'){$highRecord=$record}else{$mediumOwned.Add($record)|Out-Null} }
+        foreach($error in @(Stop-Owned $mediumOwned 25000)){$errors.Add($error)|Out-Null}
+        if($null -ne $highRecord -and -not $highRecord.process.HasExited) {
+            if(-not $highRecord.process.WaitForExit(100000)) { $errors.Add('High bootstrap did not exit through its own timeout/controller-loss cleanup') | Out-Null }
+        }
+        if($null -ne $failure -and $errors.Count -ne 0){throw "native validation failed: $failure; cleanup also failed: $($errors -join '; ')"}; if($null -ne $failure){throw $failure}; if($errors.Count -ne 0){throw "native validation cleanup failed: $($errors -join '; ')"}
+    }
 }
-
-if ($RunNative) {
-    Invoke-NativeValidation
-    exit 0
-}
-
+if($SyntaxOnly){Write-Host 'diagnostics_validation.ps1 parsed';exit 0}
+if($HighSide){Invoke-HighSide;exit $LASTEXITCODE}
+if($RunNative){Invoke-NativeValidation;exit 0}
 Invoke-SelfTest
