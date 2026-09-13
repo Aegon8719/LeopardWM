@@ -124,6 +124,7 @@ impl AppState {
                             self.border_position(),
                             bgr,
                             corner_radius,
+                            hwnd,
                         );
                         return;
                     }
@@ -140,6 +141,7 @@ impl AppState {
                                 self.border_position(),
                                 bgr,
                                 corner_radius,
+                                hwnd,
                             );
                             return;
                         }
@@ -196,6 +198,7 @@ impl AppState {
                                             self.border_position(),
                                             bgr,
                                             corner_radius,
+                                            hwnd,
                                         );
                                     } else {
                                         frame.hide();

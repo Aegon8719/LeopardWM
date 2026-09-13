@@ -17,6 +17,7 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Fixes
 
+- **The active window border follows its target in z-order.** Render and cached-move paths for tiled, drag, and floating windows stack the overlay immediately above that window. Ordinary targets keep the border out of the topmost band so it is not promoted over the taskbar; a topmost target still gets a matching overlay just above it.
 - **Inactive workspace windows stay offscreen after restart.** Startup parks restored tiled and floating windows on inactive workspaces after restoring each monitor's active workspace, without moving minimized windows.
 - **Snap Layout suppression survives restarts.** Saved tiled windows regain the configured Snap Layout restriction when their workspace is restored, including inactive workspaces. Floating windows remain unchanged.
 - **Off-screen recovery recognizes Windows-clamped parking coordinates.** Parking now uses the native coordinate limit so cleanup can find and restore parked windows without mistaking ordinary minimized windows for parked ones. Recovery uses physical coordinates even when called from the CLI or watchdog, then restores the caller's DPI context.

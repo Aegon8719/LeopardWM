@@ -55,6 +55,80 @@ pub(crate) fn clamp(v: f32, lo: f32, hi: f32) -> f32 {
     v.max(lo).min(hi)
 }
 
+/// Z-order plan for stacking the overlay immediately above its target.
+///
+/// `insert_after` is passed to `SetWindowPos` as `hWndInsertAfter`. `None` keeps
+/// the current z-order (`SWP_NOZORDER`). `Some(HWND_TOP)` is a sentinel, not an
+/// invalid window: it is distinct from `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayStackPlan {
+    /// Demote with `HWND_NOTOPMOST` before applying `insert_after`.
+    demote: bool,
+    insert_after: Option<HWND>,
+}
+
+fn window_is_topmost(hwnd: HWND) -> bool {
+    let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+    ex_style & WS_EX_TOPMOST.0 != 0
+}
+
+fn window_above(hwnd: HWND) -> Option<HWND> {
+    unsafe {
+        match GetWindow(hwnd, GW_HWNDPREV) {
+            Ok(prev) if !prev.is_invalid() => Some(prev),
+            _ => None,
+        }
+    }
+}
+
+fn apply_style(color_bgr: u32, corner_radius: f32) {
+    if let Ok(mut state) = BORDER_STATE.lock() {
+        state.color_bgr = color_bgr;
+        state.corner_radius = corner_radius;
+    }
+}
+
+fn overlay_needs_render(w: i32, h: i32, width: u32, position: BorderPosition) -> bool {
+    let state = BORDER_STATE.lock().unwrap();
+    w != state.cached_w
+        || h != state.cached_h
+        || width != state.cached_width
+        || position != state.cached_position
+        || state.color_bgr != state.cached_color
+        || (state.corner_radius - state.cached_corner_radius).abs() > f32::EPSILON
+}
+
+/// Decide how to stack `overlay` immediately above `target`.
+///
+/// Inserting after a topmost predecessor of a non-topmost target would promote
+/// the overlay into the topmost band (and a later `HWND_TOP` would then raise it
+/// over the taskbar). `HWND_TOP` is not `HWND_TOPMOST`, but it still raises a
+/// window already in the topmost band to the top of that band.
+fn plan_overlay_stack(
+    overlay: HWND,
+    overlay_is_topmost: bool,
+    target_is_topmost: bool,
+    predecessor: Option<HWND>,
+    predecessor_is_topmost: bool,
+) -> OverlayStackPlan {
+    let demote = overlay_is_topmost && !target_is_topmost;
+    if predecessor == Some(overlay) {
+        return OverlayStackPlan {
+            demote,
+            insert_after: None,
+        };
+    }
+    let insert_after = match predecessor {
+        Some(prev) if predecessor_is_topmost == target_is_topmost => Some(prev),
+        _ if target_is_topmost => Some(HWND_TOPMOST),
+        _ => Some(HWND_TOP),
+    };
+    OverlayStackPlan {
+        demote,
+        insert_after,
+    }
+}
+
 /// Cached rendering state to avoid re-rendering when only position changes.
 struct BorderState {
     color_bgr: u32,
@@ -165,15 +239,13 @@ impl BorderFrame {
         color_bgr: u32,
         corner_radius: f32,
     ) {
-        if let Ok(mut state) = BORDER_STATE.lock() {
-            state.color_bgr = color_bgr;
-            state.corner_radius = corner_radius;
-        }
+        apply_style(color_bgr, corner_radius);
         self.reposition(target_hwnd, width, position);
     }
 
-    /// Show the border at a specific screen rect (not tracking any window).
-    /// Used during drag to keep the border at the layout position.
+    /// Show the border at a specific screen rect, stacked above `target_hwnd`.
+    /// Used during drag and resize preview to keep the border at the layout
+    /// position while still tracking the target's z-order.
     pub fn show_at_rect(
         &self,
         rect: leopardwm_core_layout::Rect,
@@ -181,11 +253,12 @@ impl BorderFrame {
         position: BorderPosition,
         color_bgr: u32,
         corner_radius: f32,
+        target_hwnd: u64,
     ) {
-        if let Ok(mut state) = BORDER_STATE.lock() {
-            state.color_bgr = color_bgr;
-            state.corner_radius = corner_radius;
-        }
+        let Some(target) = self.live_target(target_hwnd) else {
+            return;
+        };
+        apply_style(color_bgr, corner_radius);
 
         let bw = width as i32;
         // For outside borders, the layout rect (which matches the DWM-
@@ -210,35 +283,16 @@ impl BorderFrame {
             BorderPosition::Inside => (rx, ry, tw, th),
         };
 
-        let needs_render = {
-            let state = BORDER_STATE.lock().unwrap();
-            w != state.cached_w
-                || h != state.cached_h
-                || width != state.cached_width
-                || position != state.cached_position
-                || state.color_bgr != state.cached_color
-                || (state.corner_radius - state.cached_corner_radius).abs() > f32::EPSILON
-        };
-
-        if needs_render {
-            self.render_and_update(x, y, w, h, width, position);
-        } else {
-            unsafe {
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    Some(HWND_TOP),
-                    x,
-                    y,
-                    0,
-                    0,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE,
-                );
-                let _ = ShowWindow(self.hwnd, SW_SHOWNA);
-            }
-        }
+        self.present_overlay(
+            leopardwm_core_layout::Rect::new(x, y, w, h),
+            width,
+            position,
+            target,
+        );
     }
 
-    /// Show the border at an already-final overlay rectangle (no expansion).
+    /// Show the border at an already-final overlay rectangle (no expansion),
+    /// stacked above `target_hwnd`.
     pub fn show_final_overlay(
         &self,
         overlay: leopardwm_core_layout::Rect,
@@ -246,42 +300,13 @@ impl BorderFrame {
         position: BorderPosition,
         color_bgr: u32,
         corner_radius: f32,
+        target_hwnd: u64,
     ) {
-        if let Ok(mut state) = BORDER_STATE.lock() {
-            state.color_bgr = color_bgr;
-            state.corner_radius = corner_radius;
-        }
-
-        let x = overlay.x;
-        let y = overlay.y;
-        let w = overlay.width;
-        let h = overlay.height;
-        let needs_render = {
-            let state = BORDER_STATE.lock().unwrap();
-            w != state.cached_w
-                || h != state.cached_h
-                || width != state.cached_width
-                || position != state.cached_position
-                || state.color_bgr != state.cached_color
-                || (state.corner_radius - state.cached_corner_radius).abs() > f32::EPSILON
+        let Some(target) = self.live_target(target_hwnd) else {
+            return;
         };
-
-        if needs_render {
-            self.render_and_update(x, y, w, h, width, position);
-        } else {
-            unsafe {
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    Some(HWND_TOP),
-                    x,
-                    y,
-                    0,
-                    0,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE,
-                );
-                let _ = ShowWindow(self.hwnd, SW_SHOWNA);
-            }
-        }
+        apply_style(color_bgr, corner_radius);
+        self.present_overlay(overlay, width, position, target);
     }
 
     /// Hide the border frame.
@@ -291,19 +316,91 @@ impl BorderFrame {
         }
     }
 
+    fn live_target(&self, target_hwnd: u64) -> Option<HWND> {
+        let target = HWND(target_hwnd as *mut c_void);
+        if target.is_invalid() || unsafe { !IsWindow(Some(target)).as_bool() } {
+            self.hide();
+            None
+        } else {
+            Some(target)
+        }
+    }
+
+    fn present_overlay(
+        &self,
+        overlay: leopardwm_core_layout::Rect,
+        width: u32,
+        position: BorderPosition,
+        target: HWND,
+    ) {
+        let x = overlay.x;
+        let y = overlay.y;
+        let w = overlay.width;
+        let h = overlay.height;
+        if overlay_needs_render(w, h, width, position) {
+            self.render_and_update(x, y, w, h, width, position);
+        } else {
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE,
+                );
+            }
+        }
+        self.stack_above_target(target);
+    }
+
+    fn stack_above_target(&self, target: HWND) {
+        if target.is_invalid() || unsafe { !IsWindow(Some(target)).as_bool() } {
+            self.hide();
+            return;
+        }
+        let predecessor = window_above(target);
+        let plan = plan_overlay_stack(
+            self.hwnd,
+            window_is_topmost(self.hwnd),
+            window_is_topmost(target),
+            predecessor,
+            predecessor.is_some_and(window_is_topmost),
+        );
+        unsafe {
+            if plan.demote {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_NOTOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+            let z_flags = if plan.insert_after.is_some() {
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+            } else {
+                SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+            };
+            let _ = SetWindowPos(self.hwnd, plan.insert_after, 0, 0, 0, 0, z_flags);
+            let _ = ShowWindow(self.hwnd, SW_SHOWNA);
+        }
+    }
+
     /// Reposition the border frame to track the target window.
     ///
     /// If the overlay dimensions and config haven't changed since the last
     /// render, only the position is updated (fast path for scrolling).
     pub fn reposition(&self, target_hwnd: u64, width: u32, position: BorderPosition) {
-        let target = HWND(target_hwnd as *mut c_void);
+        let Some(target) = self.live_target(target_hwnd) else {
+            return;
+        };
         let bw = width as i32;
 
         unsafe {
-            if !IsWindow(Some(target)).as_bool() {
-                return;
-            }
-
             // Get actual visible window bounds (excludes DWM shadow padding).
             let mut rect = RECT::default();
             const DWMWA_EXTENDED_FRAME_BOUNDS: i32 = 9;
@@ -338,52 +435,12 @@ impl BorderFrame {
                 BorderPosition::Inside => (rect.left, rect.top, tw, th),
             };
 
-            // Check if we can just move (same size/config = bitmap is cached)
-            let needs_render = {
-                let state = BORDER_STATE.lock().unwrap();
-                w != state.cached_w
-                    || h != state.cached_h
-                    || width != state.cached_width
-                    || position != state.cached_position
-                    || state.color_bgr != state.cached_color
-            };
-
-            if needs_render {
-                self.render_and_update(x, y, w, h, width, position);
-            } else {
-                // Fast path: just move the overlay (bitmap is retained).
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    None,
-                    x,
-                    y,
-                    0,
-                    0,
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE,
-                );
-            }
-
-            // Z-order the border just above its target — for BOTH paths.
-            // `render_and_update` positions the overlay via
-            // `UpdateLayeredWindow` but does NOT touch z-order, so without
-            // this the border keeps its previous z-position whenever it
-            // re-renders for a differently-sized window (e.g. the first
-            // summon of the scratchpad), leaving it stuck behind the
-            // previously-focused window.
-            let insert_after = match GetWindow(target, GW_HWNDPREV) {
-                Ok(prev) if prev != self.hwnd => Some(prev),
-                _ => Some(HWND_TOP),
-            };
-            let _ = SetWindowPos(
-                self.hwnd,
-                insert_after,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            self.present_overlay(
+                leopardwm_core_layout::Rect::new(x, y, w, h),
+                width,
+                position,
+                target,
             );
-            let _ = ShowWindow(self.hwnd, SW_SHOWNA);
         }
     }
 
@@ -560,4 +617,137 @@ unsafe extern "system" fn border_frame_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::c_void;
+
+    fn hwnd(id: usize) -> HWND {
+        HWND(id as *mut c_void)
+    }
+
+    #[test]
+    fn self_predecessor_does_not_raise() {
+        let overlay = hwnd(0x100);
+        let plan = plan_overlay_stack(overlay, false, false, Some(overlay), false);
+        assert_eq!(
+            plan,
+            OverlayStackPlan {
+                demote: false,
+                insert_after: None,
+            }
+        );
+    }
+
+    #[test]
+    fn self_predecessor_topmost_does_not_raise() {
+        let overlay = hwnd(0x100);
+        let plan = plan_overlay_stack(overlay, true, true, Some(overlay), true);
+        assert_eq!(
+            plan,
+            OverlayStackPlan {
+                demote: false,
+                insert_after: None,
+            }
+        );
+    }
+
+    #[test]
+    fn leftover_topmost_self_predecessor_demotes_without_raise() {
+        let overlay = hwnd(0x100);
+        let plan = plan_overlay_stack(overlay, true, false, Some(overlay), true);
+        assert_eq!(
+            plan,
+            OverlayStackPlan {
+                demote: true,
+                insert_after: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ordinary_target_inserts_after_window_above_it() {
+        let overlay = hwnd(0x100);
+        let above = hwnd(0x200);
+        let plan = plan_overlay_stack(overlay, false, false, Some(above), false);
+        assert_eq!(
+            plan,
+            OverlayStackPlan {
+                demote: false,
+                insert_after: Some(above),
+            }
+        );
+    }
+
+    #[test]
+    fn ordinary_target_with_shell_above_stays_non_topmost() {
+        let overlay = hwnd(0x100);
+        let shell = hwnd(0x400);
+        let plan = plan_overlay_stack(overlay, false, false, Some(shell), true);
+        assert_eq!(
+            plan,
+            OverlayStackPlan {
+                demote: false,
+                insert_after: Some(HWND_TOP),
+            }
+        );
+        assert_ne!(plan.insert_after, Some(shell));
+        assert_ne!(plan.insert_after, Some(HWND_TOPMOST));
+    }
+
+    #[test]
+    fn target_switch_from_topmost_to_ordinary_demotes_below_shell() {
+        let overlay = hwnd(0x100);
+        let shell = hwnd(0x400);
+        let plan = plan_overlay_stack(overlay, true, false, Some(shell), true);
+        assert_eq!(
+            plan,
+            OverlayStackPlan {
+                demote: true,
+                insert_after: Some(HWND_TOP),
+            }
+        );
+        assert_ne!(plan.insert_after, Some(shell));
+        assert_ne!(plan.insert_after, Some(HWND_TOPMOST));
+    }
+
+    #[test]
+    fn topmost_target_inserts_after_same_band_predecessor() {
+        let overlay = hwnd(0x100);
+        let above = hwnd(0x300);
+        let plan = plan_overlay_stack(overlay, false, true, Some(above), true);
+        assert_eq!(
+            plan,
+            OverlayStackPlan {
+                demote: false,
+                insert_after: Some(above),
+            }
+        );
+        assert_ne!(plan.insert_after, Some(HWND_TOPMOST));
+    }
+
+    #[test]
+    fn topmost_target_at_top_of_zorder_uses_topmost_sentinel() {
+        let overlay = hwnd(0x100);
+        let plan = plan_overlay_stack(overlay, false, true, None, false);
+        assert_eq!(
+            plan,
+            OverlayStackPlan {
+                demote: false,
+                insert_after: Some(HWND_TOPMOST),
+            }
+        );
+    }
+
+    #[test]
+    fn hwnd_top_is_distinct_from_no_zorder_change() {
+        let overlay = hwnd(0x100);
+        let keep = plan_overlay_stack(overlay, false, false, Some(overlay), false);
+        let top_of_band = plan_overlay_stack(overlay, false, false, None, false);
+        assert_eq!(keep.insert_after, None);
+        assert_eq!(top_of_band.insert_after, Some(HWND_TOP));
+        assert_ne!(keep.insert_after, top_of_band.insert_after);
+    }
 }
