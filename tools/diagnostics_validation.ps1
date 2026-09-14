@@ -544,13 +544,23 @@ if($Mode -eq 'fail'){exit 9}; while($true){Start-Sleep -Milliseconds 25}
     if ($metadataRecord.name -ne 'metadata-retention' -or $null -eq $metadataRecord.process) { throw 'metadata failure lost the retained runner record' }
     $null = Stop-Retained $metadataRecord 12000
     Write-Host 'SelfTest retained and cleaned the runner after injected metadata failure'
+    $launchAudit = Join-Path $launchOut 'audit.json'
+    $launchAuditHash = Get-Sha256 $launchAudit
+    $imageOut = New-FreshDirectory $root 'image-unavailable-evidence'
+    $imageAudit = Join-Path $imageOut 'audit.json'
+    $imageData = New-RunnerData $imageOut $root (Join-Path $imageOut 'stop') $imageAudit @([ordered]@{name='image-unavailable-child';exe=(Join-Path $root 'missing.exe');args=@();env=@{};start='immediate';stdout=(Join-Path $imageOut 'out');stderr=(Join-Path $imageOut 'err')}) $controller $null 5
+    $imagePath = Join-Path $root 'image-unavailable.json'
+    Write-JsonFresh $imagePath $imageData
     $script:TestFailProcessImageFor = 'image-unavailable'
     try {
-        $imageRecord = Start-Runner 'image-unavailable' $shell $runner $launchPath $root (Join-Path $launchOut 'image-audit.json') $owned
+        $imageRecord = Start-Runner 'image-unavailable' $shell $runner $imagePath $root $imageAudit $owned
         if ($null -ne $imageRecord.image -or $imageRecord.image -eq $controller.image) { throw 'unavailable child image was replaced with controller image' }
+        $imageEvidence = Wait-Json $imageAudit $imageRecord ([datetime]::UtcNow.AddSeconds(8)) 'image-unavailable audit'
+        if ([int]$imageEvidence.exitCode -eq 0 -or (@($imageEvidence.failures) -join '; ') -notlike '*child executable missing for image-unavailable-child*') { throw 'image-unavailable audit did not preserve its expected launch failure' }
+        if ((Get-Sha256 $launchAudit) -ne $launchAuditHash) { throw 'image-unavailable runner replaced launch-failure evidence' }
         $null = Stop-Retained $imageRecord 12000
     } finally { $script:TestFailProcessImageFor = $null }
-    Write-Host 'SelfTest records an unavailable child image without substituting the controller image'
+    Write-Host 'SelfTest records an unavailable child image without substituting the controller image or replacing launch-failure evidence'
     $timeoutOut=New-FreshDirectory $root 'timeout-evidence'; $timeoutData=New-RunnerData $timeoutOut $root (Join-Path $timeoutOut 'stop') (Join-Path $timeoutOut 'audit.json') @([ordered]@{name='hang';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','hang','-Evidence',(Join-Path $timeoutOut 'x'),' -StopPath',(Join-Path $timeoutOut 'stop'));env=@{};start='immediate';stdout=(Join-Path $timeoutOut 'o');stderr=(Join-Path $timeoutOut 'e')}) $controller $null 1; $timeoutPath=Join-Path $root 'timeout.json'; Write-JsonFresh $timeoutPath $timeoutData; $timeout=Start-Runner 'timeout' $shell $runner $timeoutPath $root (Join-Path $timeoutOut 'audit.json') $owned; $timeout.process.WaitForExit(12000)|Out-Null; if($timeout.process.ExitCode -eq 0 -or -not (Test-Path -LiteralPath (Join-Path $timeoutOut 'audit.json'))){throw 'timeout cleanup/audit failed'}
     $lossOut=New-FreshDirectory $root 'controller-loss-evidence'
     $lossStop=Join-Path $lossOut 'stop'
