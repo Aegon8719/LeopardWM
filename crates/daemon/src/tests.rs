@@ -1500,7 +1500,7 @@ fn test_apply_layout_preserves_full_partial_native_width_without_parking_follow_
 }
 
 #[test]
-fn test_primary_feedback_survives_full_partial_landing() {
+fn test_primary_feedback_survives_ordinary_contained_landing() {
     use crate::state::{
         TestApplyPlacementsBehavior, TestApplyPlacementsOutcome, TestApplyPlacementsStep,
     };

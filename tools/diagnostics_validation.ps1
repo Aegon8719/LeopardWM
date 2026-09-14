@@ -106,6 +106,7 @@ function Join-ProcessArguments([string[]]$Arguments) {
     return $parts -join ' '
 }
 $script:TestFailProcessMetadataFor = $null
+$script:TestFailProcessImageFor = $null
 function Test-DescendantPath([string]$Parent, [string]$Candidate) {
     $parentPath = [IO.Path]::GetFullPath($Parent).TrimEnd('\')
     $candidatePath = [IO.Path]::GetFullPath($Candidate)
@@ -117,7 +118,10 @@ function New-ProcessRecord([string]$Name, $Process, [string]$AuditPath = $null) 
 function Complete-ProcessRecord($Record) {
     if ($script:TestFailProcessMetadataFor -eq $Record.name) { throw "injected process metadata failure for $($Record.name)" }
     $Record.creation_filetime = [uint64]$Record.process.StartTime.ToFileTimeUtc()
-    try { $Record.image = [string]$Record.process.Path } catch { $Record.image = (Get-Process -Id $PID).Path }
+    try {
+        if ($script:TestFailProcessImageFor -eq $Record.name) { throw "injected process image failure for $($Record.name)" }
+        $Record.image = [string]$Record.process.Path
+    } catch { $Record.image = $null }
     return $Record
 }
 function Start-Runner([string]$Name, [string]$Shell, [string]$Runner, [string]$DataPath, [string]$WorkingDirectory, [string]$AuditPath, $Owned) {
@@ -485,6 +489,15 @@ if($Mode -eq 'fail'){exit 9}; while($true){Start-Sleep -Milliseconds 25}
         Send-ServerIdentity $successControl $successRun $successServerPipe 1 1 $success
         $null=Wait-Json $successClient $success ([datetime]::UtcNow.AddSeconds(8)) 'simulated High client'; $null=Wait-Json $successAudit $success ([datetime]::UtcNow.AddSeconds(12)) 'successful High cleanup audit'; Assert-Audit $successAudit @('successful-high-host','successful-high-client') 'successful simulated High'
     } finally { $successControl.Dispose() }
+    $allExitedOut = New-FreshDirectory $root 'all-exited-evidence'
+    $allExitedAudit = Join-Path $allExitedOut 'audit.json'
+    $allExitedData = New-RunnerData $allExitedOut $root (Join-Path $allExitedOut 'stop') $allExitedAudit @([ordered]@{name='all-exited-child';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','client','-Evidence',(Join-Path $allExitedOut 'client.json'),'-StopPath',(Join-Path $allExitedOut 'stop'));env=@{};start='immediate';stdout=(Join-Path $allExitedOut 'child.out');stderr=(Join-Path $allExitedOut 'child.err')}) $null $null 5
+    $allExitedPath = Join-Path $root 'all-exited.json'
+    Write-JsonFresh $allExitedPath $allExitedData
+    $allExited = Start-Runner 'all-exited' $shell $runner $allExitedPath $root $allExitedAudit $owned
+    $null = Wait-Json $allExitedAudit $allExited ([datetime]::UtcNow.AddSeconds(8)) 'all-exited audit'
+    Assert-Audit $allExitedAudit @('all-exited-child') 'all-exited runner'
+    Write-Host 'SelfTest verified normal all-exited runner completion'
     $failedChildOut = New-FreshDirectory $root 'failed-child-audit-evidence'
     $failedChildAudit = Join-Path $failedChildOut 'audit.json'
     $failedChildData = New-RunnerData $failedChildOut $root (Join-Path $failedChildOut 'stop') $failedChildAudit @([ordered]@{name='failing-child';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','fail','-Evidence',(Join-Path $failedChildOut 'unused.json'),'-StopPath',(Join-Path $failedChildOut 'stop'));env=@{};start='immediate';stdout=(Join-Path $failedChildOut 'child.out');stderr=(Join-Path $failedChildOut 'child.err')}) $null $null 5
@@ -531,6 +544,13 @@ if($Mode -eq 'fail'){exit 9}; while($true){Start-Sleep -Milliseconds 25}
     if ($metadataRecord.name -ne 'metadata-retention' -or $null -eq $metadataRecord.process) { throw 'metadata failure lost the retained runner record' }
     $null = Stop-Retained $metadataRecord 12000
     Write-Host 'SelfTest retained and cleaned the runner after injected metadata failure'
+    $script:TestFailProcessImageFor = 'image-unavailable'
+    try {
+        $imageRecord = Start-Runner 'image-unavailable' $shell $runner $launchPath $root (Join-Path $launchOut 'image-audit.json') $owned
+        if ($null -ne $imageRecord.image -or $imageRecord.image -eq $controller.image) { throw 'unavailable child image was replaced with controller image' }
+        $null = Stop-Retained $imageRecord 12000
+    } finally { $script:TestFailProcessImageFor = $null }
+    Write-Host 'SelfTest records an unavailable child image without substituting the controller image'
     $timeoutOut=New-FreshDirectory $root 'timeout-evidence'; $timeoutData=New-RunnerData $timeoutOut $root (Join-Path $timeoutOut 'stop') (Join-Path $timeoutOut 'audit.json') @([ordered]@{name='hang';exe=$shell;args=@('-NoProfile','-File',$child,'-Mode','hang','-Evidence',(Join-Path $timeoutOut 'x'),' -StopPath',(Join-Path $timeoutOut 'stop'));env=@{};start='immediate';stdout=(Join-Path $timeoutOut 'o');stderr=(Join-Path $timeoutOut 'e')}) $controller $null 1; $timeoutPath=Join-Path $root 'timeout.json'; Write-JsonFresh $timeoutPath $timeoutData; $timeout=Start-Runner 'timeout' $shell $runner $timeoutPath $root (Join-Path $timeoutOut 'audit.json') $owned; $timeout.process.WaitForExit(12000)|Out-Null; if($timeout.process.ExitCode -eq 0 -or -not (Test-Path -LiteralPath (Join-Path $timeoutOut 'audit.json'))){throw 'timeout cleanup/audit failed'}
     $lossOut=New-FreshDirectory $root 'controller-loss-evidence'
     $lossStop=Join-Path $lossOut 'stop'

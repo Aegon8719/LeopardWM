@@ -200,6 +200,7 @@ try {
     $handoffSpecs = @($Data.children | Where-Object { [string]$_.start -eq 'handoff' })
     if ($handoffSpecs.Count -gt 1) { throw 'runner permits one handoff child' }
     $handoffStarted = $handoffSpecs.Count -eq 0
+    $completed = $false
     while ([datetime]::UtcNow -lt $Deadline) {
         if ($null -ne $Controller -and -not (Test-ControllerIdentityAlive $Controller)) { throw 'controller identity lost' }
         if (-not $handoffStarted) {
@@ -213,13 +214,19 @@ try {
                 if ($record.StopAfterExit -and -not (Test-Path -LiteralPath ([string]$Data.stopPath))) { Set-Content -LiteralPath ([string]$Data.stopPath) -Value 'stop' }
             }
         }
-        if (Test-Path -LiteralPath ([string]$Data.stopPath)) { break }
+        if (Test-Path -LiteralPath ([string]$Data.stopPath)) {
+            $completed = $true
+            break
+        }
         $allExited = $Started.Count -gt 0
         foreach ($record in $Started) { if (-not $record.Process.HasExited) { $allExited = $false } }
-        if ($allExited -and $handoffStarted) { break }
+        if ($allExited -and $handoffStarted) {
+            $completed = $true
+            break
+        }
         Start-Sleep -Milliseconds 100
     }
-    if ([datetime]::UtcNow -ge $Deadline) { throw 'runner deadline exceeded' }
+    if (-not $completed) { throw 'runner deadline exceeded' }
 } catch { $Failures.Add("$_") | Out-Null } finally {
     foreach ($record in $Started) { try { $code = Stop-Child $record; if ($code -ne 0) { $Failures.Add("$($record.Name) exit $code") | Out-Null } } catch { $Failures.Add("cleanup $($record.Name): $_") | Out-Null } }
     if ($Failures.Count -eq 0) { $exitCode = 0 }

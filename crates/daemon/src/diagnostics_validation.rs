@@ -491,7 +491,13 @@ fn create_hidden_fixture() -> Result<FixtureWindow, String> {
     }
     let hwnd = match create_message_only_hwnd(&class_w, &title_w) {
         Ok(hwnd) => hwnd,
-        Err(_) => create_hidden_popup_hwnd(&class_w, &title_w)?,
+        Err(_) => match create_hidden_popup_hwnd(&class_w, &title_w) {
+            Ok(hwnd) => hwnd,
+            Err(error) => {
+                let _ = unsafe { UnregisterClassW(windows::core::PCWSTR(class_w.as_ptr()), None) };
+                return Err(error);
+            }
+        },
     };
     if window_is_visible(hwnd) {
         let _ = unsafe { DestroyWindow(hwnd) };
@@ -686,6 +692,7 @@ fn run_owned_fixture_thread(
         let result = (|| {
             let fixture = create_hidden_fixture()?;
             let hwnd = fixture.hwnd;
+            let _guard = FixtureGuard(Some(fixture));
             let live_pid =
                 fixture_pid(hwnd).ok_or_else(|| "owned HWND pid unreadable".to_string())?;
             if live_pid != pid {
@@ -698,7 +705,6 @@ fn run_owned_fixture_thread(
                 image,
                 title: FIXTURE_TITLE.to_string(),
             };
-            let _guard = FixtureGuard(Some(fixture));
             verify_live_fixture(&identity)?;
             write_fixture_evidence(&dir, &identity, false)?;
             pump_until(&stop, Instant::now() + timeout);
