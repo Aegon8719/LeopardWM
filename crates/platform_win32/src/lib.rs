@@ -27,6 +27,8 @@ pub mod toast;
 
 pub use tab_strip::{TabAction, TabActionEvent, TabCloseAction};
 
+#[cfg(test)]
+mod clipping_proof;
 mod elevation;
 mod enumeration;
 mod event_hooks;
