@@ -2663,11 +2663,9 @@ impl AppState {
                 self.reconcile_monitors(new_monitors);
                 self.reconcile_application_fullscreen_sessions();
 
-                // Correct any window whose minimized flag went stale across the
-                // topology change (e.g. a monitor waking un-minimizes its
-                // windows but the restored stash still has them flagged), so the
-                // re-apply below tiles what is actually on screen.
-                self.resync_minimized_from_os();
+                // Correct stale minimized flags, then park restored inactive
+                // workspace windows that apply_layout will not place.
+                self.prepare_inactive_workspace_windows();
 
                 // Re-apply layout with updated monitor configuration
                 if let Err(e) = self.apply_layout() {

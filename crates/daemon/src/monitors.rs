@@ -370,6 +370,42 @@ impl AppState {
         }
     }
 
+    /// After workspace model and fullscreen sessions are current, resync
+    /// minimized flags from the OS and park inactive-workspace windows that
+    /// `apply_layout` will not place. Shared by startup and display-change
+    /// reconciliation so a stashed reconnect cannot leave those windows on the
+    /// remaining monitor.
+    pub(crate) fn prepare_inactive_workspace_windows(&mut self) {
+        self.resync_minimized_from_os();
+        // Shutdown recovers parked windows; apply_layout only places active workspaces.
+        for (&monitor, workspaces) in &self.workspaces {
+            let active = self.active_workspace_idx(monitor);
+            for (index, workspace) in workspaces.iter().enumerate() {
+                if index == active {
+                    continue;
+                }
+                for wid in workspace.all_window_ids() {
+                    if workspace.is_minimized(wid) || self.is_application_fullscreen(wid) {
+                        continue;
+                    }
+                    let (chrome_rect, dwm_rect) = self.application_fullscreen_geometry(wid);
+                    if let Some(session) = self.observe_application_fullscreen(
+                        wid,
+                        chrome_rect,
+                        dwm_rect,
+                        leopardwm_platform_win32::is_window_maximized(wid),
+                    ) {
+                        self.application_fullscreen.insert(wid, session);
+                        continue;
+                    }
+                    if let Err(e) = leopardwm_platform_win32::move_window_offscreen(wid) {
+                        warn!("Failed to park inactive workspace window {:#x}: {}", wid, e);
+                    }
+                }
+            }
+        }
+    }
+
     /// Reconcile every managed window's minimized flag with the OS.
     ///
     /// A monitor sleep/wake cycle desyncs this: a stashed workspace restored on

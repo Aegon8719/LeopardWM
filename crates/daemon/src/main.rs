@@ -752,37 +752,7 @@ async fn sync_pending_layout_apply_timeout_ui(
 }
 
 fn prepare_initial_layout(state: &mut AppState) {
-    state.resync_minimized_from_os();
-    // Shutdown recovers parked windows; the first layout only places active workspaces.
-    for (&monitor, workspaces) in &state.workspaces {
-        let active = state.active_workspace_idx(monitor);
-        for (index, workspace) in workspaces.iter().enumerate() {
-            if index == active {
-                continue;
-            }
-            for wid in workspace.all_window_ids() {
-                if workspace.is_minimized(wid) || state.is_application_fullscreen(wid) {
-                    continue;
-                }
-                let (chrome_rect, dwm_rect) = state.application_fullscreen_geometry(wid);
-                if let Some(session) = state.observe_application_fullscreen(
-                    wid,
-                    chrome_rect,
-                    dwm_rect,
-                    leopardwm_platform_win32::is_window_maximized(wid),
-                ) {
-                    state.application_fullscreen.insert(wid, session);
-                    continue;
-                }
-                if let Err(e) = leopardwm_platform_win32::move_window_offscreen(wid) {
-                    warn!(
-                        "Failed to park inactive workspace window {:#x} at startup: {}",
-                        wid, e
-                    );
-                }
-            }
-        }
-    }
+    state.prepare_inactive_workspace_windows();
 }
 
 async fn apply_initial_layout(

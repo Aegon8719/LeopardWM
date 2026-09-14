@@ -11809,6 +11809,186 @@ fn test_initial_layout_parks_restored_inactive_windows() {
 }
 
 #[test]
+fn test_display_reconcile_parks_restored_inactive_windows() {
+    use windows::core::w;
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MINIMIZE, WS_POPUP,
+    };
+
+    struct TestWindow(HWND);
+    impl TestWindow {
+        fn new(minimized: bool) -> Self {
+            Self(unsafe {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                    w!("STATIC"),
+                    w!(""),
+                    if minimized {
+                        WS_POPUP | WS_MINIMIZE
+                    } else {
+                        WS_POPUP
+                    },
+                    100,
+                    100,
+                    200,
+                    100,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+        }
+
+        fn id(&self) -> u64 {
+            self.0 .0 as u64
+        }
+
+        fn rect(&self) -> Rect {
+            let mut rect = RECT::default();
+            unsafe { GetWindowRect(self.0, &mut rect).unwrap() };
+            Rect::new(
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+            )
+        }
+    }
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    let active_primary = TestWindow::new(false);
+    let active_returning = TestWindow::new(false);
+    let inactive_tiled = TestWindow::new(false);
+    let inactive_floating = TestWindow::new(false);
+    let fullscreen = TestWindow::new(false);
+    unsafe {
+        SetWindowPos(
+            fullscreen.0,
+            None,
+            0,
+            0,
+            1920,
+            1080,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+        .unwrap();
+    }
+    let minimized = TestWindow::new(true);
+    let unmanaged = TestWindow::new(false);
+    let windows = [
+        &active_primary,
+        &active_returning,
+        &inactive_tiled,
+        &inactive_floating,
+        &fullscreen,
+        &minimized,
+        &unmanaged,
+    ];
+    let before: HashMap<_, _> = windows
+        .iter()
+        .map(|window| (window.id(), window.rect()))
+        .collect();
+    let expected_parked = HashSet::from([inactive_tiled.id(), inactive_floating.id()]);
+
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(active_primary.id(), Some(640))
+        .unwrap();
+
+    let mut returning_inactive = Workspace::default();
+    returning_inactive
+        .insert_window(inactive_tiled.id(), Some(720))
+        .unwrap();
+    returning_inactive
+        .insert_window(minimized.id(), Some(480))
+        .unwrap();
+    returning_inactive.mark_minimized(minimized.id());
+    returning_inactive
+        .add_floating(inactive_floating.id(), before[&inactive_floating.id()])
+        .unwrap();
+    returning_inactive
+        .insert_window(fullscreen.id(), Some(800))
+        .unwrap();
+
+    let mut returning_active = Workspace::default();
+    returning_active
+        .insert_window(active_returning.id(), Some(600))
+        .unwrap();
+
+    state
+        .workspaces
+        .insert(2, vec![returning_inactive, returning_active]);
+    state.active_workspace.insert(2, 1);
+
+    state.reconcile_monitors(test_monitors());
+    assert!(!state.workspaces.contains_key(&2));
+    assert!(state.workspaces[&1][0].contains_window(inactive_tiled.id()));
+    assert!(state.workspaces[&1][0].contains_window(active_returning.id()));
+    assert!(state.stashed_monitor_layouts.contains_key("DISPLAY2"));
+
+    let mut returned = two_monitors();
+    returned[1].id = 99;
+    state.reconcile_monitors(returned);
+
+    assert!(state.workspaces.contains_key(&99));
+    assert_eq!(state.active_workspace_idx(99), 1);
+    assert!(state.workspaces[&99][0].contains_window(inactive_tiled.id()));
+    assert!(state.workspaces[&99][0].is_floating(inactive_floating.id()));
+    assert!(state.workspaces[&99][1].contains_window(active_returning.id()));
+    assert!(!state.workspaces[&1][0].contains_window(inactive_tiled.id()));
+    assert!(!state.stashed_monitor_layouts.contains_key("DISPLAY2"));
+    for window in [&inactive_tiled, &inactive_floating] {
+        assert_eq!(
+            window.rect(),
+            before[&window.id()],
+            "monitor restore must not park native windows by itself"
+        );
+    }
+
+    let membership = state.all_managed_window_ids();
+    for _ in 0..2 {
+        state.prepare_inactive_workspace_windows();
+        assert_eq!(state.active_workspace_idx(1), 0);
+        assert_eq!(state.active_workspace_idx(99), 1);
+        assert_eq!(state.all_managed_window_ids(), membership);
+        assert!(!state.workspaces[&99][0].is_minimized(inactive_tiled.id()));
+        assert!(state.workspaces[&99][0].is_minimized(minimized.id()));
+        for window in windows {
+            let rect = window.rect();
+            let original = before[&window.id()];
+            if expected_parked.contains(&window.id()) {
+                assert!(
+                    leopardwm_platform_win32::is_move_offscreen_sentinel_rect(&rect),
+                    "restored inactive HWND {} must be physically parked, got {rect:?}",
+                    window.id()
+                );
+                assert_eq!((rect.width, rect.height), (original.width, original.height));
+            } else {
+                assert_eq!(
+                    rect, original,
+                    "display reconcile must not move active, minimized, application-fullscreen or unmanaged windows"
+                );
+            }
+            assert!(!leopardwm_platform_win32::is_window_visible(window.id()));
+        }
+        assert!(state.is_application_fullscreen(fullscreen.id()));
+        assert_eq!(state.workspaces[&99][0].columns()[0].width(), 720);
+        assert_eq!(
+            state.workspaces[&99][0].floating_windows()[0].rect,
+            before[&inactive_floating.id()]
+        );
+    }
+}
+
+#[test]
 fn test_restore_structure_reapplies_snap_suppression() {
     use windows::core::w;
     use windows::Win32::Foundation::HWND;
