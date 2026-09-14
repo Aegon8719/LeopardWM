@@ -11811,65 +11811,13 @@ fn test_initial_layout_parks_restored_inactive_windows() {
 
 #[test]
 fn test_display_reconcile_parks_restored_inactive_windows() {
-    use windows::core::w;
-    use windows::Win32::Foundation::{HWND, RECT};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MINIMIZE, WS_POPUP,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
 
-    struct TestWindow(HWND);
-    impl TestWindow {
-        fn new(minimized: bool) -> Self {
-            Self(unsafe {
-                CreateWindowExW(
-                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-                    w!("STATIC"),
-                    w!(""),
-                    if minimized {
-                        WS_POPUP | WS_MINIMIZE
-                    } else {
-                        WS_POPUP
-                    },
-                    100,
-                    100,
-                    200,
-                    100,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .unwrap()
-            })
-        }
-
-        fn id(&self) -> u64 {
-            self.0 .0 as u64
-        }
-
-        fn rect(&self) -> Rect {
-            let mut rect = RECT::default();
-            unsafe { GetWindowRect(self.0, &mut rect).unwrap() };
-            Rect::new(
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-            )
-        }
-    }
-    impl Drop for TestWindow {
-        fn drop(&mut self) {
-            let _ = unsafe { DestroyWindow(self.0) };
-        }
-    }
-
-    let active_primary = TestWindow::new(false);
-    let active_returning = TestWindow::new(false);
-    let inactive_tiled = TestWindow::new(false);
-    let inactive_floating = TestWindow::new(false);
-    let fullscreen = TestWindow::new(false);
+    let active_primary = ParkProbeWindow::new(false);
+    let active_returning = ParkProbeWindow::new(false);
+    let inactive_tiled = ParkProbeWindow::new(false);
+    let inactive_floating = ParkProbeWindow::new(false);
+    let fullscreen = ParkProbeWindow::new(false);
     unsafe {
         SetWindowPos(
             fullscreen.0,
@@ -11882,8 +11830,8 @@ fn test_display_reconcile_parks_restored_inactive_windows() {
         )
         .unwrap();
     }
-    let minimized = TestWindow::new(true);
-    let unmanaged = TestWindow::new(false);
+    let minimized = ParkProbeWindow::new(true);
+    let unmanaged = ParkProbeWindow::new(false);
     let windows = [
         &active_primary,
         &active_returning,
@@ -12140,10 +12088,15 @@ fn test_resume_parks_inactive_windows_and_syncs_taskbar() {
                 window.id()
             );
             assert_eq!((rect.width, rect.height), (original.width, original.height));
+        } else if window.id() == active.id() {
+            assert_eq!(
+                rect, original,
+                "active window is unmoved by parking while the active apply backend is faked"
+            );
         } else {
             assert_eq!(
                 rect, original,
-                "resume must not move active, minimized, application-fullscreen or unmanaged windows"
+                "resume parking must not move minimized, application-fullscreen or unmanaged windows"
             );
         }
         assert!(!leopardwm_platform_win32::is_window_visible(window.id()));
