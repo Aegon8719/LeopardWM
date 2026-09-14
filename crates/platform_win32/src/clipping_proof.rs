@@ -8,8 +8,8 @@
 //! '--exact','clipping_proof::framed_window_region_viability','--ignored','--nocapture'`; with
 //! `LEOPARDWM_RUN_FRAMED_WINDOW_CLIPPING_PROOF=1`, stop only `$p.Id` if it exceeds 15 seconds.
 //! For `clipping_proof::known_state_region_ownership_recovery_matrix`, retain that same exact
-//! executable for 125 seconds; the matrix itself exits at 120 seconds and each fixture/controller
-//! role exits at 10 seconds.
+//! executable for 125 seconds; the matrix itself exits at 120 seconds, controllers at 12 seconds,
+//! and fixtures at 30 seconds.
 
 use std::ffi::c_void;
 use std::io::{BufRead, BufReader, Write};
@@ -58,8 +58,11 @@ const MATRIX_EXPECTED_FAULT_EXIT: i32 = 86;
 const MATRIX_GENERATION_PROPERTY: &str = "LeopardWMClippingProofGeneration";
 const MATRIX_OWNERSHIP_PROPERTY: &str = "LeopardWMClippingProofOwnership";
 const MATRIX_TEST_NAME: &str = "clipping_proof::known_state_region_ownership_recovery_matrix";
-const MATRIX_DEADLINE: Duration = Duration::from_secs(10);
+const MATRIX_PROTOCOL_WAIT: Duration = Duration::from_secs(4);
+const MATRIX_CONTROLLER_DEADLINE: Duration = Duration::from_secs(12);
+const MATRIX_FIXTURE_DEADLINE: Duration = Duration::from_secs(30);
 const MATRIX_SUPERVISOR_DEADLINE: Duration = Duration::from_secs(120);
+const MATRIX_EXTERNAL_SUPERVISOR_DEADLINE: Duration = Duration::from_secs(125);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Bounds {
@@ -343,6 +346,9 @@ impl OwnedFixtureWindow {
     }
 
     unsafe fn cleanup(&mut self) -> Result<Option<Duration>, String> {
+        if self.hwnd.is_invalid() {
+            return Ok(None);
+        }
         let mut failures = Vec::new();
         if self.region_installed {
             if let Err(error) = self.clear_region() {
@@ -702,15 +708,6 @@ enum KnownRegionState {
     Complex,
 }
 
-fn guard_known_region_mutation<T>(
-    state: Option<KnownRegionState>,
-    mutate: impl FnOnce(KnownRegionState) -> T,
-) -> Result<T, String> {
-    state
-        .map(mutate)
-        .ok_or_else(|| "INCONCLUSIVE: unknown original region is not mutated".to_owned())
-}
-
 impl KnownRegionState {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
@@ -736,6 +733,57 @@ impl KnownRegionState {
 enum SerializedRegion {
     Absent,
     Data(Vec<u8>),
+}
+
+struct AlignedRegionData {
+    words: Vec<u32>,
+    byte_len: usize,
+}
+
+impl AlignedRegionData {
+    fn zeroed(byte_len: usize) -> Result<Self, String> {
+        let word_len = byte_len
+            .checked_add(std::mem::size_of::<u32>() - 1)
+            .ok_or_else(|| {
+                "INCONCLUSIVE: region data length overflowed alignment storage".to_owned()
+            })?
+            / std::mem::size_of::<u32>();
+        Ok(Self {
+            words: vec![0; word_len],
+            byte_len,
+        })
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let mut data = Self::zeroed(bytes.len())?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                data.words.as_mut_ptr().cast::<u8>(),
+                bytes.len(),
+            );
+        }
+        Ok(data)
+    }
+
+    fn byte_len_u32(&self) -> Result<u32, String> {
+        u32::try_from(self.byte_len)
+            .map_err(|_| "INCONCLUSIVE: region data length exceeded Win32 limits".to_owned())
+    }
+
+    fn as_rgndata(&self) -> *const RGNDATA {
+        self.words.as_ptr().cast()
+    }
+
+    fn as_mut_rgndata(&mut self) -> *mut RGNDATA {
+        self.words.as_mut_ptr().cast()
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        unsafe {
+            std::slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), self.byte_len).to_vec()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -875,12 +923,12 @@ unsafe fn serialize_region(region: HRGN) -> Result<SerializedRegion, String> {
     if required == 0 {
         return Err("INCONCLUSIVE: region serialization length was unavailable".to_owned());
     }
-    let mut bytes = vec![0u8; required as usize];
-    let copied = GetRegionData(region, required, Some(bytes.as_mut_ptr() as *mut RGNDATA));
+    let mut data = AlignedRegionData::zeroed(required as usize)?;
+    let copied = GetRegionData(region, required, Some(data.as_mut_rgndata()));
     if copied != required {
         return Err("INCONCLUSIVE: region serialization was incomplete".to_owned());
     }
-    Ok(SerializedRegion::Data(bytes))
+    Ok(SerializedRegion::Data(data.into_bytes()))
 }
 
 unsafe fn serialize_installed_region(hwnd: HWND) -> Result<SerializedRegion, String> {
@@ -963,7 +1011,8 @@ unsafe fn install_serialized_region(hwnd: HWND, region: &SerializedRegion) -> Re
     let SerializedRegion::Data(bytes) = region else {
         return Err("INCONCLUSIVE: application replacement was unexpectedly absent".to_owned());
     };
-    let handle = ExtCreateRegion(None, bytes.len() as u32, bytes.as_ptr() as *const RGNDATA);
+    let data = AlignedRegionData::from_bytes(bytes)?;
+    let handle = ExtCreateRegion(None, data.byte_len_u32()?, data.as_rgndata());
     if handle.is_invalid() {
         return Err(
             "INCONCLUSIVE: could not reconstruct application replacement region".to_owned(),
@@ -1017,8 +1066,8 @@ unsafe fn restore_serialized_region_injected(
             }
         }
         SerializedRegion::Data(bytes) => {
-            let restored =
-                ExtCreateRegion(None, bytes.len() as u32, bytes.as_ptr() as *const RGNDATA);
+            let data = AlignedRegionData::from_bytes(bytes)?;
+            let restored = ExtCreateRegion(None, data.byte_len_u32()?, data.as_rgndata());
             if restored.is_invalid() {
                 return Err("MECHANICAL FAIL: failed to reconstruct serialized region".to_owned());
             }
@@ -1288,7 +1337,8 @@ unsafe fn install_owned_clip(
         layout.name(),
         layout.allowed_slice()
     );
-    let clip = ExtCreateRegion(None, bytes.len() as u32, bytes.as_ptr() as *const RGNDATA);
+    let data = AlignedRegionData::from_bytes(bytes)?;
+    let clip = ExtCreateRegion(None, data.byte_len_u32()?, data.as_rgndata());
     if clip.is_invalid() {
         return Err("INCONCLUSIVE: could not reconstruct matrix clipping region".to_owned());
     }
@@ -1346,7 +1396,8 @@ unsafe fn install_progress_owned_region(
     let SerializedRegion::Data(bytes) = expected else {
         return Err("INCONCLUSIVE: owned progress region was unexpectedly absent".to_owned());
     };
-    let region = ExtCreateRegion(None, bytes.len() as u32, bytes.as_ptr() as *const RGNDATA);
+    let data = AlignedRegionData::from_bytes(bytes)?;
+    let region = ExtCreateRegion(None, data.byte_len_u32()?, data.as_rgndata());
     if region.is_invalid() {
         return Err("INCONCLUSIVE: could not reconstruct owned progress region".to_owned());
     }
@@ -1543,15 +1594,6 @@ unsafe fn verify_known_region(
             }
             Ok(())
         }
-    }
-}
-
-fn retry_restore_once<T>(mut restore: impl FnMut() -> Result<T, String>) -> Result<T, String> {
-    match restore() {
-        Ok(value) => Ok(value),
-        Err(first_error) => restore().map_err(|retry_error| {
-            format!("MECHANICAL FAIL: restoration retry failed after {first_error}; {retry_error}")
-        }),
     }
 }
 
@@ -1756,7 +1798,7 @@ fn wait_for_matrix_line(
     receiver: &mpsc::Receiver<Result<String, String>>,
     prefix: &str,
 ) -> Result<String, String> {
-    let deadline = Instant::now() + MATRIX_DEADLINE;
+    let deadline = Instant::now() + MATRIX_PROTOCOL_WAIT;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1940,34 +1982,52 @@ impl Drop for RetainedMatrixController {
     }
 }
 
+fn boundary_exit_code_is_unexpected(code: Option<i32>) -> bool {
+    code != Some(1)
+}
+
 fn terminate_retained_controller(
     child: &mut Child,
     boundary: MatrixBoundary,
 ) -> Result<(), String> {
-    child.kill().map_err(|error| {
-        format!(
-            "INCONCLUSIVE: failed to terminate retained controller at {}: {error}",
+    if let Some(status) = child.try_wait().map_err(|error| {
+        format!("INCONCLUSIVE: failed to query retained controller before termination: {error}")
+    })? {
+        return Err(format!(
+            "INCONCLUSIVE: controller exited before intended termination at {} with {status}",
             boundary.phase()
-        )
-    })?;
+        ));
+    }
+    if let Err(kill_error) = child.kill() {
+        return match child.wait() {
+            Ok(status) => Err(format!(
+                "INCONCLUSIVE: failed to terminate retained controller at {}: {kill_error}; reaped retained controller as {status}",
+                boundary.phase()
+            )),
+            Err(wait_error) => Err(format!(
+                "INCONCLUSIVE: failed to terminate retained controller at {}: {kill_error}; failed to reap retained controller: {wait_error}",
+                boundary.phase()
+            )),
+        };
+    }
     let status = child
         .wait()
         .map_err(|error| format!("INCONCLUSIVE: failed to reap retained controller: {error}"))?;
-    if status.success() {
-        return Err(
-            "INCONCLUSIVE: controller unexpectedly exited successfully after termination"
-                .to_owned(),
-        );
+    if boundary_exit_code_is_unexpected(status.code()) {
+        return Err(format!(
+            "INCONCLUSIVE: controller termination at {} lacked intentional-kill evidence; reaped status {status}",
+            boundary.phase()
+        ));
     }
     eprintln!(
-        "clipping-matrix-supervisor state=controller-terminated boundary={}",
+        "clipping-matrix-supervisor state=controller-terminated boundary={} exit={status}",
         boundary.phase()
     );
     Ok(())
 }
 
 fn wait_for_matrix_child(child: &mut Child, role: &str) -> Result<ExitStatus, String> {
-    let deadline = Instant::now() + MATRIX_DEADLINE;
+    let deadline = Instant::now() + MATRIX_PROTOCOL_WAIT;
     loop {
         if let Some(status) = child
             .try_wait()
@@ -1977,7 +2037,7 @@ fn wait_for_matrix_child(child: &mut Child, role: &str) -> Result<ExitStatus, St
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "INCONCLUSIVE: retained {role} exceeded matrix deadline"
+                "INCONCLUSIVE: retained {role} exceeded {MATRIX_PROTOCOL_WAIT:?} protocol wait"
             ));
         }
         thread::sleep(Duration::from_millis(20));
@@ -2006,7 +2066,7 @@ unsafe fn run_matrix_fixture(state: KnownRegionState, layout: MatrixLayout) -> R
         .flush()
         .map_err(|error| format!("INCONCLUSIVE: fixture boot flush failed: {error}"))?;
     let expected_bind = format!("bind {process_id} {creation_filetime}");
-    match command_rx.recv_timeout(MATRIX_DEADLINE) {
+    match command_rx.recv_timeout(MATRIX_PROTOCOL_WAIT) {
         Ok(Ok(command)) if command == expected_bind => {}
         Ok(Ok(command)) => {
             return Err(format!(
@@ -2215,6 +2275,7 @@ fn parse_matrix_fixture_descriptor(value: &str) -> Result<FixtureIdentity, Strin
 
 fn run_matrix_with_deadline(
     role: &str,
+    deadline: Duration,
     work: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     let (stop_tx, stop_rx) = mpsc::channel();
@@ -2222,7 +2283,7 @@ fn run_matrix_with_deadline(
     let watchdog = thread::Builder::new()
         .name(format!("clipping-matrix-{role}-deadline"))
         .spawn(move || {
-            if stop_rx.recv_timeout(MATRIX_DEADLINE).is_err() {
+            if stop_rx.recv_timeout(deadline).is_err() {
                 eprintln!("clipping-matrix-{role} state=deadline-process-exit");
                 std::process::exit(124);
             }
@@ -2245,9 +2306,9 @@ fn run_matrix_role() -> Result<(), String> {
     )?;
     let layout = MatrixLayout::parse(std::env::var(MATRIX_LAYOUT_ENV).ok())?;
     match role.as_str() {
-        "fixture" => {
-            run_matrix_with_deadline("fixture", || unsafe { run_matrix_fixture(state, layout) })
-        }
+        "fixture" => run_matrix_with_deadline("fixture", MATRIX_FIXTURE_DEADLINE, || unsafe {
+            run_matrix_fixture(state, layout)
+        }),
         "controller" => {
             let identity = parse_matrix_fixture_descriptor(
                 &std::env::var(MATRIX_FIXTURE_ENV)
@@ -2255,9 +2316,10 @@ fn run_matrix_role() -> Result<(), String> {
             )?;
             let boundary = MatrixBoundary::parse(std::env::var(MATRIX_BOUNDARY_ENV).ok())?;
             let fault = MatrixFault::parse(std::env::var(MATRIX_FAULT_ENV).ok())?;
-            let result = run_matrix_with_deadline("controller", || unsafe {
-                run_matrix_controller(identity, state, layout, boundary, fault)
-            });
+            let result =
+                run_matrix_with_deadline("controller", MATRIX_CONTROLLER_DEADLINE, || unsafe {
+                    run_matrix_controller(identity, state, layout, boundary, fault)
+                });
             if let Some(fault) = fault {
                 if fault.is_controller_fault()
                     && matches!(&result, Err(error) if error.starts_with("INJECTED:"))
@@ -2688,39 +2750,52 @@ unsafe fn run_matrix_stale_identity_case(
 }
 
 #[test]
-fn unknown_matrix_region_state_is_rejected_before_fixture_mutation() {
+fn unknown_matrix_region_state_is_rejected_by_role_parser() {
     assert!(matches!(
         KnownRegionState::parse("unknown"),
         Err(reason) if reason.contains("unknown matrix region state")
     ));
-    let mut mutation_attempted = false;
-    let result = guard_known_region_mutation(None, |_| mutation_attempted = true);
-    assert!(matches!(result, Err(reason) if reason.contains("unknown original region")));
-    assert!(!mutation_attempted);
 }
 
 #[test]
-fn injected_restore_failure_retries_once_and_preserves_terminal_failure() {
-    let mut attempts = 0;
-    assert_eq!(
-        retry_restore_once(|| {
-            attempts += 1;
-            (attempts == 2)
-                .then_some(())
-                .ok_or_else(|| "first failure".to_owned())
-        }),
-        Ok(())
-    );
-    assert_eq!(attempts, 2);
+fn already_cleaned_fixture_cleanup_is_a_noop() {
+    let mut fixture = OwnedFixtureWindow {
+        hwnd: HWND::default(),
+        region_installed: false,
+        visible_since: None,
+    };
+    assert_eq!(unsafe { fixture.cleanup() }, Ok(None));
+}
 
-    let mut attempts = 0;
-    let error = retry_restore_once(|| {
-        attempts += 1;
-        Err::<(), _>(format!("failure-{attempts}"))
-    })
-    .unwrap_err();
-    assert_eq!(attempts, 2);
-    assert!(error.contains("failure-1") && error.contains("failure-2"));
+#[test]
+fn aligned_region_data_preserves_exact_bytes() {
+    let bytes = vec![1, 2, 3, 4, 5];
+    let data = AlignedRegionData::from_bytes(&bytes).unwrap();
+    assert_eq!(data.byte_len, bytes.len());
+    assert_eq!(
+        (data.as_rgndata() as usize) % std::mem::align_of::<RGNDATA>(),
+        0
+    );
+    assert_eq!(data.into_bytes(), bytes);
+}
+
+#[test]
+fn matrix_deadlines_and_boundary_exit_codes_are_ordered() {
+    assert!(MATRIX_PROTOCOL_WAIT < MATRIX_CONTROLLER_DEADLINE);
+    assert!(MATRIX_CONTROLLER_DEADLINE < MATRIX_FIXTURE_DEADLINE);
+    assert!(MATRIX_FIXTURE_DEADLINE < MATRIX_SUPERVISOR_DEADLINE);
+    assert!(MATRIX_SUPERVISOR_DEADLINE < MATRIX_EXTERNAL_SUPERVISOR_DEADLINE);
+    assert!(boundary_exit_code_is_unexpected(None));
+    assert!(boundary_exit_code_is_unexpected(Some(0)));
+    assert!(boundary_exit_code_is_unexpected(Some(101)));
+    assert!(boundary_exit_code_is_unexpected(Some(
+        0xC000_0005u32 as i32
+    )));
+    assert!(boundary_exit_code_is_unexpected(Some(124)));
+    assert!(boundary_exit_code_is_unexpected(Some(
+        MATRIX_EXPECTED_FAULT_EXIT
+    )));
+    assert!(!boundary_exit_code_is_unexpected(Some(1)));
 }
 
 #[test]
