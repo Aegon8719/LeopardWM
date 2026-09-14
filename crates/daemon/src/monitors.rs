@@ -374,9 +374,13 @@ impl AppState {
     /// minimized flags from the OS and park inactive-workspace windows that
     /// `apply_layout` will not place. Shared by startup and display-change
     /// reconciliation so a stashed reconnect cannot leave those windows on the
-    /// remaining monitor.
+    /// remaining monitor. Pause keeps the old display-change resync but skips
+    /// parking and fullscreen observation.
     pub(crate) fn prepare_inactive_workspace_windows(&mut self) {
         self.resync_minimized_from_os();
+        if self.paused {
+            return;
+        }
         // Shutdown recovers parked windows; apply_layout only places active workspaces.
         for (&monitor, workspaces) in &self.workspaces {
             let active = self.active_workspace_idx(monitor);

@@ -11772,6 +11772,7 @@ fn test_initial_layout_parks_restored_inactive_windows() {
     state.config.behavior.disable_snap_layouts = false;
     state.restore_workspace_structure(&snapshot);
     state.restore_state(&snapshot);
+    state.paused = false;
     let membership = state.all_managed_window_ids();
 
     for _ in 0..2 {
@@ -11907,6 +11908,7 @@ fn test_display_reconcile_parks_restored_inactive_windows() {
     returning_inactive
         .insert_window(inactive_tiled.id(), Some(720))
         .unwrap();
+    returning_inactive.mark_minimized(inactive_tiled.id());
     returning_inactive
         .insert_window(minimized.id(), Some(480))
         .unwrap();
@@ -11952,8 +11954,25 @@ fn test_display_reconcile_parks_restored_inactive_windows() {
             "monitor restore must not park native windows by itself"
         );
     }
+    assert!(state.paused);
+    assert!(state.workspaces[&99][0].is_minimized(inactive_tiled.id()));
 
     let membership = state.all_managed_window_ids();
+    state.prepare_inactive_workspace_windows();
+    assert_eq!(state.active_workspace_idx(1), 0);
+    assert_eq!(state.active_workspace_idx(99), 1);
+    assert_eq!(state.all_managed_window_ids(), membership);
+    assert!(!state.workspaces[&99][0].is_minimized(inactive_tiled.id()));
+    assert!(state.workspaces[&99][0].is_minimized(minimized.id()));
+    for window in windows {
+        assert_eq!(
+            window.rect(),
+            before[&window.id()],
+            "paused display preparation must not move native windows"
+        );
+    }
+
+    state.paused = false;
     for _ in 0..2 {
         state.prepare_inactive_workspace_windows();
         assert_eq!(state.active_workspace_idx(1), 0);
