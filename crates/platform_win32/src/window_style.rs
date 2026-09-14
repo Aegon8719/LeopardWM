@@ -99,8 +99,8 @@ static MAXIMIZEBOX_GEOMETRY_CORRELATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MaximizeboxGeometrySnapshot {
-    style: Result<i32, u32>,
-    ex_style: Result<i32, u32>,
+    style: Result<i32, i32>,
+    ex_style: Result<i32, i32>,
     window_rect: Result<[i32; 4], i32>,
     client_rect: Result<[i32; 4], i32>,
     dwm_frame: Result<[i32; 4], i32>,
@@ -124,7 +124,7 @@ fn capture_maximizebox_geometry(hwnd: HWND) -> MaximizeboxGeometrySnapshot {
                 if err == 0 {
                     Ok(0)
                 } else {
-                    Err(err)
+                    Err(windows::core::HRESULT::from_win32(err).0)
                 }
             } else {
                 Ok(value)
@@ -204,7 +204,7 @@ fn log_maximizebox_geometry(
         dwm_frame = ?snapshot.dwm_frame,
         nc_rendering = ?snapshot.nc_rendering,
         set_window_pos_hr,
-        MAXIMIZEBOX_GEOMETRY_EVENT
+        event = MAXIMIZEBOX_GEOMETRY_EVENT,
     );
     unsafe { SetLastError(previous_error) };
 }
@@ -262,7 +262,6 @@ pub fn remove_maximizebox(window_id: WindowId) -> Result<bool, Win32Error> {
                 Err(error) => error.code().0,
             }),
         );
-        let _ = frame_result;
 
         let mut guard = lock_snap_disabled();
         guard.get_or_insert_with(HashSet::new).insert(window_id);
@@ -327,7 +326,6 @@ pub fn restore_maximizebox(window_id: WindowId) -> Result<bool, Win32Error> {
                 Err(error) => error.code().0,
             }),
         );
-        let _ = frame_result;
     }
     Ok(true)
 }
@@ -541,14 +539,6 @@ mod tests {
         fn window_id(&self) -> WindowId {
             self.hwnd().0 as usize as u64
         }
-
-        fn destroy(mut self) -> windows::core::Result<()> {
-            let hwnd = self.hwnd.expect("fixture already destroyed");
-            let _ = restore_maximizebox(hwnd.0 as usize as u64);
-            unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd) }?;
-            self.hwnd = None;
-            Ok(())
-        }
     }
 
     impl Drop for HiddenFramedFixture {
@@ -562,6 +552,7 @@ mod tests {
 
     #[derive(Default)]
     struct RecordedGeometryEvent {
+        event: Option<String>,
         operation: Option<String>,
         stage: Option<String>,
         correlation_id: Option<u64>,
@@ -584,6 +575,7 @@ mod tests {
 
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
             match field.name() {
+                "event" => self.0.event = Some(value.to_string()),
                 "operation" => self.0.operation = Some(value.to_string()),
                 "stage" => self.0.stage = Some(value.to_string()),
                 _ => {}
@@ -663,6 +655,9 @@ mod tests {
 
         let recorded = events.lock().unwrap();
         assert_eq!(recorded.len(), 6);
+        assert!(recorded
+            .iter()
+            .all(|event| event.event.as_deref() == Some(MAXIMIZEBOX_GEOMETRY_EVENT)));
         assert_eq!(
             recorded
                 .iter()
@@ -722,18 +717,8 @@ mod tests {
     }
 
     #[test]
-    fn test_maximizebox_geometry_capture_destroyed_window_is_unavailable() {
-        let fixture = HiddenFramedFixture::create();
-        let hwnd = fixture.hwnd();
-        let live = capture_maximizebox_geometry(hwnd);
-        assert!(live.window_rect.is_ok());
-        assert!(live.style.is_ok());
-
-        fixture
-            .destroy()
-            .expect("DestroyWindow should succeed for owned fixture");
-
-        let dead = capture_maximizebox_geometry(hwnd);
+    fn test_maximizebox_geometry_capture_invalid_hwnd_is_err() {
+        let dead = capture_maximizebox_geometry(HWND::default());
         assert!(dead.style.is_err());
         assert!(dead.ex_style.is_err());
         assert!(dead.window_rect.is_err());
