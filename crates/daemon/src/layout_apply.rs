@@ -733,7 +733,7 @@ impl AppState {
 
         // Reposition border to track the focused window after layout changes.
         // A thumbnail-revoked source remains cloaked until this exact landing
-        // has current physical containment evidence.
+        // is current, confirmed, and not parked.
         if result.is_ok() {
             self.release_ghost_sources_after_physical_landing();
             self.finalize_layout_success();

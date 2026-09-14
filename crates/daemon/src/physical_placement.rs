@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct ConstrainedAxes {
+struct ConstrainedAxes {
     pub left: bool,
     pub right: bool,
     pub top: bool,
@@ -22,7 +22,7 @@ pub(crate) struct ConstrainedAxes {
 }
 
 impl ConstrainedAxes {
-    pub(crate) fn any(self) -> bool {
+    fn any(self) -> bool {
         self.left || self.right || self.top || self.bottom
     }
 }
@@ -30,7 +30,7 @@ impl ConstrainedAxes {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PhysicalDecision {
     Unchanged,
-    Constrained { rect: Rect, axes: ConstrainedAxes },
+    Constrained { rect: Rect },
     Parked { rect: Rect },
 }
 
@@ -251,7 +251,7 @@ pub(crate) fn project_physical_rect(
     if rects_equal(rect, window) {
         PhysicalDecision::Unchanged
     } else {
-        PhysicalDecision::Constrained { rect, axes }
+        PhysicalDecision::Constrained { rect }
     }
 }
 
@@ -1438,9 +1438,7 @@ mod tests {
         let neighbor = neighbor_800();
         let decision = project_physical_rect(window, owner, &[owner, neighbor]);
         match decision {
-            PhysicalDecision::Constrained { rect, axes } => {
-                assert!(axes.right);
-                assert!(!axes.left && !axes.top && !axes.bottom);
+            PhysicalDecision::Constrained { rect } => {
                 assert_eq!(rect, Rect::new(4320, 10, 800, 1440));
                 let overlap_w = edge_end(window.x, window.width) - neighbor.x as i64;
                 let overlap_h = overlap_len(
@@ -1463,24 +1461,21 @@ mod tests {
         let bottom = Rect::new(0, 1000, 1000, 600);
         let overflow_left = Rect::new(-200, 100, 500, 400);
         match project_physical_rect(overflow_left, owner, &[owner, left]) {
-            PhysicalDecision::Constrained { rect, axes } => {
-                assert!(axes.left);
+            PhysicalDecision::Constrained { rect } => {
                 assert_eq!(rect, Rect::new(0, 100, 300, 400));
             }
             other => panic!("{other:?}"),
         }
         let overflow_top = Rect::new(100, -200, 400, 500);
         match project_physical_rect(overflow_top, owner, &[owner, top]) {
-            PhysicalDecision::Constrained { rect, axes } => {
-                assert!(axes.top);
+            PhysicalDecision::Constrained { rect } => {
                 assert_eq!(rect, Rect::new(100, 0, 400, 300));
             }
             other => panic!("{other:?}"),
         }
         let overflow_bottom = Rect::new(100, 800, 400, 400);
         match project_physical_rect(overflow_bottom, owner, &[owner, bottom]) {
-            PhysicalDecision::Constrained { rect, axes } => {
-                assert!(axes.bottom);
+            PhysicalDecision::Constrained { rect } => {
                 assert_eq!(rect, Rect::new(100, 800, 400, 200));
             }
             other => panic!("{other:?}"),
@@ -1505,8 +1500,7 @@ mod tests {
         let bottom = Rect::new(0, 1000, 1000, 600);
         let window = Rect::new(800, 800, 400, 400);
         match project_physical_rect(window, owner, &[owner, right, bottom]) {
-            PhysicalDecision::Constrained { rect, axes } => {
-                assert!(axes.right && axes.bottom);
+            PhysicalDecision::Constrained { rect } => {
                 assert_eq!(rect, Rect::new(800, 800, 200, 200));
             }
             other => panic!("{other:?}"),
@@ -1519,8 +1513,7 @@ mod tests {
         let neighbor = Rect::new(0, 0, 2880, 1800);
         let window = Rect::new(-200, 0, 500, 1080);
         match project_physical_rect(window, owner, &[owner, neighbor]) {
-            PhysicalDecision::Constrained { rect, axes } => {
-                assert!(axes.right);
+            PhysicalDecision::Constrained { rect } => {
                 assert_eq!(rect, Rect::new(-200, 0, 200, 1080));
             }
             other => panic!("{other:?}"),
@@ -1703,8 +1696,7 @@ mod tests {
         );
         let strip = tab_strip_rect(window, 28, 8);
         match project_physical_rect(strip, owner, &[owner, above]) {
-            PhysicalDecision::Constrained { rect, axes } => {
-                assert!(axes.top);
+            PhysicalDecision::Constrained { rect } => {
                 assert_eq!(rect.y, 0);
                 assert_eq!(rect.height, 0.max(strip.height - 36 + 8));
             }
@@ -1813,8 +1805,7 @@ mod tests {
             .iter()
             .any(|m| placements[2].rect.intersects(m)));
         match project_physical_rect(visible, owner.rect, &[owner.rect, right.rect]) {
-            PhysicalDecision::Constrained { rect, axes } => {
-                assert!(axes.right);
+            PhysicalDecision::Constrained { rect } => {
                 assert_eq!(rect.x + rect.width, owner.rect.x + owner.rect.width);
             }
             PhysicalDecision::Parked { .. } => {}
@@ -1840,8 +1831,7 @@ mod tests {
         let overlay = expand_border_overlay(content, 4, true);
         assert!(overlay.width > content.width);
         match project_physical_rect(overlay, owner, &[owner, neighbor]) {
-            PhysicalDecision::Constrained { rect, axes } => {
-                assert!(axes.right);
+            PhysicalDecision::Constrained { rect } => {
                 assert_eq!(rect.x + rect.width, owner.x + owner.width);
             }
             other => panic!("{other:?}"),

@@ -3013,7 +3013,7 @@ async fn handle_animation_frame_applied(
 
             // Keep surviving sources cloaked through the synchronous landing.
             // A thumbnail revocation must never expose the stale source before
-            // containment has been re-proven for the current topology.
+            // a current, confirmed non-parked landing.
 
             // Only this landing pass follows an async frame burst,
             // so it is the only `apply_layout` that needs to fire
