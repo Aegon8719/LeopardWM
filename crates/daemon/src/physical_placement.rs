@@ -1,18 +1,17 @@
 //! Physical presentation for tiled HWNDs at shared monitor edges.
 //!
 //! Logical layout (requested widths, membership, scroll) stays unchanged.
-//! This module projects a rectangle onto the owning monitor only where that
-//! monitor exactly touches a neighbor, then parks the HWND when no positive
-//! owner-visible slice remains or the app rejects the slice.
+//! Applications retain that full geometry, including where it bleeds onto an
+//! exactly adjacent monitor. Decorations use the shared projection below to
+//! remain clipped at protected owner edges; applications are parked only when
+//! no positive owner-visible slice remains.
 
 use crate::state::*;
 use leopardwm_core_layout::{Rect, Visibility, WindowPlacement};
 use leopardwm_platform_win32::{MonitorId, MonitorInfo, PlacementLanding};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
-
-const CONTAINMENT_TOLERANCE: i32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct ConstrainedAxes {
@@ -26,14 +25,6 @@ impl ConstrainedAxes {
     pub(crate) fn any(self) -> bool {
         self.left || self.right || self.top || self.bottom
     }
-
-    pub(crate) fn width(self) -> bool {
-        self.left || self.right
-    }
-
-    pub(crate) fn height(self) -> bool {
-        self.top || self.bottom
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,79 +34,16 @@ pub(crate) enum PhysicalDecision {
     Parked { rect: Rect },
 }
 
-impl PhysicalDecision {
-    pub(crate) fn kind(self) -> PhysicalKind {
-        match self {
-            Self::Unchanged => PhysicalKind::Unchanged,
-            Self::Constrained { .. } => PhysicalKind::Constrained,
-            Self::Parked { .. } => PhysicalKind::Parked,
-        }
-    }
-
-    pub(crate) fn axes(self) -> ConstrainedAxes {
-        match self {
-            Self::Constrained { axes, .. } => axes,
-            _ => ConstrainedAxes::default(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PhysicalKind {
     Unchanged,
-    Constrained,
     Parked,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GeometryContext {
-    pub owner_id: MonitorId,
-    pub owner_rect: Rect,
-    pub topology: Vec<(i32, i32, i32, i32)>,
-    pub scale_milli: u32,
-    pub insets: (i32, i32, i32, i32),
-    pub native_style: u32,
-    pub window_width: i32,
-    pub window_height: i32,
-}
-
-impl GeometryContext {
-    fn matches(&self, other: &Self, axes: ConstrainedAxes) -> bool {
-        self.owner_id == other.owner_id
-            && self.owner_rect == other.owner_rect
-            && self.topology == other.topology
-            && self.scale_milli == other.scale_milli
-            && self.insets == other.insets
-            && self.native_style == other.native_style
-            && (!axes.width() || self.window_height == other.window_height)
-            && (!axes.height() || self.window_width == other.window_width)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PhysicalRejectionObservation {
-    /// Minimum visible dimensions the app actually accepted or enforced.
-    pub required_width: i32,
-    pub required_height: i32,
-    /// Measured outer dimensions retained solely to clear every monitor while parked.
-    pub retained_outer_width: i32,
-    pub retained_outer_height: i32,
-    pub width_affected: bool,
-    pub height_affected: bool,
-    pub coupled: bool,
-    pub context: GeometryContext,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct PhysicalPresentation {
-    pub window_id: u64,
-    #[allow(dead_code)]
-    pub logical: WindowPlacement,
-    pub owner_id: MonitorId,
     pub physical: WindowPlacement,
     pub kind: PhysicalKind,
-    pub axes: ConstrainedAxes,
-    pub context: GeometryContext,
     pub request_id: u64,
     pub invalidation_id: u64,
     pub confirmed: bool,
@@ -182,15 +110,6 @@ fn exact_touching_edge(owner: Rect, neighbor: Rect) -> Option<SharedEdge> {
     } else {
         None
     }
-}
-
-fn sorted_topology(monitor_rects: &[Rect]) -> Vec<(i32, i32, i32, i32)> {
-    let mut topology: Vec<_> = monitor_rects
-        .iter()
-        .map(|rect| (rect.x, rect.y, rect.width, rect.height))
-        .collect();
-    topology.sort_unstable();
-    topology
 }
 
 pub(crate) fn topology_signature(
@@ -393,17 +312,12 @@ pub(crate) fn park_offscreen_avoiding_neighbors(
 
 fn physical_from_decision(logical: WindowPlacement, decision: PhysicalDecision) -> WindowPlacement {
     match decision {
-        PhysicalDecision::Unchanged => logical,
-        PhysicalDecision::Constrained { rect, .. } => WindowPlacement {
-            rect,
-            visibility: Visibility::Visible,
-            ..logical
-        },
         PhysicalDecision::Parked { rect } => WindowPlacement {
             rect,
             visibility: Visibility::OffScreenRight,
             ..logical
         },
+        PhysicalDecision::Unchanged | PhysicalDecision::Constrained { .. } => logical,
     }
 }
 
@@ -411,113 +325,22 @@ pub(crate) fn decide_physical_rect(
     window: Rect,
     owner: Rect,
     monitor_rects: &[Rect],
-    observation: Option<&PhysicalRejectionObservation>,
-    context: &GeometryContext,
+    native_insets: (i32, i32, i32, i32),
 ) -> PhysicalDecision {
     match project_physical_rect(window, owner, monitor_rects) {
-        PhysicalDecision::Unchanged => PhysicalDecision::Unchanged,
         PhysicalDecision::Parked { .. } => PhysicalDecision::Parked {
-            rect: offscreen_park_rect(window, monitor_rects, context.insets),
+            rect: offscreen_park_rect(window, monitor_rects, native_insets),
         },
-        PhysicalDecision::Constrained { rect, axes } => {
-            let insufficient_observation = observation.is_some_and(|obs| {
-                obs.context.matches(context, axes)
-                    && ((axes.width() && obs.width_affected && obs.required_width > rect.width)
-                        || (axes.height()
-                            && obs.height_affected
-                            && obs.required_height > rect.height))
-            });
-            if insufficient_observation {
-                let retained = observation
-                    .map(|obs| {
-                        Rect::new(
-                            window.x,
-                            window.y,
-                            obs.retained_outer_width.max(window.width),
-                            obs.retained_outer_height.max(window.height),
-                        )
-                    })
-                    .unwrap_or(window);
-                PhysicalDecision::Parked {
-                    rect: offscreen_park_rect(retained, monitor_rects, (0, 0, 0, 0)),
-                }
-            } else {
-                PhysicalDecision::Constrained { rect, axes }
-            }
+        PhysicalDecision::Unchanged | PhysicalDecision::Constrained { .. } => {
+            PhysicalDecision::Unchanged
         }
     }
-}
-
-pub(crate) fn evaluate_protected_axis_containment(
-    requested: Rect,
-    actual: Rect,
-    owner: Rect,
-    axes: ConstrainedAxes,
-    tolerance: i32,
-) -> bool {
-    let tol = tolerance.max(0) as i64;
-    if axes.right && edge_end(actual.x, actual.width) > edge_end(owner.x, owner.width) + tol {
-        return false;
-    }
-    if axes.left && (actual.x as i64) + tol < owner.x as i64 {
-        return false;
-    }
-    if axes.bottom && edge_end(actual.y, actual.height) > edge_end(owner.y, owner.height) + tol {
-        return false;
-    }
-    if axes.top && (actual.y as i64) + tol < owner.y as i64 {
-        return false;
-    }
-    if axes.width() && actual.width > requested.width.saturating_add(tolerance) {
-        return false;
-    }
-    if axes.height() && actual.height > requested.height.saturating_add(tolerance) {
-        return false;
-    }
-    true
 }
 
 pub(crate) fn parking_clears_monitors(actual: Rect, monitor_rects: &[Rect]) -> bool {
     !monitor_rects
         .iter()
         .any(|monitor| actual.intersects(monitor))
-}
-
-pub(crate) fn convert_failed_slices_to_parks(
-    placements: &[WindowPlacement],
-    failed_ids: &HashSet<u64>,
-    retained: &HashMap<u64, Rect>,
-    monitor_rects: &[Rect],
-) -> Vec<WindowPlacement> {
-    placements
-        .iter()
-        .map(|placement| {
-            if !failed_ids.contains(&placement.window_id) {
-                return placement.clone();
-            }
-            let size = retained
-                .get(&placement.window_id)
-                .copied()
-                .unwrap_or(placement.rect);
-            WindowPlacement {
-                rect: offscreen_park_rect(size, monitor_rects, (0, 0, 0, 0)),
-                visibility: Visibility::OffScreenRight,
-                ..*placement
-            }
-        })
-        .collect()
-}
-
-fn native_style_bits(window_id: u64) -> u32 {
-    #[cfg(test)]
-    {
-        let _ = window_id;
-        0
-    }
-    #[cfg(not(test))]
-    {
-        leopardwm_platform_win32::get_window_style_bits(window_id).unwrap_or(0)
-    }
 }
 
 fn native_insets(window_id: u64) -> (i32, i32, i32, i32) {
@@ -538,7 +361,6 @@ impl AppState {
     }
 
     pub(crate) fn clear_physical_window_state(&mut self, window_id: u64) {
-        self.physical_observations.remove(&window_id);
         self.last_physical_presentations.remove(&window_id);
         self.pending_physical_presentations.remove(&window_id);
         self.bump_physical_invalidation();
@@ -555,31 +377,6 @@ impl AppState {
                         .map(|provenance| provenance.owner)
                 })
             })
-    }
-
-    fn geometry_context_for(
-        &self,
-        window_id: u64,
-        owner_id: MonitorId,
-        owner: Rect,
-        window: Rect,
-        monitor_rects: &[Rect],
-    ) -> GeometryContext {
-        let scale_milli = self
-            .monitors
-            .get(&owner_id)
-            .map(|monitor| (monitor.scale_factor * 1000.0).round() as u32)
-            .unwrap_or(1000);
-        GeometryContext {
-            owner_id,
-            owner_rect: owner,
-            topology: sorted_topology(monitor_rects),
-            scale_milli,
-            insets: native_insets(window_id),
-            native_style: native_style_bits(window_id),
-            window_width: window.width,
-            window_height: window.height,
-        }
     }
 
     fn native_window_is_maximized(&self, window_id: u64) -> bool {
@@ -704,24 +501,6 @@ impl AppState {
                 physical.push(logical);
                 continue;
             };
-            let context =
-                self.geometry_context_for(logical.window_id, owner_id, owner, logical.rect, &rects);
-            let projected = project_physical_rect(logical.rect, owner, &rects);
-            if let Some(observation) = self.physical_observations.get(&logical.window_id) {
-                let axes = match projected {
-                    PhysicalDecision::Constrained { axes, .. } => axes,
-                    PhysicalDecision::Unchanged | PhysicalDecision::Parked { .. } => {
-                        ConstrainedAxes {
-                            right: observation.width_affected,
-                            bottom: observation.height_affected,
-                            ..ConstrainedAxes::default()
-                        }
-                    }
-                };
-                if !observation.context.matches(&context, axes) {
-                    self.physical_observations.remove(&logical.window_id);
-                }
-            }
             let decision = if self.is_projection_exempt(&logical) {
                 PhysicalDecision::Unchanged
             } else {
@@ -729,26 +508,19 @@ impl AppState {
                     logical.rect,
                     owner,
                     &rects,
-                    self.physical_observations.get(&logical.window_id),
-                    &context,
+                    native_insets(logical.window_id),
                 )
             };
-            if matches!(decision, PhysicalDecision::Unchanged)
-                && self.physical_observations.contains_key(&logical.window_id)
-            {
-                self.physical_observations.remove(&logical.window_id);
-            }
             let physical_placement = physical_from_decision(logical.clone(), decision);
             presentations.insert(
                 logical.window_id,
                 PhysicalPresentation {
-                    window_id: logical.window_id,
-                    logical,
-                    owner_id,
                     physical: physical_placement.clone(),
-                    kind: decision.kind(),
-                    axes: decision.axes(),
-                    context,
+                    kind: if matches!(decision, PhysicalDecision::Parked { .. }) {
+                        PhysicalKind::Parked
+                    } else {
+                        PhysicalKind::Unchanged
+                    },
                     request_id,
                     invalidation_id,
                     confirmed: false,
@@ -836,58 +608,26 @@ impl AppState {
                 .all(|presentation| presentation.confirmed)
     }
 
-    fn record_physical_observation(
-        &mut self,
-        presentation: &PhysicalPresentation,
-        landing: &PlacementLanding,
-    ) {
-        let (Some(actual_visible), Some(actual_outer)) =
-            (landing.actual_visible_rect, landing.actual_outer_rect)
-        else {
-            return;
-        };
-        let requested = presentation.physical.rect;
-        let coupled = (presentation.axes.width()
-            && actual_visible.height > requested.height.saturating_add(CONTAINMENT_TOLERANCE))
-            || (presentation.axes.height()
-                && actual_visible.width > requested.width.saturating_add(CONTAINMENT_TOLERANCE));
-        self.physical_observations.insert(
-            presentation.window_id,
-            PhysicalRejectionObservation {
-                required_width: actual_visible.width.max(1),
-                required_height: actual_visible.height.max(1),
-                retained_outer_width: actual_outer.width.max(1),
-                retained_outer_height: actual_outer.height.max(1),
-                width_affected: presentation.axes.width() || coupled,
-                height_affected: presentation.axes.height() || coupled,
-                coupled,
-                context: presentation.context.clone(),
-            },
-        );
-        self.bump_physical_invalidation();
-    }
-
     pub(crate) fn consume_physical_landings(
         &mut self,
         request_id: u64,
         invalidation_id: u64,
         landings: &[PlacementLanding],
-        dispatched: &[WindowPlacement],
-    ) -> Vec<WindowPlacement> {
+    ) {
         if !self.physical_result_is_current(request_id, invalidation_id) {
             debug!(
                 "Ignoring stale physical landings request={} invalidation={}",
                 request_id, invalidation_id
             );
-            return Vec::new();
+            return;
         }
         let Some(origins) = self.inflight_origins.remove(&request_id) else {
-            return Vec::new();
+            return;
         };
         if origins.values().any(|origin| {
             origin.request_id != request_id || origin.invalidation_id != invalidation_id
         }) {
-            return Vec::new();
+            return;
         }
         if self.inflight_request_id == Some(request_id) {
             self.inflight_request_id = None;
@@ -898,75 +638,32 @@ impl AppState {
             .iter()
             .map(|landing| (landing.window_id, landing))
             .collect();
-        let mut failed_ids = HashSet::new();
-        let mut retained = HashMap::new();
         let mut confirmed = origins.clone();
 
         for (window_id, presentation) in &origins {
-            if presentation.kind != PhysicalKind::Constrained {
-                if let Some(entry) = confirmed.get_mut(window_id) {
-                    let Some(landing) = landings_by_id.get(window_id) else {
-                        warn!(
-                            "Physical placement of window {} is unconfirmed: no readback",
-                            window_id
-                        );
-                        continue;
-                    };
-                    entry.confirmed = !landing.failed
-                        && !landing.unreadable
-                        && match presentation.kind {
-                            PhysicalKind::Parked => landing
-                                .actual_outer_rect
-                                .is_some_and(|rect| parking_clears_monitors(rect, &rects)),
-                            PhysicalKind::Unchanged => landing.actual_visible_rect.is_some(),
-                            PhysicalKind::Constrained => unreachable!(),
-                        };
-                    if !entry.confirmed {
-                        warn!(
-                            "Physical placement of window {} was blocked (failed={} unreadable={})",
-                            window_id, landing.failed, landing.unreadable
-                        );
-                    }
-                }
-                continue;
-            }
-
-            let Some(owner) = self.monitors.get(&presentation.owner_id).map(|m| m.rect) else {
+            let Some(entry) = confirmed.get_mut(window_id) else {
                 continue;
             };
             let Some(landing) = landings_by_id.get(window_id) else {
                 warn!(
-                    "Physical containment of window {} is blocked: no native readback",
+                    "Physical placement of window {} is unconfirmed: no readback",
                     window_id
                 );
                 continue;
             };
-            let Some(actual_outer) = landing.actual_outer_rect else {
-                warn!(
-                    "Physical containment of window {} is blocked: outer geometry is unreadable",
-                    window_id
-                );
-                continue;
-            };
-            let contained = !landing.failed
+            entry.confirmed = !landing.failed
                 && !landing.unreadable
-                && landing.actual_visible_rect.is_some_and(|actual_visible| {
-                    evaluate_protected_axis_containment(
-                        presentation.physical.rect,
-                        actual_visible,
-                        owner,
-                        presentation.axes,
-                        CONTAINMENT_TOLERANCE,
-                    )
-                });
-            if contained {
-                if let Some(entry) = confirmed.get_mut(window_id) {
-                    entry.confirmed = true;
-                }
-            } else {
-                failed_ids.insert(*window_id);
-                retained.insert(*window_id, actual_outer);
-                self.record_physical_observation(presentation, landing);
+                && match presentation.kind {
+                    PhysicalKind::Parked => landing
+                        .actual_outer_rect
+                        .is_some_and(|rect| parking_clears_monitors(rect, &rects)),
+                    PhysicalKind::Unchanged => landing.actual_visible_rect.is_some(),
+                };
+            if !entry.confirmed {
+                warn!(
+                    "Physical placement of window {} was blocked (failed={} unreadable={})",
+                    window_id, landing.failed, landing.unreadable
+                );
             }
         }
 
@@ -979,12 +676,6 @@ impl AppState {
         {
             self.pending_physical_presentations.clear();
         }
-
-        if failed_ids.is_empty() {
-            return Vec::new();
-        }
-
-        convert_failed_slices_to_parks(dispatched, &failed_ids, &retained, &rects)
     }
 
     pub(crate) fn acknowledge_empty_physical_state(
@@ -1009,47 +700,6 @@ impl AppState {
         self.last_applied_physical_invalidation =
             self.physical_invalidation_id.load(Ordering::SeqCst);
         self.last_topology_signature = topology_signature(&self.monitors);
-    }
-
-    pub(crate) fn begin_physical_follow_up(&mut self, follow_up: &[WindowPlacement]) {
-        for presentation in self.last_physical_presentations.values_mut() {
-            if follow_up.iter().any(|placement| {
-                placement.window_id == presentation.window_id
-                    && placement.visibility != Visibility::Visible
-            }) {
-                presentation.kind = PhysicalKind::Parked;
-                if let Some(parked) = follow_up
-                    .iter()
-                    .find(|placement| placement.window_id == presentation.window_id)
-                {
-                    presentation.physical = parked.clone();
-                }
-                presentation.confirmed = false;
-            }
-        }
-    }
-
-    pub(crate) fn complete_physical_follow_up(&mut self, landings: &[PlacementLanding]) {
-        let rects = monitor_rects(&self.monitors);
-        for landing in landings {
-            if let Some(presentation) = self.last_physical_presentations.get_mut(&landing.window_id)
-            {
-                if presentation.kind != PhysicalKind::Parked {
-                    continue;
-                }
-                presentation.confirmed = !landing.failed
-                    && !landing.unreadable
-                    && landing
-                        .actual_outer_rect
-                        .is_some_and(|rect| parking_clears_monitors(rect, &rects));
-                if !presentation.confirmed {
-                    warn!(
-                        "Follow-up parking of window {} did not clear monitors (failed={} unreadable={})",
-                        landing.window_id, landing.failed, landing.unreadable
-                    );
-                }
-            }
-        }
     }
 
     pub(crate) fn swept_rect_meets_protected_boundary(
@@ -1125,39 +775,207 @@ mod tests {
     }
 
     #[test]
-    fn missing_outer_readback_blocks_containment_without_fallback() {
+    fn full_partial_landing_confirms_without_outer_containment() {
         let mut state = AppState::new_with_config(
             crate::config::Config::default(),
-            vec![
-                monitor(1, 0, 0, 1920, 1080),
-                monitor(2, 1920, 0, 1920, 1080),
-            ],
+            vec![monitor(1, 0, 0, 5120, 1440), monitor(2, 5120, 0, 800, 600)],
         );
         state.workspaces.get_mut(&1).unwrap()[0]
-            .insert_window(100, Some(800))
+            .insert_window(100, Some(1600))
             .unwrap();
-        let dispatched = state.apply_physical_projection(vec![placement(
-            100,
-            Rect::new(1800, 0, 400, 600),
-            Visibility::Visible,
-        )]);
+        let logical = placement(100, reproduction_window(), Visibility::Visible);
+        let dispatched = state.apply_physical_projection(vec![logical.clone()]);
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].window_id, logical.window_id);
+        assert_eq!(dispatched[0].rect, logical.rect);
+        assert_eq!(dispatched[0].visibility, logical.visibility);
         let (request_id, invalidation_id) = state.physical_request_ids();
-        let follow_up = state.consume_physical_landings(
+        state.consume_physical_landings(
             request_id,
             invalidation_id,
             &[PlacementLanding {
                 window_id: 100,
                 requested_rect: dispatched[0].rect,
                 requested_visibility: Visibility::Visible,
-                actual_visible_rect: Some(Rect::new(1800, 0, 400, 600)),
-                actual_outer_rect: None,
+                actual_visible_rect: Some(dispatched[0].rect),
+                actual_outer_rect: Some(dispatched[0].rect),
                 failed: false,
                 unreadable: false,
             }],
-            &dispatched,
         );
-        assert!(follow_up.is_empty());
-        assert!(!state.last_physical_presentations[&100].confirmed);
+        assert_eq!(
+            state.last_physical_presentations[&100].kind,
+            PhysicalKind::Unchanged
+        );
+        assert!(state.last_physical_presentations[&100].confirmed);
+        assert!(!state.is_physically_parked(100));
+    }
+
+    #[test]
+    fn production_projection_preserves_full_partial_progression_and_parks_zero_slice() {
+        let mut state = AppState::new_with_config(
+            crate::config::Config::default(),
+            vec![
+                monitor(1, 0, 0, 1000, 1000),
+                monitor(2, -800, 0, 800, 1000),
+                monitor(3, 1000, 0, 800, 1000),
+                monitor(4, 0, -600, 1000, 600),
+                monitor(5, 0, 1000, 1000, 600),
+            ],
+        );
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(100, Some(400))
+            .unwrap();
+        let widths = {
+            let workspace = &state.workspaces[&1][0];
+            (
+                workspace.columns()[0].width(),
+                workspace.effective_column_width(&workspace.columns()[0]),
+            )
+        };
+
+        for (name, rect) in [
+            ("right partial progression", Rect::new(700, 100, 400, 400)),
+            ("right further partial", Rect::new(800, 100, 400, 400)),
+            ("right reversal", Rect::new(700, 100, 400, 400)),
+            ("right stopped partial", Rect::new(700, 100, 400, 400)),
+            ("recenter", Rect::new(300, 100, 400, 400)),
+            ("left partial progression", Rect::new(-100, 100, 400, 400)),
+            ("left further partial", Rect::new(-200, 100, 400, 400)),
+            ("left reversal", Rect::new(-100, 100, 400, 400)),
+            ("left stopped partial", Rect::new(-100, 100, 400, 400)),
+            ("top partial", Rect::new(100, -100, 400, 400)),
+            ("bottom partial", Rect::new(100, 700, 400, 400)),
+        ] {
+            let logical = placement(100, rect, Visibility::Visible);
+            let physical = state.apply_physical_projection(vec![logical.clone()]);
+            assert_eq!(physical.len(), 1, "{name}");
+            assert_eq!(physical[0].rect, logical.rect, "{name}");
+            assert_eq!(physical[0].visibility, logical.visibility, "{name}");
+            assert_eq!(
+                state.pending_physical_presentations[&100].kind,
+                PhysicalKind::Unchanged,
+                "{name}"
+            );
+            let workspace = &state.workspaces[&1][0];
+            assert_eq!(workspace.columns()[0].width(), widths.0, "{name}");
+            assert_eq!(
+                workspace.effective_column_width(&workspace.columns()[0]),
+                widths.1,
+                "{name}"
+            );
+        }
+
+        let zero_slice = placement(100, Rect::new(1000, 100, 400, 400), Visibility::Visible);
+        let parked = state.apply_physical_projection(vec![zero_slice.clone()]);
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].rect.width, zero_slice.rect.width);
+        assert_eq!(parked[0].rect.height, zero_slice.rect.height);
+        assert_eq!(parked[0].visibility, Visibility::OffScreenRight);
+        assert_eq!(
+            state.pending_physical_presentations[&100].kind,
+            PhysicalKind::Parked
+        );
+        let workspace = &state.workspaces[&1][0];
+        assert_eq!(workspace.columns()[0].width(), widths.0);
+        assert_eq!(
+            workspace.effective_column_width(&workspace.columns()[0]),
+            widths.1
+        );
+    }
+
+    #[test]
+    fn production_projection_preserves_negative_no_neighbor_and_gapped_geometry() {
+        let negative_owner = Rect::new(-1920, 0, 1920, 1080);
+        let negative_neighbor = Rect::new(0, 0, 2880, 1800);
+        let negative_logical = placement(100, Rect::new(-200, 0, 500, 1080), Visibility::Visible);
+        let mut negative = AppState::new_with_config(
+            crate::config::Config::default(),
+            vec![
+                monitor(
+                    1,
+                    negative_owner.x,
+                    negative_owner.y,
+                    negative_owner.width,
+                    negative_owner.height,
+                ),
+                monitor(
+                    2,
+                    negative_neighbor.x,
+                    negative_neighbor.y,
+                    negative_neighbor.width,
+                    negative_neighbor.height,
+                ),
+            ],
+        );
+        negative.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(100, Some(500))
+            .unwrap();
+        let negative_widths = {
+            let workspace = &negative.workspaces[&1][0];
+            (
+                workspace.columns()[0].width(),
+                workspace.effective_column_width(&workspace.columns()[0]),
+            )
+        };
+        let negative_physical = negative.apply_physical_projection(vec![negative_logical.clone()]);
+        assert_eq!(negative_physical[0].rect, negative_logical.rect);
+        assert_eq!(negative_physical[0].visibility, negative_logical.visibility);
+        assert_eq!(
+            negative.pending_physical_presentations[&100].kind,
+            PhysicalKind::Unchanged
+        );
+        let workspace = &negative.workspaces[&1][0];
+        assert_eq!(workspace.columns()[0].width(), negative_widths.0);
+        assert_eq!(
+            workspace.effective_column_width(&workspace.columns()[0]),
+            negative_widths.1
+        );
+
+        for (name, monitors) in [
+            ("no neighbor", vec![monitor(1, 0, 0, 1000, 1000)]),
+            (
+                "gapped neighbor",
+                vec![monitor(1, 0, 0, 1000, 1000), monitor(2, 1010, 0, 800, 1000)],
+            ),
+        ] {
+            let mut state = AppState::new_with_config(crate::config::Config::default(), monitors);
+            state.workspaces.get_mut(&1).unwrap()[0]
+                .insert_window(100, Some(400))
+                .unwrap();
+            let widths = {
+                let workspace = &state.workspaces[&1][0];
+                (
+                    workspace.columns()[0].width(),
+                    workspace.effective_column_width(&workspace.columns()[0]),
+                )
+            };
+            let logical = placement(100, Rect::new(800, 100, 400, 400), Visibility::Visible);
+            assert_eq!(
+                project_physical_rect(
+                    logical.rect,
+                    state.monitors[&1].rect,
+                    &monitor_rects(&state.monitors)
+                ),
+                PhysicalDecision::Unchanged,
+                "{name}"
+            );
+            let physical = state.apply_physical_projection(vec![logical.clone()]);
+            assert_eq!(physical[0].rect, logical.rect, "{name}");
+            assert_eq!(physical[0].visibility, logical.visibility, "{name}");
+            assert_eq!(
+                state.pending_physical_presentations[&100].kind,
+                PhysicalKind::Unchanged,
+                "{name}"
+            );
+            let workspace = &state.workspaces[&1][0];
+            assert_eq!(workspace.columns()[0].width(), widths.0, "{name}");
+            assert_eq!(
+                workspace.effective_column_width(&workspace.columns()[0]),
+                widths.1,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1187,7 +1005,6 @@ mod tests {
                 failed: true,
                 unreadable: false,
             }],
-            &dispatched,
         );
         assert!(!state.last_physical_presentations[&100].confirmed);
         assert!(
@@ -1223,12 +1040,52 @@ mod tests {
                 failed: false,
                 unreadable: false,
             }],
-            &dispatched,
         );
         assert!(state.pending_physical_presentations.is_empty());
         assert_eq!(state.expected_physical_rect(100), Some(dispatched[0].rect));
         assert!(state.last_physical_presentations[&100].confirmed);
         assert!(state.physical_fast_path_ok());
+    }
+
+    #[test]
+    fn parked_landing_requires_actual_outer_clearance() {
+        let mut state = AppState::new_with_config(
+            crate::config::Config::default(),
+            vec![
+                monitor(1, 0, 0, 1920, 1080),
+                monitor(2, 1920, 0, 1920, 1080),
+            ],
+        );
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(100, Some(800))
+            .unwrap();
+        let logical = placement(100, Rect::new(1920, 0, 400, 600), Visibility::Visible);
+        let dispatched = state.apply_physical_projection(vec![logical.clone()]);
+        assert_eq!(
+            state.pending_physical_presentations[&100].kind,
+            PhysicalKind::Parked
+        );
+        let (request_id, invalidation_id) = state.physical_request_ids();
+        let actual_outer = Rect::new(-20, -20, 2040, 1120);
+        assert!(actual_outer.width > logical.rect.width);
+        assert!(actual_outer.height > logical.rect.height);
+        state.consume_physical_landings(
+            request_id,
+            invalidation_id,
+            &[PlacementLanding {
+                window_id: 100,
+                requested_rect: dispatched[0].rect,
+                requested_visibility: dispatched[0].visibility,
+                actual_visible_rect: None,
+                actual_outer_rect: Some(actual_outer),
+                failed: false,
+                unreadable: false,
+            }],
+        );
+
+        assert!(!state.last_physical_presentations[&100].confirmed);
+        assert!(state.is_physically_parked(100));
+        assert!(!state.physical_fast_path_ok());
     }
 
     #[test]
@@ -1258,7 +1115,6 @@ mod tests {
                 failed: false,
                 unreadable: false,
             }],
-            &dispatched,
         );
         state.ghost_sources_pending_safe_landing.insert(100);
 
@@ -1292,7 +1148,7 @@ mod tests {
             Visibility::Visible,
         )]);
 
-        assert_eq!(dispatched[0].rect, Rect::new(1800, 0, 120, 600));
+        assert_eq!(dispatched[0].rect, Rect::new(1800, 0, 400, 600));
         assert_eq!(
             state.last_physical_presentations.get(&100).map(|_| ()),
             None,
@@ -1300,8 +1156,8 @@ mod tests {
         );
         assert_eq!(
             state.pending_physical_presentations[&100].kind,
-            PhysicalKind::Constrained,
-            "a tiled exit remains eligible even after source membership changes"
+            PhysicalKind::Unchanged,
+            "a tiled exit remains eligible without shrinking its native geometry"
         );
     }
 
@@ -1512,116 +1368,39 @@ mod tests {
     }
 
     #[test]
-    fn rejected_slice_uses_outer_size_for_one_full_batch_fallback() {
+    fn pending_presentation_precedes_last_until_full_landing_is_consumed() {
         let mut state = AppState::new_with_config(
             crate::config::Config::default(),
-            vec![
-                monitor(1, 0, 0, 1920, 1080),
-                monitor(2, 1920, 0, 1920, 1080),
-            ],
-        );
-        let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
-        workspace.insert_window(100, Some(800)).unwrap();
-        workspace.insert_window(200, Some(800)).unwrap();
-        let dispatched = state.apply_physical_projection(vec![
-            placement(100, Rect::new(1800, 0, 400, 600), Visibility::Visible),
-            placement(200, Rect::new(100, 0, 400, 600), Visibility::Visible),
-        ]);
-        let (request_id, invalidation_id) = state.physical_request_ids();
-        let follow_up = state.consume_physical_landings(
-            request_id,
-            invalidation_id,
-            &[
-                PlacementLanding {
-                    window_id: 100,
-                    requested_rect: dispatched[0].rect,
-                    requested_visibility: Visibility::Visible,
-                    actual_visible_rect: Some(Rect::new(1800, 0, 400, 600)),
-                    actual_outer_rect: Some(Rect::new(1800, 0, 450, 650)),
-                    failed: false,
-                    unreadable: false,
-                },
-                PlacementLanding {
-                    window_id: 200,
-                    requested_rect: dispatched[1].rect,
-                    requested_visibility: Visibility::Visible,
-                    actual_visible_rect: Some(dispatched[1].rect),
-                    actual_outer_rect: Some(dispatched[1].rect),
-                    failed: false,
-                    unreadable: false,
-                },
-            ],
-            &dispatched,
-        );
-        assert_eq!(follow_up.len(), 2);
-        let parked = follow_up
-            .iter()
-            .find(|placement| placement.window_id == 100)
-            .unwrap();
-        assert_eq!(parked.visibility, Visibility::OffScreenRight);
-        assert_eq!(parked.rect.width, 450);
-        assert!(parking_clears_monitors(
-            parked.rect,
-            &monitor_rects(&state.monitors)
-        ));
-        assert_eq!(
-            follow_up
-                .iter()
-                .find(|placement| placement.window_id == 200)
-                .unwrap()
-                .rect,
-            dispatched[1].rect
-        );
-        assert!(state
-            .consume_physical_landings(request_id, invalidation_id, &[], &dispatched)
-            .is_empty());
-    }
-
-    #[test]
-    fn pending_presentation_precedes_last_until_consumed_and_fallback_remains_current() {
-        let mut state = AppState::new_with_config(
-            crate::config::Config::default(),
-            vec![
-                monitor(1, 0, 0, 1920, 1080),
-                monitor(2, 1920, 0, 1920, 1080),
-            ],
+            vec![monitor(1, 0, 0, 5120, 1440), monitor(2, 5120, 0, 800, 600)],
         );
         state.workspaces.get_mut(&1).unwrap()[0]
-            .insert_window(100, Some(800))
+            .insert_window(100, Some(1600))
             .unwrap();
-        let logical = placement(100, Rect::new(1800, 0, 400, 600), Visibility::Visible);
-        let first = state.apply_physical_projection(vec![logical.clone()]);
+        let logical = placement(100, reproduction_window(), Visibility::Visible);
+        let dispatched = state.apply_physical_projection(vec![logical.clone()]);
         let mut previous = state.pending_physical_presentations[&100].clone();
-        previous.kind = PhysicalKind::Unchanged;
-        previous.physical.rect = logical.rect;
+        previous.physical.rect = Rect::new(0, 0, 400, 600);
         previous.confirmed = true;
         state.last_physical_presentations.insert(100, previous);
-        assert_eq!(state.expected_physical_rect(100), Some(first[0].rect));
-        assert!(!state.is_physically_parked(100));
+        assert_eq!(state.expected_physical_rect(100), Some(logical.rect));
 
         let (request_id, invalidation_id) = state.physical_request_ids();
-        let fallback = state.consume_physical_landings(
+        state.consume_physical_landings(
             request_id,
             invalidation_id,
             &[PlacementLanding {
                 window_id: 100,
-                requested_rect: first[0].rect,
+                requested_rect: logical.rect,
                 requested_visibility: Visibility::Visible,
                 actual_visible_rect: Some(logical.rect),
-                actual_outer_rect: Some(Rect::new(1800, 0, 450, 650)),
+                actual_outer_rect: Some(logical.rect),
                 failed: false,
                 unreadable: false,
             }],
-            &first,
         );
         assert!(state.pending_physical_presentations.is_empty());
-        state.begin_physical_follow_up(&fallback);
-        assert!(state.is_physically_parked(100));
-        assert_eq!(
-            state.expected_physical_rect(100),
-            Some(fallback[0].rect),
-            "the confirmed fallback replaces the consumed pending slice"
-        );
+        assert_eq!(state.expected_physical_rect(100), Some(dispatched[0].rect));
+        assert!(state.last_physical_presentations[&100].confirmed);
     }
 
     #[test]
@@ -1633,7 +1412,7 @@ mod tests {
         state.workspaces.get_mut(&1).unwrap()[0]
             .insert_window(100, Some(800))
             .unwrap();
-        let first = state.apply_physical_projection(vec![placement(
+        let _first = state.apply_physical_projection(vec![placement(
             100,
             Rect::new(100, 0, 400, 600),
             Visibility::Visible,
@@ -1644,110 +1423,12 @@ mod tests {
             Rect::new(200, 0, 400, 600),
             Visibility::Visible,
         )]);
-        assert!(state
-            .consume_physical_landings(old_request, old_invalidation, &[], &first)
-            .is_empty());
+        state.consume_physical_landings(old_request, old_invalidation, &[]);
         assert_eq!(state.expected_physical_rect(100), Some(newer[0].rect));
         assert_eq!(
             state.pending_physical_request_id,
             old_request.wrapping_add(1)
         );
-    }
-
-    #[test]
-    fn context_change_discards_rejection_but_same_context_reuses_it() {
-        let mut state = AppState::new_with_config(
-            crate::config::Config::default(),
-            vec![
-                monitor(1, 0, 0, 1920, 1080),
-                monitor(2, 1920, 0, 1920, 1080),
-            ],
-        );
-        state.workspaces.get_mut(&1).unwrap()[0]
-            .insert_window(100, Some(800))
-            .unwrap();
-        let a = placement(100, Rect::new(1800, 0, 400, 600), Visibility::Visible);
-        let rejected = state.apply_physical_projection(vec![a.clone()]);
-        let (request_id, invalidation_id) = state.physical_request_ids();
-        state.consume_physical_landings(
-            request_id,
-            invalidation_id,
-            &[PlacementLanding {
-                window_id: 100,
-                requested_rect: rejected[0].rect,
-                requested_visibility: Visibility::Visible,
-                actual_visible_rect: Some(a.rect),
-                actual_outer_rect: Some(Rect::new(1800, 0, 450, 650)),
-                failed: false,
-                unreadable: false,
-            }],
-            &rejected,
-        );
-        assert!(state.physical_observations.contains_key(&100));
-
-        let repeat = state.apply_physical_projection(vec![a.clone()]);
-        assert_eq!(
-            state.pending_physical_presentations[&100].kind,
-            PhysicalKind::Parked,
-            "the same rejected context must avoid another constrained probe"
-        );
-        let (request_id, invalidation_id) = state.physical_request_ids();
-        state.consume_physical_landings(
-            request_id,
-            invalidation_id,
-            &[PlacementLanding {
-                window_id: 100,
-                requested_rect: repeat[0].rect,
-                requested_visibility: Visibility::OffScreenRight,
-                actual_visible_rect: None,
-                actual_outer_rect: Some(repeat[0].rect),
-                failed: false,
-                unreadable: false,
-            }],
-            &repeat,
-        );
-        assert!(
-            state.physical_observations.contains_key(&100),
-            "parking in the unchanged context keeps the rejection observation"
-        );
-
-        state.monitors.insert(1, monitor(1, 0, 0, 1000, 1080));
-        state.monitors.insert(2, monitor(2, 1000, 0, 1920, 1080));
-        let parked_in_b = state.apply_physical_projection(vec![a.clone()]);
-        assert_eq!(
-            state.pending_physical_presentations[&100].kind,
-            PhysicalKind::Parked,
-            "a changed topology can park the window before another constrained probe"
-        );
-        assert!(
-            !state.physical_observations.contains_key(&100),
-            "the changed parked context discards the old rejection"
-        );
-        let (request_id, invalidation_id) = state.physical_request_ids();
-        state.consume_physical_landings(
-            request_id,
-            invalidation_id,
-            &[PlacementLanding {
-                window_id: 100,
-                requested_rect: parked_in_b[0].rect,
-                requested_visibility: Visibility::OffScreenRight,
-                actual_visible_rect: None,
-                actual_outer_rect: Some(parked_in_b[0].rect),
-                failed: false,
-                unreadable: false,
-            }],
-            &parked_in_b,
-        );
-
-        state.monitors.insert(1, monitor(1, 0, 0, 1920, 1080));
-        state.monitors.insert(2, monitor(2, 1920, 0, 1920, 1080));
-        let retry_a = state.apply_physical_projection(vec![a]);
-        assert_eq!(
-            state.pending_physical_presentations[&100].kind,
-            PhysicalKind::Constrained,
-            "the original rejection must not revive after another context landed"
-        );
-        assert_eq!(retry_a[0].visibility, Visibility::Visible);
     }
 
     #[test]
@@ -1897,22 +1578,12 @@ mod tests {
         let owner = Rect::new(-100_000, -100_000, 500, 500);
         let neighbor = Rect::new(-99_500, -100_000, 500, 500);
         let window = Rect::new(-99_500, -100_000, 400, 400);
-        let context = GeometryContext {
-            owner_id: 1,
-            owner_rect: owner,
-            topology: sorted_topology(&[owner, neighbor]),
-            scale_milli: 1000,
-            insets: (7, 1, 7, 8),
-            native_style: 0,
-            window_width: window.width,
-            window_height: window.height,
-        };
-        let parked = match decide_physical_rect(window, owner, &[owner, neighbor], None, &context) {
+        let insets = (7, 1, 7, 8);
+        let parked = match decide_physical_rect(window, owner, &[owner, neighbor], insets) {
             PhysicalDecision::Parked { rect } => rect,
             other => panic!("expected zero visible slice to park, got {other:?}"),
         };
-        let outer =
-            leopardwm_platform_win32::visible_rect_to_frame_rect(parked, context.insets, false);
+        let outer = leopardwm_platform_win32::visible_rect_to_frame_rect(parked, insets, false);
         assert!(leopardwm_platform_win32::is_move_offscreen_sentinel_rect(
             &outer
         ));
@@ -1949,159 +1620,6 @@ mod tests {
             &outer
         ));
         assert!(parking_clears_monitors(outer, &[owner, neighbor]));
-    }
-
-    #[test]
-    fn observation_parks_without_reprobe_including_greater_than_viewport() {
-        let owner = owner_5120();
-        let neighbor = neighbor_800();
-        let window = reproduction_window();
-        let context = GeometryContext {
-            owner_id: 1,
-            owner_rect: owner,
-            topology: sorted_topology(&[owner, neighbor]),
-            scale_milli: 1000,
-            insets: (0, 0, 0, 0),
-            native_style: 0,
-            window_width: window.width,
-            window_height: window.height,
-        };
-        let observation = PhysicalRejectionObservation {
-            required_width: 1600,
-            required_height: 1440,
-            retained_outer_width: 1600,
-            retained_outer_height: 1440,
-            width_affected: true,
-            height_affected: false,
-            coupled: false,
-            context: context.clone(),
-        };
-        assert!(matches!(
-            decide_physical_rect(
-                window,
-                owner,
-                &[owner, neighbor],
-                Some(&observation),
-                &context,
-            ),
-            PhysicalDecision::Parked { .. }
-        ));
-        let viewport_obs = PhysicalRejectionObservation {
-            required_width: 5120,
-            required_height: 1440,
-            retained_outer_width: 1600,
-            retained_outer_height: 1440,
-            width_affected: true,
-            height_affected: false,
-            coupled: false,
-            context: context.clone(),
-        };
-        assert!(matches!(
-            decide_physical_rect(
-                window,
-                owner,
-                &[owner, neighbor],
-                Some(&viewport_obs),
-                &context,
-            ),
-            PhysicalDecision::Parked { .. }
-        ));
-    }
-
-    #[test]
-    fn small_observation_allows_slice_retry() {
-        let owner = owner_5120();
-        let neighbor = neighbor_800();
-        let window = reproduction_window();
-        let context = GeometryContext {
-            owner_id: 1,
-            owner_rect: owner,
-            topology: sorted_topology(&[owner, neighbor]),
-            scale_milli: 1000,
-            insets: (0, 0, 0, 0),
-            native_style: 0,
-            window_width: window.width,
-            window_height: window.height,
-        };
-        let small_obs = PhysicalRejectionObservation {
-            required_width: 500,
-            required_height: 1440,
-            retained_outer_width: 1600,
-            retained_outer_height: 1440,
-            width_affected: true,
-            height_affected: false,
-            coupled: false,
-            context: context.clone(),
-        };
-        assert!(matches!(
-            decide_physical_rect(
-                window,
-                owner,
-                &[owner, neighbor],
-                Some(&small_obs),
-                &context,
-            ),
-            PhysicalDecision::Constrained { .. }
-        ));
-    }
-
-    #[test]
-    fn containment_detects_size_and_position_overshoot() {
-        let owner = owner_5120();
-        let requested = Rect::new(4320, 10, 800, 1440);
-        let axes = ConstrainedAxes {
-            right: true,
-            ..ConstrainedAxes::default()
-        };
-        assert!(evaluate_protected_axis_containment(
-            requested,
-            requested,
-            owner,
-            axes,
-            CONTAINMENT_TOLERANCE
-        ));
-        assert!(!evaluate_protected_axis_containment(
-            requested,
-            Rect::new(4320, 10, 1600, 1440),
-            owner,
-            axes,
-            CONTAINMENT_TOLERANCE
-        ));
-        assert!(!evaluate_protected_axis_containment(
-            requested,
-            Rect::new(5000, 10, 800, 1440),
-            owner,
-            axes,
-            CONTAINMENT_TOLERANCE
-        ));
-    }
-
-    #[test]
-    fn follow_up_batch_parks_only_failed_slices() {
-        let owner = owner_5120();
-        let neighbor = neighbor_800();
-        let placements = vec![
-            placement(1, Rect::new(4320, 10, 800, 1440), Visibility::Visible),
-            placement(2, Rect::new(0, 10, 800, 1440), Visibility::Visible),
-            placement(3, Rect::new(-400, 10, 400, 400), Visibility::OffScreenLeft),
-        ];
-        let failed = HashSet::from([1u64]);
-        let retained = HashMap::from([(1u64, Rect::new(4320, 10, 1600, 1440))]);
-        let follow_up =
-            convert_failed_slices_to_parks(&placements, &failed, &retained, &[owner, neighbor]);
-        assert_eq!(follow_up[1].window_id, placements[1].window_id);
-        assert_eq!(follow_up[1].rect, placements[1].rect);
-        assert_eq!(follow_up[1].visibility, placements[1].visibility);
-        assert_eq!(follow_up[2].window_id, placements[2].window_id);
-        assert_eq!(follow_up[2].rect, placements[2].rect);
-        assert_eq!(follow_up[2].visibility, placements[2].visibility);
-        assert_eq!(follow_up[0].visibility, Visibility::OffScreenRight);
-        assert_eq!(
-            (follow_up[0].rect.width, follow_up[0].rect.height),
-            (1600, 1440)
-        );
-        assert!(!follow_up[0].rect.intersects(&owner));
-        assert!(!follow_up[0].rect.intersects(&neighbor));
     }
 
     #[test]

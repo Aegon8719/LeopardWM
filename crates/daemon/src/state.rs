@@ -1,7 +1,7 @@
 //! AppState struct definition, constructor, and basic accessors.
 
 use crate::config::{self, Config};
-use crate::physical_placement::{PhysicalPresentation, PhysicalRejectionObservation};
+use crate::physical_placement::PhysicalPresentation;
 use leopardwm_core_layout::{Rect, Workspace};
 use leopardwm_platform_win32::{MonitorId, MonitorInfo, PlatformConfig};
 use serde::{Deserialize, Serialize};
@@ -526,7 +526,6 @@ pub(crate) struct AppState {
     pub(crate) last_physical_presentations: HashMap<u64, PhysicalPresentation>,
     pub(crate) pending_physical_presentations: HashMap<u64, PhysicalPresentation>,
     pub(crate) inflight_origins: HashMap<u64, HashMap<u64, PhysicalPresentation>>,
-    pub(crate) physical_observations: HashMap<u64, PhysicalRejectionObservation>,
     pub(crate) physical_request_seq: u64,
     pub(crate) physical_dispatch_request_id: Arc<AtomicU64>,
     pub(crate) physical_invalidation_id: Arc<AtomicU64>,
@@ -920,7 +919,6 @@ impl AppState {
             last_physical_presentations: HashMap::new(),
             pending_physical_presentations: HashMap::new(),
             inflight_origins: HashMap::new(),
-            physical_observations: HashMap::new(),
             physical_request_seq: 0,
             physical_dispatch_request_id: Arc::new(AtomicU64::new(0)),
             physical_invalidation_id: Arc::new(AtomicU64::new(0)),

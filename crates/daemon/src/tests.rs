@@ -1186,57 +1186,39 @@ fn test_sync_size_violation_reapplies_once_and_reveals_widened_focus() {
 }
 
 #[test]
-fn test_physical_feedback_uses_immutable_dispatch_origin() {
-    let mut monitors = two_monitors();
-    monitors.push(MonitorInfo {
-        id: 3,
-        rect: Rect::new(0, 1080, 1920, 1080),
-        work_area: Rect::new(0, 1080, 1920, 1040),
-        is_primary: false,
-        device_name: "DISPLAY3".to_string(),
-        scale_factor: 1.0,
-    });
-    let mut state = AppState::new_with_config(test_config(), monitors);
+fn test_physical_feedback_allows_full_placements_and_suppresses_parking() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
     state.workspaces.get_mut(&1).unwrap()[0]
         .insert_window(100, Some(800))
         .unwrap();
-    let constrained = leopardwm_core_layout::WindowPlacement {
+    let partial = leopardwm_core_layout::WindowPlacement {
         window_id: 100,
         rect: Rect::new(1800, 0, 400, 600),
         visibility: leopardwm_core_layout::Visibility::Visible,
         column_index: 0,
     };
-    state.apply_physical_projection(vec![constrained]);
-    let (request_id, _) = state.physical_request_ids();
-    assert!(
-        !state.allows_core_size_feedback(request_id, 100),
-        "a horizontally sliced origin must not teach a logical minimum on either axis"
-    );
-
-    let vertically_constrained = leopardwm_core_layout::WindowPlacement {
-        window_id: 100,
-        rect: Rect::new(0, 1000, 400, 400),
-        visibility: leopardwm_core_layout::Visibility::Visible,
-        column_index: 0,
-    };
-    state.apply_physical_projection(vec![vertically_constrained]);
-    let (request_id, _) = state.physical_request_ids();
-    assert!(
-        !state.allows_core_size_feedback(request_id, 100),
-        "a height slice can provoke coupled width reflow, so neither axis may teach core minima"
-    );
-
-    let ordinary = leopardwm_core_layout::WindowPlacement {
-        window_id: 100,
-        rect: Rect::new(100, 0, 400, 600),
-        visibility: leopardwm_core_layout::Visibility::Visible,
-        column_index: 0,
-    };
-    state.apply_physical_projection(vec![ordinary]);
+    state.apply_physical_projection(vec![partial]);
     let (request_id, _) = state.physical_request_ids();
     assert!(
         state.allows_core_size_feedback(request_id, 100),
-        "ordinary uncut origins still allow core size feedback"
+        "a positive partial placement retains its full native geometry and ordinary feedback"
+    );
+
+    let parked = leopardwm_core_layout::WindowPlacement {
+        window_id: 100,
+        rect: Rect::new(1920, 0, 400, 600),
+        visibility: leopardwm_core_layout::Visibility::Visible,
+        column_index: 0,
+    };
+    state.apply_physical_projection(vec![parked]);
+    let (request_id, _) = state.physical_request_ids();
+    assert!(
+        !state.allows_core_size_feedback(request_id, 100),
+        "a tracked parked placement must not teach logical minimums"
+    );
+    assert!(
+        state.allows_core_size_feedback(request_id, 999),
+        "an untracked window keeps the existing ordinary-feedback behavior"
     );
 }
 
@@ -1346,7 +1328,6 @@ fn test_outer_animation_pump_preserves_newer_frame_and_resumes_after_sync_supers
             failed: false,
             unreadable: false,
         }],
-        &newer,
     );
     assert_eq!(state.inflight_request_id, None);
     state.animation_inflight_request_id = None;
@@ -1462,87 +1443,70 @@ fn test_invalidated_animation_result_releases_only_matching_latch() {
 }
 
 #[test]
-fn test_direct_and_reduced_motion_apply_park_rejected_adjacent_slice_without_width_feedback() {
+fn test_apply_layout_preserves_full_partial_native_width_without_parking_follow_up() {
     use crate::state::{
         TestApplyPlacementsBehavior, TestApplyPlacementsOutcome, TestApplyPlacementsStep,
     };
 
-    for reduce_motion in [false, true] {
-        let mut state = AppState::new_with_config(test_config(), two_monitors());
-        state.paused = false;
-        state.reduce_motion = reduce_motion;
-        let mut workspace = Workspace::with_gaps(0, 0);
-        workspace.set_reduce_motion(reduce_motion);
-        workspace.insert_window(100, Some(2200)).unwrap();
-        state.workspaces.get_mut(&1).unwrap()[0] = workspace;
-        state.injected_apply_placements_behavior =
-            Some(TestApplyPlacementsBehavior::Scripted(vec![
-                TestApplyPlacementsStep {
-                    delay: std::time::Duration::ZERO,
-                    outcome: TestApplyPlacementsOutcome::Succeed {
-                        landings: vec![leopardwm_platform_win32::PlacementLanding {
-                            window_id: 100,
-                            requested_rect: Rect::new(0, 0, 1920, 1040),
-                            requested_visibility: leopardwm_core_layout::Visibility::Visible,
-                            actual_visible_rect: Some(Rect::new(0, 0, 2200, 1040)),
-                            actual_outer_rect: Some(Rect::new(0, 0, 2200, 1040)),
-                            failed: false,
-                            unreadable: false,
-                        }],
-                    },
-                },
-                TestApplyPlacementsStep {
-                    delay: std::time::Duration::ZERO,
-                    outcome: TestApplyPlacementsOutcome::Succeed {
-                        landings: vec![leopardwm_platform_win32::PlacementLanding {
-                            window_id: 100,
-                            requested_rect: Rect::new(-5000, 0, 2200, 1040),
-                            requested_visibility: leopardwm_core_layout::Visibility::OffScreenRight,
-                            actual_visible_rect: None,
-                            actual_outer_rect: Some(Rect::new(-5000, 0, 2200, 1040)),
-                            failed: false,
-                            unreadable: false,
-                        }],
-                    },
-                },
-            ]));
+    let mut monitors = two_monitors();
+    monitors[0].rect = Rect::new(0, 0, 5120, 1440);
+    monitors[0].work_area = Rect::new(0, 0, 5120, 1440);
+    monitors[1].rect = Rect::new(5120, 0, 800, 600);
+    monitors[1].work_area = Rect::new(5120, 0, 800, 600);
+    let mut state = AppState::new_with_config(test_config(), monitors);
+    state.paused = false;
+    let mut workspace = Workspace::with_gaps(0, 0);
+    workspace.insert_window(101, Some(1600)).unwrap();
+    workspace.insert_window(102, Some(1600)).unwrap();
+    workspace.insert_window(103, Some(1600)).unwrap();
+    workspace.insert_window(100, Some(1600)).unwrap();
+    workspace.set_scroll_offset(480.0);
+    state.workspaces.get_mut(&1).unwrap()[0] = workspace;
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::Scripted(vec![
+        TestApplyPlacementsStep {
+            delay: std::time::Duration::ZERO,
+            outcome: TestApplyPlacementsOutcome::Succeed {
+                landings: vec![leopardwm_platform_win32::PlacementLanding {
+                    window_id: 100,
+                    requested_rect: Rect::new(4320, 0, 1600, 1440),
+                    requested_visibility: leopardwm_core_layout::Visibility::Visible,
+                    actual_visible_rect: Some(Rect::new(4320, 0, 1600, 1440)),
+                    actual_outer_rect: Some(Rect::new(4320, 0, 1600, 1440)),
+                    failed: false,
+                    unreadable: false,
+                }],
+            },
+        },
+    ]));
 
-        state.apply_layout().unwrap();
+    state.apply_layout().unwrap();
 
-        assert_eq!(
-            state.focused_workspace().unwrap().columns()[0].width(),
-            2200
-        );
-        let presentation = &state.last_physical_presentations[&100];
-        assert_eq!(presentation.logical.rect, Rect::new(0, 0, 2200, 1040));
-        assert_eq!(
-            presentation.kind,
-            crate::physical_placement::PhysicalKind::Parked
-        );
-        assert_eq!(
-            presentation.physical.visibility,
-            leopardwm_core_layout::Visibility::OffScreenRight
-        );
-        assert!(presentation.confirmed);
-        assert_eq!(
-            *state.injected_apply_placements_batches.lock().unwrap(),
-            vec![vec![100], vec![100]],
-            "reduce_motion={reduce_motion}: direct landing and bounded parking both dispatch"
-        );
-    }
+    let presentation = &state.last_physical_presentations[&100];
+    assert_eq!(presentation.physical.rect, Rect::new(4320, 0, 1600, 1440));
+    assert_eq!(
+        presentation.kind,
+        crate::physical_placement::PhysicalKind::Unchanged
+    );
+    assert!(presentation.confirmed);
+    assert_eq!(
+        state.focused_workspace().unwrap().columns()[0].width(),
+        1600
+    );
+    assert_eq!(
+        *state.injected_apply_placements_batches.lock().unwrap(),
+        vec![vec![101, 102, 103, 100]],
+        "a successful full-width landing must not dispatch containment parking"
+    );
 }
 
 #[test]
-fn test_primary_feedback_survives_failed_parking_follow_up() {
+fn test_primary_feedback_survives_full_partial_landing() {
     use crate::state::{
         TestApplyPlacementsBehavior, TestApplyPlacementsOutcome, TestApplyPlacementsStep,
     };
 
     let mut state = AppState::new_with_config(test_config(), two_monitors());
     state.paused = false;
-    state.workspaces.get_mut(&1).unwrap()[0]
-        .insert_window(100, Some(2200))
-        .unwrap();
     state.workspaces.get_mut(&2).unwrap()[0]
         .insert_window(200, Some(400))
         .unwrap();
@@ -1555,51 +1519,24 @@ fn test_primary_feedback_survives_failed_parking_follow_up() {
                     min_width: 1200,
                 }],
                 height_violations: Vec::new(),
-                landings: vec![
-                    leopardwm_platform_win32::PlacementLanding {
-                        window_id: 100,
-                        requested_rect: Rect::new(0, 0, 1920, 1040),
-                        requested_visibility: leopardwm_core_layout::Visibility::Visible,
-                        actual_visible_rect: Some(Rect::new(0, 0, 2200, 1040)),
-                        actual_outer_rect: Some(Rect::new(0, 0, 2200, 1040)),
-                        failed: false,
-                        unreadable: false,
-                    },
-                    leopardwm_platform_win32::PlacementLanding {
-                        window_id: 200,
-                        requested_rect: Rect::new(1920, 0, 400, 1040),
-                        requested_visibility: leopardwm_core_layout::Visibility::Visible,
-                        actual_visible_rect: Some(Rect::new(1920, 0, 400, 1040)),
-                        actual_outer_rect: Some(Rect::new(1920, 0, 400, 1040)),
-                        failed: false,
-                        unreadable: false,
-                    },
-                ],
+                landings: vec![leopardwm_platform_win32::PlacementLanding {
+                    window_id: 200,
+                    requested_rect: Rect::new(1920, 0, 400, 1040),
+                    requested_visibility: leopardwm_core_layout::Visibility::Visible,
+                    actual_visible_rect: Some(Rect::new(1920, 0, 400, 1040)),
+                    actual_outer_rect: Some(Rect::new(1920, 0, 400, 1040)),
+                    failed: false,
+                    unreadable: false,
+                }],
             },
-        },
-        TestApplyPlacementsStep {
-            delay: std::time::Duration::ZERO,
-            outcome: TestApplyPlacementsOutcome::Fail,
         },
     ]));
 
-    assert!(state.apply_layout().is_err());
+    assert!(state.apply_layout().is_ok());
     let workspace = &state.workspaces[&2][0];
     assert_eq!(
         workspace.effective_column_width(&workspace.columns()[0]),
-        1200,
-        "unconstrained primary feedback must be retained even when parking fails"
-    );
-    assert!(
-        !state.last_physical_presentations[&100].confirmed,
-        "the failed parking follow-up must remain unconfirmed"
-    );
-    assert_eq!(
-        state
-            .injected_apply_placements_call_count
-            .load(Ordering::SeqCst),
-        2,
-        "the rejected slice still receives only one parking follow-up"
+        1200
     );
 }
 
@@ -1641,7 +1578,6 @@ fn test_failed_landing_retries_before_releasing_pending_ghost() {
             failed: false,
             unreadable: false,
         }],
-        &dispatched,
     );
     state.last_placed_layout_rects.insert(WID, placement.rect);
     assert!(state.physical_fast_path_ok());
@@ -1692,116 +1628,19 @@ fn test_failed_landing_retries_before_releasing_pending_ghost() {
 }
 
 #[test]
-fn test_physical_follow_up_uses_one_bounded_full_batch_worker() {
-    use crate::state::{
-        TestApplyPlacementsBehavior, TestApplyPlacementsOutcome, TestApplyPlacementsStep,
-    };
-
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
-    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::Scripted(vec![
-        TestApplyPlacementsStep {
-            delay: std::time::Duration::ZERO,
-            outcome: TestApplyPlacementsOutcome::Succeed {
-                landings: Vec::new(),
-            },
-        },
-    ]));
-    let follow_up = vec![
-        leopardwm_core_layout::WindowPlacement {
-            window_id: 100,
-            rect: Rect::new(0, 0, 400, 600),
-            visibility: leopardwm_core_layout::Visibility::OffScreenRight,
-            column_index: 0,
-        },
-        leopardwm_core_layout::WindowPlacement {
-            window_id: 200,
-            rect: Rect::new(400, 0, 400, 600),
-            visibility: leopardwm_core_layout::Visibility::Visible,
-            column_index: 1,
-        },
-    ];
-
-    state.apply_physical_follow_up(follow_up).unwrap();
-    assert_eq!(
-        state
-            .injected_apply_placements_call_count
-            .load(Ordering::SeqCst),
-        1,
-        "parking uses exactly one worker-dispatched full membership batch"
-    );
-    assert_eq!(
-        *state.injected_apply_placements_batches.lock().unwrap(),
-        vec![vec![100, 200]],
-        "the parking worker retains the original full batch membership"
-    );
-}
-
-#[test]
-fn test_physical_follow_up_failure_is_propagated() {
-    use crate::state::{
-        TestApplyPlacementsBehavior, TestApplyPlacementsOutcome, TestApplyPlacementsStep,
-    };
-
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
-    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::Scripted(vec![
-        TestApplyPlacementsStep {
-            delay: std::time::Duration::ZERO,
-            outcome: TestApplyPlacementsOutcome::Fail,
-        },
-    ]));
-    let follow_up = vec![leopardwm_core_layout::WindowPlacement {
-        window_id: 100,
-        rect: Rect::new(0, 0, 400, 600),
-        visibility: leopardwm_core_layout::Visibility::OffScreenRight,
-        column_index: 0,
-    }];
-
-    assert!(state.apply_physical_follow_up(follow_up).is_err());
-    assert_eq!(
-        state
-            .injected_apply_placements_call_count
-            .load(Ordering::SeqCst),
-        1
-    );
-}
-
-#[test]
-fn test_physical_follow_up_timeout_is_propagated() {
-    use crate::state::{
-        TestApplyPlacementsBehavior, TestApplyPlacementsOutcome, TestApplyPlacementsStep,
-    };
-
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
-    state.layout_apply_timeout = std::time::Duration::ZERO;
-    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::Scripted(vec![
-        TestApplyPlacementsStep {
-            delay: std::time::Duration::from_millis(10),
-            outcome: TestApplyPlacementsOutcome::Succeed {
-                landings: Vec::new(),
-            },
-        },
-    ]));
-    let follow_up = vec![leopardwm_core_layout::WindowPlacement {
-        window_id: 100,
-        rect: Rect::new(0, 0, 400, 600),
-        visibility: leopardwm_core_layout::Visibility::OffScreenRight,
-        column_index: 0,
-    }];
-
-    assert!(state.apply_physical_follow_up(follow_up).is_err());
-    assert!(state.paused);
-    assert!(state.pending_layout_apply_timeout_report.is_some());
-}
-
-#[test]
-fn test_animation_projection_runs_once_and_preserves_dispatch_origin() {
-    let mut state = AppState::new_with_config(test_config(), two_monitors());
+fn test_animation_projection_runs_once_and_preserves_full_partial_geometry() {
+    let mut monitors = two_monitors();
+    monitors[0].rect = Rect::new(0, 0, 5120, 1440);
+    monitors[0].work_area = Rect::new(0, 0, 5120, 1440);
+    monitors[1].rect = Rect::new(5120, 0, 800, 600);
+    monitors[1].work_area = Rect::new(5120, 0, 800, 600);
+    let mut state = AppState::new_with_config(test_config(), monitors);
     state.workspaces.get_mut(&1).unwrap()[0]
-        .insert_window(100, Some(800))
+        .insert_window(100, Some(1600))
         .unwrap();
     let logical = leopardwm_core_layout::WindowPlacement {
         window_id: 100,
-        rect: Rect::new(1800, 0, 400, 600),
+        rect: Rect::new(4320, 10, 1600, 1440),
         visibility: leopardwm_core_layout::Visibility::Visible,
         column_index: 0,
     };
@@ -1809,10 +1648,38 @@ fn test_animation_projection_runs_once_and_preserves_dispatch_origin() {
     let maximized = std::collections::HashSet::new();
     let request = state.prepare_animation_frame(physical, &maximized);
     assert_eq!(state.physical_request_seq, 1);
-    assert_eq!(request.placements[0].rect, Rect::new(1800, 0, 120, 600));
+    assert_eq!(request.placements[0].rect, logical.rect);
     let origin = state.inflight_origins.get(&1).unwrap().get(&100).unwrap();
-    assert_eq!(origin.logical.rect, logical.rect);
-    assert!(origin.axes.right);
+    assert_eq!(origin.physical.rect, logical.rect);
+    assert_eq!(
+        origin.kind,
+        crate::physical_placement::PhysicalKind::Unchanged
+    );
+    state.applying_layout = true;
+    let frame_result = animation_worker::FrameResult {
+        apply_result: Ok(()),
+        frame_time: Duration::ZERO,
+        width_violations: Vec::new(),
+        height_violations: Vec::new(),
+        maximized_skipped_window_ids: Vec::new(),
+        physical_request_id: request.physical_request_id,
+        physical_invalidation_id: request.physical_invalidation_id,
+        landings: vec![leopardwm_platform_win32::PlacementLanding {
+            window_id: 100,
+            requested_rect: logical.rect,
+            requested_visibility: leopardwm_core_layout::Visibility::Visible,
+            actual_visible_rect: Some(logical.rect),
+            actual_outer_rect: Some(logical.rect),
+            failed: false,
+            unreadable: false,
+        }],
+    };
+    assert!(matches!(
+        state.handle_animation_placement_result(&frame_result),
+        crate::layout_apply::AnimationPlacementResult::Current
+    ));
+    assert!(state.last_physical_presentations[&100].confirmed);
+    assert_eq!(state.expected_physical_rect(100), Some(logical.rect));
 }
 
 #[test]

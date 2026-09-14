@@ -1438,10 +1438,10 @@ mod tests {
                     outcome: TestApplyPlacementsOutcome::Succeed {
                         landings: vec![leopardwm_platform_win32::PlacementLanding {
                             window_id: 101,
-                            requested_rect: Rect::new(0, 0, 1920, 1040),
+                            requested_rect: Rect::new(0, 0, 2200, 1040),
                             requested_visibility: leopardwm_core_layout::Visibility::Visible,
-                            actual_visible_rect: Some(Rect::new(0, 0, 1920, 1040)),
-                            actual_outer_rect: Some(Rect::new(0, 0, 1920, 1040)),
+                            actual_visible_rect: Some(Rect::new(0, 0, 2200, 1040)),
+                            actual_outer_rect: Some(Rect::new(0, 0, 2200, 1040)),
                             failed: false,
                             unreadable: false,
                         }],
@@ -1452,11 +1452,10 @@ mod tests {
         state.apply_layout().unwrap();
 
         let presentation = &state.last_physical_presentations[&101];
-        assert_eq!(presentation.logical.rect, Rect::new(0, 0, 2200, 1040));
-        assert_eq!(presentation.physical.rect, Rect::new(0, 0, 1920, 1040));
+        assert_eq!(presentation.physical.rect, Rect::new(0, 0, 2200, 1040));
         assert_eq!(
             presentation.kind,
-            crate::physical_placement::PhysicalKind::Constrained
+            crate::physical_placement::PhysicalKind::Unchanged
         );
         assert!(presentation.confirmed);
         assert_eq!(

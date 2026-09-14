@@ -155,7 +155,6 @@ impl AppState {
                 frame_result.physical_request_id,
                 frame_result.physical_invalidation_id,
                 &frame_result.landings,
-                &[],
             );
         }
         if frame_result.apply_result.is_ok() {
@@ -606,7 +605,6 @@ impl AppState {
         );
 
         let timeout = self.layout_apply_timeout;
-        let dispatched_for_landing = dispatched_placements.clone();
         let (rx, worker_handle) = match self.spawn_apply_worker(dispatched_placements) {
             Ok(worker) => worker,
             Err(error) => {
@@ -644,13 +642,12 @@ impl AppState {
                     result
                 } else {
                     self.handle_maximized_placement_skips(&maximized_skipped_window_ids);
-                    let follow_up = self.consume_physical_landings(
+                    self.consume_physical_landings(
                         physical_request_id,
                         physical_invalidation_id,
                         &landings,
-                        &dispatched_for_landing,
                     );
-                    self.apply_physical_follow_up(follow_up)
+                    Ok(())
                 };
                 let constraints_changed = primary_succeeded
                     && self.propagate_size_violations(&width_violations, &height_violations);
@@ -743,77 +740,6 @@ impl AppState {
         }
 
         result
-    }
-
-    #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn apply_physical_follow_up(
-        &mut self,
-        follow_up: Vec<leopardwm_core_layout::WindowPlacement>,
-    ) -> Result<()> {
-        if follow_up.is_empty() {
-            return Ok(());
-        }
-
-        let timeout_candidate_ids: Vec<u64> = follow_up
-            .iter()
-            .map(|placement| placement.window_id)
-            .collect();
-        self.begin_physical_follow_up(&follow_up);
-        self.arm_moved_or_resized_suppression(
-            follow_up.iter().map(|placement| placement.window_id),
-        );
-        let timeout = self.layout_apply_timeout;
-        let (rx, worker_handle) = self.spawn_apply_worker(follow_up)?;
-        match rx.recv_timeout(timeout) {
-            Ok((result, _, _, maximized_skipped_window_ids, landings)) => {
-                let _ = worker_handle.join();
-                if let Err(error) = result {
-                    self.moved_or_resized_suppression.clear();
-                    warn!("Physical follow-up parking batch failed: {}", error);
-                    return Err(error);
-                }
-                self.handle_maximized_placement_skips(&maximized_skipped_window_ids);
-                self.complete_physical_follow_up(&landings);
-                Ok(())
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                self.paused = true;
-                self.apply_epoch.fetch_add(1, Ordering::SeqCst);
-                self.pending_apply_workers.push(worker_handle);
-                self.moved_or_resized_suppression.clear();
-                let msg = layout_apply_timeout_message(timeout);
-                let report = LayoutApplyTimeoutReport {
-                    timeout,
-                    candidates: self
-                        .collect_layout_apply_timeout_candidates(&timeout_candidate_ids),
-                };
-                warn!(
-                    "{} Timed-out physical follow-up batch contained {} candidate window(s); batch membership does not prove which window blocked placement.",
-                    msg,
-                    report.candidates.len()
-                );
-                for candidate in &report.candidates {
-                    warn!(
-                        "Timed-out physical follow-up candidate (not a proven blocker): hwnd={:#x} class={:?} title={:?} executable={:?}",
-                        candidate.hwnd,
-                        candidate.class_name,
-                        candidate.title,
-                        candidate.executable
-                    );
-                }
-                self.pending_layout_apply_timeout_report = Some(report);
-                let managed_window_ids = self.all_managed_window_ids();
-                run_layout_apply_recovery_pass(&managed_window_ids, "physical-follow-up-timeout");
-                Err(anyhow!(msg))
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = worker_handle.join();
-                self.moved_or_resized_suppression.clear();
-                Err(anyhow!(
-                    "Physical follow-up worker thread exited without returning a result"
-                ))
-            }
-        }
     }
 
     /// Collect animated placements for every monitor's active workspace, with debug logging.
