@@ -717,10 +717,49 @@ mod tests {
     }
 
     #[test]
+    fn test_maximizebox_geometry_capture_zero_ex_style_is_ok() {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, IsWindowVisible, WINDOW_EX_STYLE, WS_POPUP,
+        };
+
+        struct HiddenPopup(HWND);
+        impl Drop for HiddenPopup {
+            fn drop(&mut self) {
+                let _ = unsafe { DestroyWindow(self.0) };
+            }
+        }
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                None,
+                WS_POPUP,
+                48,
+                48,
+                64,
+                64,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("failed to create hidden popup STATIC fixture");
+        let _fixture = HiddenPopup(hwnd);
+        assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());
+        assert_eq!(capture_maximizebox_geometry(hwnd).ex_style, Ok(0));
+    }
+
+    #[test]
     fn test_maximizebox_geometry_capture_invalid_hwnd_is_err() {
+        use windows::Win32::Foundation::ERROR_INVALID_WINDOW_HANDLE;
+
         let dead = capture_maximizebox_geometry(HWND::default());
-        assert!(dead.style.is_err());
-        assert!(dead.ex_style.is_err());
+        let invalid_hwnd = windows::core::HRESULT::from_win32(ERROR_INVALID_WINDOW_HANDLE.0).0;
+        assert_eq!(dead.style, Err(invalid_hwnd));
+        assert_eq!(dead.ex_style, Err(invalid_hwnd));
         assert!(dead.window_rect.is_err());
         assert!(dead.client_rect.is_err());
         assert!(dead.dwm_frame.is_err());
