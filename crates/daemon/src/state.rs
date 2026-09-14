@@ -682,6 +682,15 @@ pub(crate) struct AppState {
     /// Number of late-worker recovery passes executed after cancellation.
     #[cfg(test)]
     pub(crate) late_worker_recovery_count: Arc<AtomicUsize>,
+    /// Test-only display-change topology so `on_display_change` does not
+    /// enumerate the physical desktop.
+    #[cfg(test)]
+    pub(crate) injected_display_monitors: Option<Vec<MonitorInfo>>,
+    /// Recorded `sync_taskbar_buttons` intents (`true` = show, `false` = hide).
+    /// Production still calls the platform helpers, which no-op without a live
+    /// taskbar thread.
+    #[cfg(test)]
+    pub(crate) recorded_taskbar_commands: std::sync::Mutex<Vec<(u64, bool)>>,
     /// Fanout for IPC pub/sub. The IPC server's per-client task calls
     /// `subscribe()` on this to receive an `IpcEvent` stream.
     pub(crate) event_broadcaster: tokio::sync::broadcast::Sender<leopardwm_ipc::IpcEvent>,
@@ -977,6 +986,10 @@ impl AppState {
             injected_apply_placements_batches: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             late_worker_recovery_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            injected_display_monitors: None,
+            #[cfg(test)]
+            recorded_taskbar_commands: std::sync::Mutex::new(Vec::new()),
             // Capacity 256 is comfortable for human-rate events. A
             // subscriber that lags >256 events behind receives `Lagged`
             // and is expected to reconnect with a fresh Subscribe.
@@ -1226,6 +1239,16 @@ impl AppState {
     /// is called (and under cfg(test)), so saves are simply not requested.
     pub(crate) fn install_save_channel(&mut self, tx: tokio::sync::mpsc::Sender<()>) {
         self.save_request_tx = Some(tx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_recorded_taskbar_commands(&self) -> Vec<(u64, bool)> {
+        std::mem::take(
+            &mut *self
+                .recorded_taskbar_commands
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
     }
 
     /// Try to consume `pending_tab_focus` if it matches the given event

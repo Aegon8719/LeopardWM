@@ -7,9 +7,10 @@ use crate::state::{
     TRANSIENT_WINDOW_THRESHOLD,
 };
 use leopardwm_core_layout::Rect;
+#[cfg(not(test))]
+use leopardwm_platform_win32::enumerate_monitors;
 use leopardwm_platform_win32::{
-    enumerate_monitors, find_monitor_for_rect, get_process_executable, is_shift_key_pressed,
-    MonitorInfo, WindowEvent,
+    find_monitor_for_rect, get_process_executable, is_shift_key_pressed, MonitorInfo, WindowEvent,
 };
 use tracing::{debug, info, warn};
 
@@ -2639,8 +2640,23 @@ impl AppState {
         // immediately on WM_DISPLAYCHANGE receipt (before debounce) in the
         // event loop. This handler runs after the debounce settles.
         info!("Display configuration changed - reconciling monitors");
-        // Re-enumerate monitors
-        match enumerate_monitors() {
+        let enumerated: Result<Vec<MonitorInfo>, leopardwm_platform_win32::Win32Error> = {
+            #[cfg(test)]
+            {
+                match self.injected_display_monitors.clone() {
+                    Some(monitors) => Ok(monitors),
+                    None => {
+                        warn!("Ignoring display change in tests without injected monitors");
+                        return;
+                    }
+                }
+            }
+            #[cfg(not(test))]
+            {
+                enumerate_monitors()
+            }
+        };
+        match enumerated {
             Ok(new_monitors) if !new_monitors.is_empty() => {
                 info!(
                     "Detected {} monitor(s) after display change",
@@ -2671,6 +2687,7 @@ impl AppState {
                 if let Err(e) = self.apply_layout() {
                     warn!("Failed to apply layout after display change: {}", e);
                 }
+                self.sync_taskbar_buttons();
             }
             Ok(_) => {
                 warn!("No monitors found after display change");

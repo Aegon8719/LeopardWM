@@ -12007,6 +12007,262 @@ fn test_display_reconcile_parks_restored_inactive_windows() {
     }
 }
 
+struct ParkProbeWindow(windows::Win32::Foundation::HWND);
+impl ParkProbeWindow {
+    fn new(minimized: bool) -> Self {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MINIMIZE, WS_POPUP,
+        };
+        Self(unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!(""),
+                if minimized {
+                    WS_POPUP | WS_MINIMIZE
+                } else {
+                    WS_POPUP
+                },
+                100,
+                100,
+                200,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        })
+    }
+
+    fn id(&self) -> u64 {
+        self.0 .0 as u64
+    }
+
+    fn rect(&self) -> Rect {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(self.0, &mut rect).unwrap() };
+        Rect::new(
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+        )
+    }
+}
+impl Drop for ParkProbeWindow {
+    fn drop(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+        let _ = unsafe { DestroyWindow(self.0) };
+    }
+}
+
+fn park_probe_state() -> AppState {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = false;
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        Duration::from_millis(1),
+    ));
+    state.ensure_workspace_exists(1, 1);
+    state
+}
+
+#[test]
+fn test_resume_parks_inactive_windows_and_syncs_taskbar() {
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+
+    let active = ParkProbeWindow::new(false);
+    let inactive_tiled = ParkProbeWindow::new(false);
+    let inactive_floating = ParkProbeWindow::new(false);
+    let fullscreen = ParkProbeWindow::new(false);
+    unsafe {
+        SetWindowPos(
+            fullscreen.0,
+            None,
+            0,
+            0,
+            1920,
+            1080,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+        .unwrap();
+    }
+    let minimized = ParkProbeWindow::new(true);
+    let unmanaged = ParkProbeWindow::new(false);
+    let windows = [
+        &active,
+        &inactive_tiled,
+        &inactive_floating,
+        &fullscreen,
+        &minimized,
+        &unmanaged,
+    ];
+    let before: HashMap<_, _> = windows
+        .iter()
+        .map(|window| (window.id(), window.rect()))
+        .collect();
+    let expected_parked = HashSet::from([inactive_tiled.id(), inactive_floating.id()]);
+
+    let mut state = park_probe_state();
+    state.paused = true;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(active.id(), Some(640))
+        .unwrap();
+    let inactive = &mut state.workspaces.get_mut(&1).unwrap()[1];
+    inactive
+        .insert_window(inactive_tiled.id(), Some(720))
+        .unwrap();
+    inactive
+        .add_floating(inactive_floating.id(), before[&inactive_floating.id()])
+        .unwrap();
+    inactive.insert_window(fullscreen.id(), Some(800)).unwrap();
+    inactive.insert_window(minimized.id(), Some(480)).unwrap();
+    inactive.mark_minimized(minimized.id());
+    let membership = state.all_managed_window_ids();
+
+    state.toggle_pause("test resume catchup").unwrap();
+    assert!(!state.paused);
+    assert_eq!(state.active_workspace_idx(1), 0);
+    assert_eq!(state.all_managed_window_ids(), membership);
+    assert!(state.workspaces[&1][1].is_minimized(minimized.id()));
+    assert!(state.is_application_fullscreen(fullscreen.id()));
+    for window in windows {
+        let rect = window.rect();
+        let original = before[&window.id()];
+        if expected_parked.contains(&window.id()) {
+            assert!(
+                leopardwm_platform_win32::is_move_offscreen_sentinel_rect(&rect),
+                "resumed inactive HWND {} must be physically parked, got {rect:?}",
+                window.id()
+            );
+            assert_eq!((rect.width, rect.height), (original.width, original.height));
+        } else {
+            assert_eq!(
+                rect, original,
+                "resume must not move active, minimized, application-fullscreen or unmanaged windows"
+            );
+        }
+        assert!(!leopardwm_platform_win32::is_window_visible(window.id()));
+    }
+    let commands = state.take_recorded_taskbar_commands();
+    assert!(commands.contains(&(active.id(), true)));
+    assert!(commands.contains(&(inactive_tiled.id(), false)));
+    assert!(commands.contains(&(inactive_floating.id(), false)));
+    assert!(commands.contains(&(minimized.id(), false)));
+    assert!(!commands.iter().any(|(id, _)| *id == fullscreen.id()));
+    assert!(!commands.iter().any(|(id, _)| *id == unmanaged.id()));
+}
+
+#[test]
+fn test_failed_resume_does_not_park_or_sync_taskbar() {
+    let active = ParkProbeWindow::new(false);
+    let inactive_tiled = ParkProbeWindow::new(false);
+    let before_active = active.rect();
+    let before_inactive = inactive_tiled.rect();
+
+    let mut state = park_probe_state();
+    state.paused = true;
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndFail(
+        Duration::from_millis(1),
+    ));
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(active.id(), Some(640))
+        .unwrap();
+    state.workspaces.get_mut(&1).unwrap()[1]
+        .insert_window(inactive_tiled.id(), Some(720))
+        .unwrap();
+
+    state
+        .toggle_pause("test failed resume catchup")
+        .expect_err("injected resume apply failure should propagate");
+    assert!(state.paused, "failed resume should restore paused state");
+    assert_eq!(active.rect(), before_active);
+    assert_eq!(inactive_tiled.rect(), before_inactive);
+    assert!(
+        !leopardwm_platform_win32::is_move_offscreen_sentinel_rect(&inactive_tiled.rect()),
+        "failed resume must not park inactive windows"
+    );
+    assert!(state.take_recorded_taskbar_commands().is_empty());
+}
+
+#[test]
+fn test_display_change_event_parks_inactive_windows_and_syncs_taskbar() {
+    let active = ParkProbeWindow::new(false);
+    let inactive_tiled = ParkProbeWindow::new(false);
+    let unmanaged = ParkProbeWindow::new(false);
+    let before_active = active.rect();
+    let before_inactive = inactive_tiled.rect();
+    let before_unmanaged = unmanaged.rect();
+
+    let mut state = park_probe_state();
+    state.injected_display_monitors = Some(two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(active.id(), Some(640))
+        .unwrap();
+    state.workspaces.get_mut(&1).unwrap()[1]
+        .insert_window(inactive_tiled.id(), Some(720))
+        .unwrap();
+
+    state.handle_window_event(WindowEvent::DisplayChange);
+    assert!(!state.paused);
+    assert_eq!(state.active_workspace_idx(1), 0);
+    assert_eq!(active.rect(), before_active);
+    assert_eq!(unmanaged.rect(), before_unmanaged);
+    assert!(
+        leopardwm_platform_win32::is_move_offscreen_sentinel_rect(&inactive_tiled.rect()),
+        "display-change caller must park restored inactive windows, got {:?}",
+        inactive_tiled.rect()
+    );
+    assert_eq!(
+        (inactive_tiled.rect().width, inactive_tiled.rect().height),
+        (before_inactive.width, before_inactive.height)
+    );
+    let commands = state.take_recorded_taskbar_commands();
+    assert!(commands.contains(&(active.id(), true)));
+    assert!(commands.contains(&(inactive_tiled.id(), false)));
+    assert!(!commands.iter().any(|(id, _)| *id == unmanaged.id()));
+}
+
+#[test]
+fn test_paused_display_change_event_resyncs_without_moving_and_syncs_taskbar() {
+    let active = ParkProbeWindow::new(false);
+    let inactive_tiled = ParkProbeWindow::new(false);
+    let minimized = ParkProbeWindow::new(true);
+    let before_active = active.rect();
+    let before_inactive = inactive_tiled.rect();
+    let before_minimized = minimized.rect();
+
+    let mut state = park_probe_state();
+    state.paused = true;
+    state.injected_display_monitors = Some(two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(active.id(), Some(640))
+        .unwrap();
+    let inactive = &mut state.workspaces.get_mut(&1).unwrap()[1];
+    inactive
+        .insert_window(inactive_tiled.id(), Some(720))
+        .unwrap();
+    inactive.mark_minimized(inactive_tiled.id());
+    inactive.insert_window(minimized.id(), Some(480)).unwrap();
+    inactive.mark_minimized(minimized.id());
+
+    state.handle_window_event(WindowEvent::DisplayChange);
+    assert!(state.paused);
+    assert!(!state.workspaces[&1][1].is_minimized(inactive_tiled.id()));
+    assert!(state.workspaces[&1][1].is_minimized(minimized.id()));
+    assert_eq!(active.rect(), before_active);
+    assert_eq!(inactive_tiled.rect(), before_inactive);
+    assert_eq!(minimized.rect(), before_minimized);
+    let commands = state.take_recorded_taskbar_commands();
+    assert!(commands.contains(&(active.id(), true)));
+    assert!(commands.contains(&(inactive_tiled.id(), false)));
+    assert!(commands.contains(&(minimized.id(), false)));
+}
+
 #[test]
 fn test_restore_structure_reapplies_snap_suppression() {
     use windows::core::w;

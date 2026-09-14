@@ -824,12 +824,22 @@ fn build_defer_entries(
             // Off-screen: SWP_NOSIZE keeps current size (no resize side-effects).
             // w stores estimated frame width for clamping only — SetWindowPos
             // ignores it due to SWP_NOSIZE.
+            //
+            // Zero-size hidden-tab placeholders are not a visible-rect request.
+            // Converting them through frame insets makes the parked origin
+            // depend on whether the inset cache is warm or cold after restart.
+            let zero_size_hidden_tab = placement.rect.width == 0 && placement.rect.height == 0;
+            let (x, y, w) = if zero_size_hidden_tab {
+                (placement.rect.x, placement.rect.y, 0)
+            } else {
+                (frame_rect.x, frame_rect.y, frame_rect.width)
+            };
             entries.push(DeferEntry {
                 hwnd,
                 window_id: placement.window_id,
-                x: frame_rect.x,
-                y: frame_rect.y,
-                w: frame_rect.width,
+                x,
+                y,
+                w,
                 h: 0,
                 layout_w: placement.rect.width,
                 layout_h: placement.rect.height,
@@ -2434,6 +2444,14 @@ mod tests {
         }
     }
 
+    fn seed_global_insets(window_id: WindowId, insets: (i32, i32, i32, i32)) {
+        if let Ok(mut global) = GLOBAL_INSET_CACHE.lock() {
+            global
+                .get_or_insert_with(HashMap::new)
+                .insert(window_id, insets);
+        }
+    }
+
     #[test]
     fn test_fresh_insets_publish_when_the_generation_still_matches() {
         let _serialize = GENERATION_TEST_LOCK
@@ -2776,5 +2794,158 @@ mod tests {
             "successful recovery must retain a ghost-owned effective cloak"
         );
         unmark_ghost_cloaked(wid);
+    }
+
+    struct HiddenPopup {
+        hwnd: HWND,
+        id: WindowId,
+    }
+
+    impl HiddenPopup {
+        fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
+            use windows::core::w;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+            };
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                    w!("STATIC"),
+                    w!("LeopardWM hidden tab park test"),
+                    WS_POPUP,
+                    x,
+                    y,
+                    w,
+                    h,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+            Self {
+                hwnd,
+                id: hwnd.0 as usize as u64,
+            }
+        }
+
+        fn rect(&self) -> Rect {
+            let mut rect = RECT::default();
+            unsafe { GetWindowRect(self.hwnd, &mut rect).unwrap() };
+            Rect::new(
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+            )
+        }
+    }
+
+    impl Drop for HiddenPopup {
+        fn drop(&mut self) {
+            use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+            let _ = unsafe { DestroyWindow(self.hwnd) };
+        }
+    }
+
+    fn offscreen_placement(
+        window_id: WindowId,
+        rect: Rect,
+        visibility: Visibility,
+    ) -> WindowPlacement {
+        WindowPlacement {
+            window_id,
+            rect,
+            visibility,
+            column_index: 0,
+        }
+    }
+
+    fn defer_origin(
+        placement: WindowPlacement,
+        insets: (i32, i32, i32, i32),
+        high_contrast: bool,
+    ) -> (i32, i32, i32, i32) {
+        let mut cache = PlacementCache::new();
+        cache.insets.insert(placement.window_id, insets);
+        let mut cache_opt = Some(&mut cache);
+        let (entries, skipped, _) = build_defer_entries(
+            &[placement],
+            &mut cache_opt,
+            SET_WINDOW_POS_FLAGS(0),
+            high_contrast,
+            true,
+        );
+        assert_eq!(skipped, 0);
+        let entry = entries
+            .first()
+            .expect("hidden HWND fixture must produce a defer entry");
+        (entry.x, entry.y, entry.w, entry.h)
+    }
+
+    #[test]
+    fn test_zero_size_hidden_tab_origin_ignores_inset_cache() {
+        let window = HiddenPopup::new(100, 100, 684, 408);
+        let logical = Rect::new(-5120, 0, 0, 0);
+        let placement = offscreen_placement(window.id, logical, Visibility::OffScreenLeft);
+        let warm = defer_origin(placement.clone(), (7, 1, 7, 8), false);
+        let cold = defer_origin(placement.clone(), (0, 0, 0, 0), false);
+        let high_contrast = defer_origin(placement, (7, 1, 7, 8), true);
+        assert_eq!(warm, (logical.x, logical.y, 0, 0));
+        assert_eq!(cold, warm);
+        assert_eq!(high_contrast, warm);
+    }
+
+    #[test]
+    fn test_nonzero_offscreen_origin_still_applies_insets() {
+        let window = HiddenPopup::new(120, 80, 400, 300);
+        let logical = Rect::new(-5120, 40, 1600, 900);
+        let placement = offscreen_placement(window.id, logical, Visibility::OffScreenLeft);
+        let insets = (7, 1, 7, 8);
+        let converted = visible_rect_to_frame_rect(logical, insets, false);
+        assert_eq!(
+            defer_origin(placement.clone(), insets, false),
+            (converted.x, converted.y, converted.width, 0)
+        );
+        assert_eq!(
+            defer_origin(placement, insets, true),
+            (logical.x, logical.y, logical.width, 0)
+        );
+    }
+
+    #[test]
+    fn test_zero_size_hidden_tab_native_park_is_stable_across_inset_cache() {
+        let _serialize = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(crate::recover_poisoned_mutex);
+        let _cloak = lock_cloak_set_tests();
+        let window = HiddenPopup::new(100, 100, 684, 408);
+        let _membership = CloakMembershipGuard::claim(window.id);
+        forget_global_insets(window.id);
+        clear_inset_cache();
+        let original = window.rect();
+        assert_eq!((original.width, original.height), (684, 408));
+        let logical = Rect::new(-5120, 0, 0, 0);
+        let placement = offscreen_placement(window.id, logical, Visibility::OffScreenLeft);
+        let config = PlatformConfig::default();
+
+        apply_placements(std::slice::from_ref(&placement), &config, None, false).unwrap();
+        let cold = window.rect();
+
+        seed_global_insets(window.id, (7, 1, 7, 8));
+        apply_placements(std::slice::from_ref(&placement), &config, None, false).unwrap();
+        let warm = window.rect();
+
+        clear_inset_cache();
+        apply_placements(std::slice::from_ref(&placement), &config, None, false).unwrap();
+        let after_restart = window.rect();
+
+        for observed in [cold, warm, after_restart] {
+            assert_eq!(observed.x, logical.x);
+            assert_eq!(observed.y, logical.y);
+            assert_eq!((observed.width, observed.height), (684, 408));
+        }
+        forget_global_insets(window.id);
     }
 }
