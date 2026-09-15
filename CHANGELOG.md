@@ -27,7 +27,7 @@ All notable changes to LeopardWM will be documented in this file.
 - **Off-screen recovery recognizes Windows-clamped parking coordinates.** Parking now uses the native coordinate limit so cleanup can find and restore parked windows without mistaking ordinary minimized windows for parked ones. Recovery uses physical coordinates even when called from the CLI or watchdog, then restores the caller's DPI context.
 - **Partially visible tiled windows retain their requested native size.** At exactly adjacent monitor edges, positive partial placements now keep the full application rectangle during scrolling and at rest, preserving requested column widths, focus, and saved layout state. Bleed onto the adjacent monitor is accepted rather than resizing or parking the application.
 - **Owned decorations remain clipped at protected owner edges.** Borders and tab strips retain the conservative shared-edge projection even where their full-size application can bleed onto an adjacent monitor. Boundary-affected animation ghosts still wait for a current confirmed landing before their live source is exposed.
-- **Off-screen parking remains recoverable and current during transitions.** Fully owner-invisible and hidden placements use LeopardWM's shared off-screen recovery sentinel. Parking confirmation still requires a readable actual outer rectangle that clears every monitor; logical target dimensions alone are not clearance proof.
+- **Off-screen parking remains recoverable and current during transitions.** Inactive-workspace parking uses LeopardWM's shared off-screen recovery sentinel. Inactive tabs on the active workspace use raw zero-size off-screen placeholder coordinates with no-size native movement, not that sentinel. Parking confirmation still requires a readable actual outer rectangle that clears every monitor; logical target dimensions alone are not clearance proof.
 - **Failed native landings no longer strand transitions or discard ordinary size feedback.** Failed synchronous placement attempts remain unconfirmed for retry, while empty filtered batches retain that state until a later verified landing. Tracked parking suppresses size feedback; ordinary full-size placements continue to report it, and departing ghost cloaks release after their thumbnail has already been dropped.
 - **Column width changes trigger workspace saves without an unrelated layout change.**
   Save detection tracks requested widths even when a native minimum keeps the effective
@@ -56,6 +56,11 @@ All notable changes to LeopardWM will be documented in this file.
   recording, LeopardWM keeps its keyboard hook active and swallows the pressed combo before
   Windows sees it, so `Win+Home`, `Win+Arrow`, and similar chords are recorded instead of
   triggering the shell. Cancelling a recording no longer reloads the configuration.
+
+### Known limitations
+
+- **Adjacent-monitor bleed is not fixed.** Partially visible tiled windows keep their full requested size while scrolling and after they stop at a partial position, so they can draw onto an adjacent monitor. That bleed is accepted in this release to retain full-size scrolling rather than clipping, resizing, or parking the window.
+- **Restart can change off-screen client-area and DWM frame geometry.** An application's outer bounds can stay the same while its client area or DWM frame insets change after a restart. This was observed with Beeper. It is accepted for 0.2.9; repair is deferred to 0.3.x. It is not proven harmless or exclusive to that application.
 
 ### Internal
 
