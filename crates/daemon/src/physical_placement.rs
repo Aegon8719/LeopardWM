@@ -1132,6 +1132,7 @@ mod tests {
                 monitor(2, 1920, 0, 1920, 1080),
             ],
         );
+        state.reduce_motion = false;
         state.workspaces.get_mut(&1).unwrap()[0]
             .insert_window(100, Some(800))
             .unwrap();
@@ -1170,6 +1171,7 @@ mod tests {
                 monitor(2, 1920, 0, 1920, 1080),
             ],
         );
+        state.reduce_motion = false;
         state.workspaces.get_mut(&1).unwrap()[0]
             .add_floating(200, Rect::new(1800, 0, 400, 600))
             .unwrap();
@@ -1209,6 +1211,7 @@ mod tests {
 
         let mut application_fullscreen =
             AppState::new_with_config(crate::config::Config::default(), adjacent_monitors());
+        application_fullscreen.reduce_motion = false;
         application_fullscreen.workspaces.get_mut(&1).unwrap()[0]
             .insert_window(300, Some(800))
             .unwrap();
@@ -1256,6 +1259,7 @@ mod tests {
 
         let mut layout_fullscreen =
             AppState::new_with_config(crate::config::Config::default(), adjacent_monitors());
+        layout_fullscreen.reduce_motion = false;
         let workspace = &mut layout_fullscreen.workspaces.get_mut(&1).unwrap()[0];
         workspace.insert_window(400, Some(800)).unwrap();
         assert!(workspace.toggle_fullscreen());
@@ -1295,6 +1299,7 @@ mod tests {
 
         let mut dragging =
             AppState::new_with_config(crate::config::Config::default(), adjacent_monitors());
+        dragging.reduce_motion = false;
         dragging.workspaces.get_mut(&1).unwrap()[0]
             .insert_window(500, Some(800))
             .unwrap();
@@ -1337,6 +1342,7 @@ mod tests {
 
         let mut native_maximized =
             AppState::new_with_config(crate::config::Config::default(), adjacent_monitors());
+        native_maximized.reduce_motion = false;
         native_maximized.workspaces.get_mut(&1).unwrap()[0]
             .insert_window(600, Some(800))
             .unwrap();
