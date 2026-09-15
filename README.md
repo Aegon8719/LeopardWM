@@ -58,6 +58,7 @@ A few deliberate **non-features**, so you know what you're getting:
 
 - Multi-monitor workspaces with monitor-aware focus and move (9 workspaces per monitor)
 - Global hotkeys with live config reload
+- **PowerToys Shortcut Guide export** — `lwm query hotkeys` lists effective bindings; `lwm export-shortcut-guide` writes a user manifest (stdout, `--output PATH`, or `--install`)
 - Smooth scroll animations with layout transition effects (vsync-locked)
 - Touchpad gestures with configurable swipe actions
 - Drag-and-drop column reorder (Shift+drag to merge windows)
@@ -227,26 +228,23 @@ lwm query hotkeys      # effective bindings plus config diagnostics
 
 ### PowerToys Shortcut Guide
 
-Export the daemon's effective hotkeys as a user manifest for the PowerToys
-Shortcut Guide:
+Export the daemon's effective hotkeys as a PowerToys Shortcut Guide user manifest:
 
 ```bash
-lwm export-shortcut-guide --install
+lwm export-shortcut-guide                 # YAML to stdout
+lwm export-shortcut-guide --output PATH   # write a file
+lwm export-shortcut-guide --install       # replace the user manifest
 ```
 
-The command writes
+`--output` and `--install` are mutually exclusive. `--install` writes
 `%LOCALAPPDATA%\Microsoft\WinGet\KeyboardShortcuts\LeopardWM.LeopardWM.en-US.yml`.
-With PowerToys running and Shortcut Guide enabled, press `Win+Shift+?` to open
-the guide. Run the exporter again after changing hotkeys. Use
-`--output <path>` instead of `--install` to inspect or version the generated
-YAML, or omit both options to print it to stdout.
 
-Use CLI and daemon binaries from the same build; the hotkey query requires IPC
-v3. The guide is a snapshot, so reload LeopardWM and export again after changing
-bindings. Reopen Shortcut Guide to inspect the updated manifest.
+Use matching CLI and daemon builds; query and export require IPC v3. The
+manifest is a snapshot: after changing bindings, reload LeopardWM and export
+again, then reopen Shortcut Guide.
 
-Each alternative binding is displayed separately. Equivalent spellings of the
-same physical chord are resolved consistently: the lexicographically first valid
+Each alternative binding is a separate shortcut. Equivalent spellings of the
+same physical chord resolve consistently: the lexicographically first valid
 configured binding wins, and warnings identify ignored collisions. F13-F24 used
 as modifiers cannot be represented by PowerToys and are skipped with a warning;
 F13-F24 used as ordinary trigger keys can be exported. Warnings go to stderr so

@@ -4,9 +4,22 @@ All notable changes to LeopardWM will be documented in this file.
 
 ## 0.2.9
 
+### Features
+
+- **Query effective hotkeys and export a PowerToys Shortcut Guide manifest.**
+  `lwm query hotkeys` lists resolved bindings and configuration diagnostics.
+  `lwm export-shortcut-guide` writes YAML to stdout, `--output PATH` writes a
+  file, and `--install` atomically replaces
+  `%LOCALAPPDATA%\Microsoft\WinGet\KeyboardShortcuts\LeopardWM.LeopardWM.en-US.yml`.
+  Matching CLI and daemon builds are required (IPC v3). The manifest is a
+  snapshot: reload LeopardWM and export again after changing bindings. Alternative
+  bindings appear as separate shortcuts. F13-F24 used as modifiers are skipped
+  with a warning; F13-F24 used as ordinary trigger keys can be exported.
+
 ### Documentation
 
 - **The README now includes the official Scoop installation and update commands.**
+- **The README documents hotkey query and PowerToys Shortcut Guide export.**
 
 ### Improvements
 
@@ -56,6 +69,10 @@ All notable changes to LeopardWM will be documented in this file.
   recording, LeopardWM keeps its keyboard hook active and swallows the pressed combo before
   Windows sees it, so `Win+Home`, `Win+Arrow`, and similar chords are recorded instead of
   triggering the shell. Cancelling a recording no longer reloads the configuration.
+- **Equivalent hotkey spellings choose the same action after every reload.**
+  Registration and queries share physical-chord deduplication. The first valid
+  binding in lexicographic order wins; ignored collisions identify the retained
+  binding and action in diagnostics.
 
 ### Known limitations
 
@@ -64,6 +81,9 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Internal
 
+- **IPC protocol v3 adds `QueryHotkeys` and `HotkeyList`.** Existing v1/v2
+  subscription clients remain supported; the new query/export commands require
+  a daemon implementing v3.
 - **Snap Layout remove and restore can emit numeric style-geometry diagnostics.** With debug logging enabled, maximize-box remove and restore log HWND, process/thread ids, style bits, and outer/client/DWM-frame/NC-rendering measurements at before-style, after-style, and after-frame boundaries. Failed geometry or style reads log numeric HRESULT codes instead of zeros. These queries are synchronous operation-boundary measurements, not proof of delayed application layout. Placement, style-change, and no-op behavior are unchanged.
 - **Opt-in framed-window clipping proofs record bounded native feasibility evidence.** The framed probe measured non-client rendering/frame changes while clipped despite unchanged native dimensions, so that presentation limitation remains separate from mechanical viability. A second ignored, hidden-fixture matrix covers known absent, empty, simple, and complex regions; LTR and right-origin RTL slices; retained-controller cancellation, restore-order, replacement, stale-identity, and native restore retry/terminal-repair boundaries. Both are test-only: no scrolling fix or compatibility acceptance is claimed.
 - **Diagnostics validation hosts are opt-in and isolated from ordinary tests.** A unique-pipe test host and exact-pipe CLI consumer can record Medium/High integrity evidence without starting the full daemon or falling back to the daily-driver pipe.
@@ -79,17 +99,11 @@ All notable changes to LeopardWM will be documented in this file.
   manifest, dedicated validator, and post-release refresh process are removed
   while the GitHub Release archive contract used by Scoop Extras remains
   unchanged.
+- **Lockfile dependency updates:** serde 1.0.229, toml 1.1.5, and tokio 1.53.1.
 
 ## 0.2.8
 
 ### Features
-
-- **Query effective hotkeys and export a PowerToys Shortcut Guide manifest.**
-  `lwm query hotkeys` lists resolved bindings and configuration diagnostics;
-  `lwm export-shortcut-guide` writes YAML to stdout, `--output PATH` writes a
-  file, and `--install` atomically replaces the user manifest. Alternative
-  bindings appear as separate shortcuts. Unsupported F13-F24 modifiers are
-  skipped with a warning.
 
 - **Window rules can set their initial column width in Settings.** The rule
   Options menu accepts a viewport fraction from `0.05` to `1.0`, or a blank
@@ -109,11 +123,6 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Fixes
 
-- **Equivalent hotkey spellings choose the same action after every reload.**
-  Registration and queries share physical-chord deduplication. The first valid
-  binding in lexicographic order wins; ignored collisions identify the retained
-  binding and action in diagnostics.
-
 - **New windows stay on the monitor where Windows opens them.** Monitor
   selection uses opening bounds when they map to an attached monitor; otherwise
   it retains the focused monitor, while preserving fullscreen stacking without
@@ -130,10 +139,6 @@ All notable changes to LeopardWM will be documented in this file.
   remeasured once.
 
 ### Internal
-
-- **IPC protocol v3 adds `QueryHotkeys` and `HotkeyList`.** Existing v1/v2
-  subscription clients remain supported; the new query/export commands require
-  a daemon implementing v3.
 
 - **Developer-only synthetic touchpad diagnostic.** The platform example records
   observed low-level wheel message kind, delta, coordinates, timestamp, and
