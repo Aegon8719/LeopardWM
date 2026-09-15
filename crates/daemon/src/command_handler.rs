@@ -1,9 +1,10 @@
 //! IPC command handling for AppState.
 
 use crate::config::Config;
+use crate::hotkey_resolution::resolve_hotkeys;
 use crate::state::{validate_set_width_fraction, AppState, PendingWorkspaceSwitchFocus};
 use leopardwm_core_layout::{Rect, Workspace};
-use leopardwm_ipc::{IpcCommand, IpcResponse};
+use leopardwm_ipc::{HotkeyBindingInfo, IpcCommand, IpcResponse};
 use leopardwm_platform_win32::{
     enumerate_windows, get_process_executable, monitor_above, monitor_below, monitor_to_left,
     monitor_to_right, move_window_offscreen, MonitorId, MonitorInfo,
@@ -27,6 +28,15 @@ enum FullscreenPolicy {
     Suppress,
     /// Run unchanged (fullscreen toggle, queries, cross-monitor/workspace moves).
     Allow,
+}
+
+/// Generate a display label for a valid action outside the catalog.
+fn humanize_action_id(action_id: &str) -> String {
+    let mut label = action_id.replace('_', " ");
+    if let Some(first) = label.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    label
 }
 
 /// Whether `cmd` navigates focus to a (possibly different) window, so the
@@ -366,6 +376,7 @@ impl AppState {
             }
             IpcCommand::QueryWorkspace => self.handle_query_workspace(),
             IpcCommand::QueryFocused => self.handle_query_focused(),
+            IpcCommand::QueryHotkeys => self.handle_query_hotkeys(),
             IpcCommand::Refresh => self.handle_refresh(),
             IpcCommand::Apply => {
                 if let Err(e) = self.apply_layout() {
@@ -796,6 +807,54 @@ impl AppState {
             }
         } else {
             IpcResponse::error("No focused workspace")
+        }
+    }
+
+    /// Handle `IpcCommand::QueryHotkeys`.
+    fn handle_query_hotkeys(&self) -> IpcResponse {
+        let catalog = leopardwm_ipc::hotkeys::hotkey_catalog();
+        let mut bindings_by_action: HashMap<String, Vec<String>> = HashMap::new();
+        let resolved = resolve_hotkeys(&self.config.hotkeys);
+        for entry in resolved.bindings {
+            if entry.executable {
+                bindings_by_action
+                    .entry(entry.action_id)
+                    .or_default()
+                    .push(entry.binding);
+            }
+        }
+
+        let mut hotkeys: Vec<_> = catalog
+            .into_iter()
+            .map(|action| {
+                let mut bindings = bindings_by_action.remove(&action.id).unwrap_or_default();
+                bindings.sort();
+                HotkeyBindingInfo {
+                    action_id: action.id,
+                    label: action.label,
+                    group: action.group.to_string(),
+                    enabled: !bindings.is_empty(),
+                    bindings,
+                }
+            })
+            .collect();
+
+        let mut extra_actions: Vec<_> = bindings_by_action.into_iter().collect();
+        extra_actions.sort_by(|(left, _), (right, _)| left.cmp(right));
+        hotkeys.extend(extra_actions.into_iter().map(|(action_id, mut bindings)| {
+            bindings.sort();
+            HotkeyBindingInfo {
+                label: humanize_action_id(&action_id),
+                group: "Other".to_string(),
+                action_id,
+                enabled: !bindings.is_empty(),
+                bindings,
+            }
+        }));
+        IpcResponse::HotkeyList {
+            hotkeys,
+            scroll_modifier: self.config.hotkeys.scroll_modifier.clone(),
+            issues: resolved.issues,
         }
     }
 
