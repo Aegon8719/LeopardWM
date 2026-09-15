@@ -20,7 +20,7 @@ Press Ctrl+C to disconnect. The daemon does not need to know who is listening; r
 
 - **Pipe**: `\\.\pipe\leopardwm_<scope>` where `<scope>` is the lowercased `USERDOMAIN\USERNAME` (e.g. `\\.\pipe\leopardwm_my-pc_jose`). Use `leopardwm_ipc::preferred_pipe_name()` from Rust or hard-code per the docs in `crates/ipc/src/lib.rs:11-71`.
 - **Framing**: newline-delimited JSON (`\n`), one logical message per line. UTF-8.
-- **Per-frame size cap**: 64 KiB (`MAX_IPC_MESSAGE_SIZE` in `crates/ipc/src/lib.rs:22`).
+- **Per-frame size cap**: 64 KiB (`MAX_IPC_MESSAGE_SIZE` in `crates/ipc/src/lib.rs`).
 
 ## Protocol versions and the hotkey query
 

@@ -241,7 +241,9 @@ lwm export-shortcut-guide --install       # replace the user manifest
 
 Use matching CLI and daemon builds; query and export require IPC v3. The
 manifest is a snapshot: after changing bindings, reload LeopardWM and export
-again, then reopen Shortcut Guide.
+again, then reopen Shortcut Guide. Query and export report resolved
+configuration, not proof that the keyboard hook is installed or active; safe
+mode can still list configured bindings.
 
 Each alternative binding is a separate shortcut. Equivalent spellings of the
 same physical chord resolve consistently: the lexicographically first valid
