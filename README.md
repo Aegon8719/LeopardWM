@@ -9,13 +9,13 @@
 ![Platform: Windows 10/11](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D4)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=000)](https://buymeacoffee.com/jcardama)
 
-A scrollable tiling window manager for Windows.
+A tiling window manager for Windows with two viewport models: **Serval** (the default focus + reel layout) and the classic scroll-first horizontal strip.
 
 https://github.com/user-attachments/assets/d367d337-4005-4c1d-bdd5-8a678b34582f
 
 ## What Makes It Different
 
-Most Windows tilers use tree or BSP layouts. LeopardWM is **scroll-first**: windows sit on a horizontal strip, and your monitor acts as a viewport that scrolls over them. Navigation stays spatially consistent as windows are added — you move through context instead of constantly rebuilding split trees.
+Most Windows tilers use tree or BSP layouts. LeopardWM treats the screen as a viewport instead. The default **Serval** model keeps one large focus window next to a slot-machine reel of scaled thumbnails — scroll the reel, click a slot, and the windows rotate through the main position without rebuilding a split tree. Prefer the original behavior? The **scroll-first** horizontal strip is one config line away (`[layout] mode = "scroll"`): windows sit on a horizontal strip, and your monitor acts as a viewport that scrolls over them. Either way, navigation stays spatially consistent as windows are added.
 
 - **Vsync-aligned animations** — smooth scrolling powered by a `DwmFlush`-driven animation engine
 - **First-class touchpad gestures** — three-finger swipes drive focus and scroll out of the box
@@ -50,7 +50,7 @@ https://github.com/user-attachments/assets/43715787-1501-4e19-b693-f301065e914d
 
 A few deliberate **non-features**, so you know what you're getting:
 
-- **Scroll-first, not multi-layout.** No BSP, no DWindle, no Equal/Stair/UltrawideVerticalStack — and we won't add them. niri (Wayland) and PaperWM (GNOME) stay scrolling-only by choice; the horizontal strip *is* the identity. If you want 9 layout variants, [komorebi](https://github.com/LGUG2Z/komorebi) is the right tool.
+- **Viewport-first, not multi-layout.** No BSP, no DWindle, no Equal/Stair/UltrawideVerticalStack — and we won't add them. The viewport models are Serval (focus + reel) and the horizontal strip; both move you through context instead of rebuilding split trees. If you want 9 layout variants, [komorebi](https://github.com/LGUG2Z/komorebi) is the right tool.
 - **No Virtual Desktop bridging.** Per-monitor workspaces don't map cleanly to Windows' global Virtual Desktops, and the only library that bridges them (`winvd`) breaks every 3-6 months on Windows feature updates. Instead, `Win+Ctrl+Arrow` is intercepted and routed to LeopardWM's workspace prev/next so the native muscle memory still works.
 - **Named-pipe IPC, not WebSocket.** Lower latency, no port allocation, no firewall prompts. If browser-based bar integration becomes a real ask, we'll add a thin bridge rather than make the daemon serve sockets directly.
 
@@ -60,6 +60,7 @@ A few deliberate **non-features**, so you know what you're getting:
 - Global hotkeys with live config reload
 - **PowerToys Shortcut Guide export** — `lwm query hotkeys` lists effective bindings; `lwm export-shortcut-guide` writes a user manifest (stdout, `--output PATH`, or `--install`)
 - Smooth scroll animations with layout transition effects (vsync-locked)
+- **Serval (Focus + Reel) layout is the default** — one large focus window plus a vertical slot-machine reel of scaled thumbnails: wheel over the reel to scroll it continuously, click a slot to promote it, and `reel_flip_side_on_promote` alternates the mirrored layout. Reel items are composited as DWM thumbnails, so their live windows never receive a `WM_SIZE` when they enter or leave the reel. Set `[layout] mode = "scroll"` for the classic horizontal strip.
 - Touchpad gestures with configurable swipe actions
 - Drag-and-drop column reorder (Shift+drag to merge windows)
 - **Tabbed columns** — toggle a column between vertical-stack and tab-strip mode (`Ctrl+Alt+T`); only the active tab fills the column rect, the rest sit in a clickable strip above
@@ -120,10 +121,26 @@ cd LeopardWM
 cargo build --release
 ```
 
+For a timestamped build (each run lands in its own folder with the UTC build
+stamp in every executable name), use the wrapper script instead:
+
+```powershell
+pwsh -File tools\build_timestamped.ps1
+# -> dist\LeopardWM-0.2.9-20260616-143005\leopardwm-0.2.9-20260616-143005.exe ...
+```
+
+Each folder also contains canonical-name hardlinks (`lwm.exe`, `leopardwm.exe`, ...)
+so `lwm.exe run` finds the daemon and watchdog in place.
+
+The build stamp is also embedded in the binaries, so `leopardwm.exe --version`,
+`lwm --version`, the startup log, `lwm status`, and the Windows file properties
+(FileVersion / ProductVersion / Comments) all identify exactly which build is
+running.
+
 Start the daemon:
 
 ```bash
-./target/release/leopardwm.exe
+./target/x86_64-pc-windows-msvc/release/leopardwm.exe
 ```
 
 A default config is created automatically at `%APPDATA%\leopardwm\config\config.toml`. Customize via the tray icon → Settings, or edit the file directly.

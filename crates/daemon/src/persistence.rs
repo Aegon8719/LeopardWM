@@ -294,6 +294,7 @@ impl AppState {
                 self.config.animation.scroll_duration_ms,
                 self.config.animation.easing,
             );
+            crate::helpers::apply_layout_mode_to_workspace(&mut ws, &self.config.layout);
             // Preserve the saved scroll offset (it serializes, but set it
             // explicitly so a future skip on this field would not regress).
             ws.set_scroll_offset(ws_snapshot.workspace.scroll_offset());
@@ -318,6 +319,7 @@ impl AppState {
                     self.config.animation.scroll_duration_ms,
                     self.config.animation.easing,
                 );
+                crate::helpers::apply_layout_mode_to_workspace(&mut empty, &self.config.layout);
                 entry.push(empty);
             }
             entry[ws_idx] = ws;
@@ -387,6 +389,10 @@ impl AppState {
                         ws.set_scroll_animation(
                             self.config.animation.scroll_duration_ms,
                             self.config.animation.easing,
+                        );
+                        crate::helpers::apply_layout_mode_to_workspace(
+                            &mut ws,
+                            &self.config.layout,
                         );
                         ws_vec.push(ws);
                     }

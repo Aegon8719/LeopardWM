@@ -184,6 +184,7 @@ impl Workspace {
             if self.fullscreen_window == Some(*wid) {
                 self.fullscreen_window = None;
             }
+            self.reel_note_removed(*wid);
         }
         if self.columns.is_empty() {
             self.focused_column = 0;
@@ -229,7 +230,13 @@ impl Workspace {
     /// Focus follows the moved window. If the source column becomes empty it is removed.
     /// In a Tabbed receiver, the moved window becomes the new active tab
     /// (consistent with the "user-initiated keyboard move" intent).
+    /// Move the focused window to the column on the left (joining it).
+    /// In Serval mode the reel rotates one step instead.
     pub fn move_window_left(&mut self) {
+        if self.focus_reel.is_some() {
+            self.reel_rotate_ring(-1);
+            return;
+        }
         if self.columns.is_empty() {
             return;
         }
@@ -260,6 +267,10 @@ impl Workspace {
     /// Focus follows the moved window. If the source column becomes empty it is removed.
     /// In a Tabbed receiver, the moved window becomes the new active tab.
     pub fn move_window_right(&mut self) {
+        if self.focus_reel.is_some() {
+            self.reel_rotate_ring(1);
+            return;
+        }
         if self.focused_column + 1 >= self.columns.len() {
             // At the right edge: unstack into a new column off the end
             // instead of a dead-end (no-op if the column isn't stacked).
@@ -383,6 +394,10 @@ impl Workspace {
     /// In a Tabbed column, `swap_windows` keeps `active_idx` tracking the
     /// same window (handled inside `Column::swap_windows`).
     pub fn move_window_up_in_column(&mut self) {
+        if self.focus_reel.is_some() {
+            self.reel_rotate_ring(-1);
+            return;
+        }
         if self.focused_window_in_column == 0 {
             return;
         }
@@ -396,6 +411,10 @@ impl Workspace {
 
     /// Swap the focused window with the one below in the same column.
     pub fn move_window_down_in_column(&mut self) {
+        if self.focus_reel.is_some() {
+            self.reel_rotate_ring(1);
+            return;
+        }
         if self.focused_window_in_column + 1 >= self.columns[self.focused_column].len() {
             return;
         }
@@ -411,7 +430,17 @@ impl Workspace {
     ///
     /// Cancels any active scroll animation so the manual scroll takes effect
     /// immediately. Special float values (NaN, Infinity) are treated as zero.
+    /// In Focus + Reel mode the delta is converted to reel slots.
     pub fn scroll_by(&mut self, delta: f64, viewport_width: i32) {
+        if let Some(reel) = self.focus_reel.as_mut() {
+            let slot_height = reel.geometry().slot_height.max(1) as f64;
+            reel.scroll_by(if delta.is_finite() {
+                delta / slot_height
+            } else {
+                0.0
+            });
+            return;
+        }
         // Cancel any in-flight animation so manual scroll is not overridden
         self.cancel_animation();
         // Treat NaN and Infinity as zero for safety
@@ -460,9 +489,13 @@ impl Workspace {
     // Animation Methods
     // ========================================================================
 
-    /// Check if a scroll animation is currently active.
+    /// Check if a scroll or reel animation is currently active.
     pub fn is_animating(&self) -> bool {
         self.active_animation.is_some()
+            || self
+                .focus_reel
+                .as_ref()
+                .is_some_and(|reel| reel.is_animating())
     }
 
     /// Get the current effective scroll offset.
@@ -509,23 +542,26 @@ impl Workspace {
         self.active_animation = Some(ScrollAnimation::new(start, target, duration, ease));
     }
 
-    /// Advance the active animation by the given delta time in milliseconds.
-    /// Returns true if an animation is still active, false if complete or no animation.
+    /// Advance the active scroll and/or reel animation by the given delta
+    /// time in milliseconds. Returns true if any animation is still active.
     pub fn tick_animation(&mut self, delta_ms: u64) -> bool {
-        let Some(anim) = &mut self.active_animation else {
-            return false;
-        };
-
-        let still_running = anim.tick(delta_ms);
-
-        if !still_running {
-            // Animation complete - finalize scroll offset and clear animation
-            self.scroll_offset = anim.target();
-            self.active_animation = None;
-            false
+        let scroll_running = if let Some(anim) = &mut self.active_animation {
+            if anim.tick(delta_ms) {
+                true
+            } else {
+                // Animation complete - finalize scroll offset and clear animation
+                self.scroll_offset = anim.target();
+                self.active_animation = None;
+                false
+            }
         } else {
-            true
-        }
+            false
+        };
+        let reel_running = self
+            .focus_reel
+            .as_mut()
+            .is_some_and(|reel| reel.tick(delta_ms));
+        scroll_running || reel_running
     }
 
     /// Stop the current animation and snap to the target position.

@@ -56,6 +56,42 @@ height_presets = [0.333, 0.5, 0.667]
 # - on_overflow: Center only when the column is wider than the viewport
 centering_mode = "{centering_mode}"
 
+# Layout model: "serval" (default) is the Focus + Reel layout — one large
+# focus window plus a slot-machine reel of scaled thumbnails on one side.
+# "scroll" restores the classic horizontal strip.
+mode = "serval"
+
+# Named Serval layout preset. "2560x1440" (default) enables the native
+# layout for a 2560x1440 screen (2048x1368 focus + four 512x342 slots);
+# "2560x1600" enables the 2560x1600 variant (2048x1528 focus + four
+# 512x382 slots). Both fill the work area and tile it with no padding.
+# Set "custom" to use the individual reel_* geometry fields below.
+resolution = "2560x1440"
+
+# Focus + Reel geometry, used when resolution = "custom". The defaults mirror
+# the native preset. The layout viewport is the monitor work area, so the
+# taskbar is already excluded. Ignored unless mode = "serval".
+reel_main_width = 2048
+# 0 = fill the work-area height (2048x1368 on the reference screen).
+reel_main_height = 0
+reel_slot_width = 512
+# Reference slot height; fill mode splits the span evenly (1368 / 4 = 342).
+reel_slot_height = 342
+# Padding between windows. 0 = tight tiling.
+reel_gap = 0
+# Top widget strip; 0 = windows start at the top edge.
+reel_top_inset = 0
+reel_bottom_inset = 0
+reel_visible_slots = 4
+
+# Initial side of the reel column: "right" or "left".
+reel_side = "right"
+
+# Toggle the reel between right and left on every promotion, producing an
+# explicit mirror-symmetric layout: a promoted right-column window grows into
+# the right-hand main position while the reel mirrors to the left (and back).
+reel_flip_side_on_promote = true
+
 [appearance]
 
 [behavior]
@@ -210,6 +246,8 @@ mod tests {
         assert!(config.starts_with("# LeopardWM Configuration\n"));
         assert!(config.contains("gap = 10"));
         assert!(config.contains("centering_mode = \"center\""));
+        assert!(config.contains("reel_gap = 0"));
+        assert!(config.contains("resolution = \"2560x1440\""));
         assert!(config.contains("\"Win+Ctrl+Escape\" = \"panic_revert\""));
     }
 

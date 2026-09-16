@@ -5,6 +5,7 @@
 //! Commands are sent to the daemon via IPC (named pipe).
 
 mod args;
+mod build_info;
 mod command_map;
 mod config_cmds;
 mod daemon_cmds;

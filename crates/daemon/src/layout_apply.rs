@@ -396,6 +396,9 @@ impl AppState {
         {
             return Ok(false);
         }
+        // A promotion tween represents the incoming focus window with its
+        // overlay thumbnail; keep the live HWND parked until the landing pass.
+        self.suppress_reel_transition_focus(&mut all_placements);
 
         // Interpolate layout transitions (structural changes like move/expel).
         if let Some(ref transition) = self.layout_transition {
@@ -452,6 +455,7 @@ impl AppState {
             }
         }
         self.update_tab_strip();
+        self.sync_reel_presentation();
         Ok(true)
     }
 
@@ -503,6 +507,9 @@ impl AppState {
         if self.paused {
             return Ok(());
         }
+        // Focus + Reel presentation follows the reel offset even when the
+        // physical placement fast path below returns early.
+        self.sync_reel_presentation();
         // During layout transitions, the animation worker drives positioning.
         if self.layout_transition.is_some() {
             return Ok(());
@@ -527,6 +534,9 @@ impl AppState {
         self.commit_pending_min_size_clears();
 
         let mut all_placements = self.collect_apply_placements();
+        // A promotion tween represents the incoming focus window with its
+        // overlay thumbnail; keep the live HWND parked until the landing pass.
+        self.suppress_reel_transition_focus(&mut all_placements);
         let logically_empty = all_placements.is_empty();
 
         // Interpolate layout transitions (structural changes like move/expel).
@@ -1189,6 +1199,8 @@ impl AppState {
         }
         // Reposition tab strip overlay (mirror border lifecycle).
         self.update_tab_strip();
+        // Reconcile reel thumbnails after every settled layout change.
+        self.sync_reel_presentation();
 
         // LayoutChanged broadcast with signature dedup. Animation
         // frames between two settled layouts produce identical

@@ -12,6 +12,7 @@
 //! - System tray icon and menu
 
 mod animation_worker;
+mod build_info;
 mod command_handler;
 mod config;
 #[cfg(test)]
@@ -28,6 +29,7 @@ mod notify;
 mod overview;
 mod persistence;
 mod physical_placement;
+mod reel;
 mod scratchpad;
 mod settings;
 mod startup;
@@ -67,7 +69,12 @@ use tracing::{debug, error, info, warn, Level};
 
 /// Command-line arguments for the daemon binary.
 #[derive(Parser, Debug, Clone)]
-#[command(name = "leopardwm", about = "LeopardWM tiling window manager daemon")]
+#[command(
+    name = "leopardwm",
+    version = crate::build_info::VERSION,
+    long_version = crate::build_info::VERSION_LONG,
+    about = "LeopardWM tiling window manager daemon"
+)]
 pub struct Args {
     /// Disable global hotkey registration
     #[arg(long)]
@@ -387,6 +394,9 @@ async fn reload_config_and_hotkeys(
         mouse_hook_handle,
         event_tx,
     );
+    // Install/uninstall the gesture + Serval input hook if the layout model or
+    // gestures.enabled changed.
+    sync_gesture_hook(&new_config, event_tx);
     // Refresh the rejected-hotkey warning in an open settings window so it
     // reflects the new registration instead of the snapshot taken at open.
     settings::push_failed_binds(&hotkey_state.failed_binds);
@@ -843,6 +853,7 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         eprintln!("[leopardwm] PANIC detected — emergency uncloaking all windows");
         leopardwm_platform_win32::restore_maximizebox_panic_recovery();
+        leopardwm_platform_win32::restore_squared_corners_panic_recovery();
         uncloak_all_visible_windows();
         match enumerate_windows() {
             Ok(windows) => {
@@ -1307,44 +1318,58 @@ fn sync_mouse_hook(
     }
 }
 
-/// Register gesture detection (if enabled).
-fn setup_gestures(
-    config: &Config,
-    event_tx: &mpsc::Sender<DaemonEvent>,
-    thread_handles: &mut Vec<std::thread::JoinHandle<()>>,
-) -> Option<leopardwm_platform_win32::GestureHandle> {
-    if config.gestures.enabled {
-        // Set scroll modifier before registering the hook
-        leopardwm_platform_win32::set_scroll_modifier(&config.hotkeys.scroll_modifier);
+/// Global gesture-hook slot so config reloads can install/uninstall the hook
+/// without a restart. Dropping the handle signals the hook thread to exit and
+/// the forwarding thread to drain.
+static GESTURE_HANDLE: std::sync::Mutex<Option<leopardwm_platform_win32::GestureHandle>> =
+    std::sync::Mutex::new(None);
 
-        match register_gestures() {
-            Ok((handle, gesture_receiver)) => {
-                info!("Gesture detection enabled");
-
-                // Spawn thread to forward gesture events
-                match spawn_forwarding_thread(
-                    "gesture-fwd",
-                    gesture_receiver,
-                    event_tx.clone(),
-                    DaemonEvent::Gesture,
-                ) {
-                    Ok(handle) => thread_handles.push(handle),
-                    Err(e) => warn!("{}", e),
+/// Bring the low-level mouse hook in line with the config.
+///
+/// The hook is also the transport for Serval input (raw wheel ticks and reel
+/// clicks), so it is wanted whenever touchpad gestures are enabled OR the
+/// Serval layout is selected. Install/remove happen in place, so switching
+/// `[layout] mode` at runtime takes effect without a restart.
+fn sync_gesture_hook(config: &Config, event_tx: &mpsc::Sender<DaemonEvent>) {
+    let wanted = config.gestures.enabled || config.layout.mode == config::LayoutModeConfig::Serval;
+    let mut guard = GESTURE_HANDLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match (wanted, guard.is_some()) {
+        (true, false) => {
+            // Set scroll modifier before registering the hook
+            leopardwm_platform_win32::set_scroll_modifier(&config.hotkeys.scroll_modifier);
+            match register_gestures() {
+                Ok((handle, gesture_receiver)) => {
+                    // Detached forwarder: it drains and exits when the hook
+                    // handle is dropped on uninstall.
+                    if let Err(e) = spawn_forwarding_thread(
+                        "gesture-fwd",
+                        gesture_receiver,
+                        event_tx.clone(),
+                        DaemonEvent::Gesture,
+                    ) {
+                        warn!("{}", e);
+                    }
+                    *guard = Some(handle);
+                    info!("Gesture / Serval mouse hook enabled");
                 }
-
-                Some(handle)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to register gestures: {}. Gesture support disabled.",
-                    e
-                );
-                None
+                Err(e) => {
+                    warn!(
+                        "Failed to register gestures: {}. Gesture support disabled.",
+                        e
+                    );
+                }
             }
         }
-    } else {
-        info!("Gesture detection disabled by config (gestures.enabled = false)");
-        None
+        (true, true) => {
+            leopardwm_platform_win32::set_scroll_modifier(&config.hotkeys.scroll_modifier);
+        }
+        (false, true) => {
+            *guard = None;
+            info!("Gesture / Serval mouse hook disabled by config");
+        }
+        (false, false) => {}
     }
 }
 
@@ -1409,7 +1434,7 @@ async fn print_banner(
         .display()
         .to_string();
     print_startup_banner(&StartupInfo {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: crate::build_info::VERSION_LONG.to_string(),
         monitor_names,
         monitor_dpi,
         window_count,
@@ -1904,6 +1929,44 @@ fn classify_gesture_command(cmd: &str) -> GestureCommand<'_> {
 
 /// Handle a touchpad/scroll gesture; returns true when the daemon should shut down.
 async fn handle_gesture_event(ctx: &mut EventLoopCtx<'_>, gesture_event: GestureEvent) -> bool {
+    // Focus + Reel raw input is not command-mapped: wheel ticks drive the
+    // continuous reel offset and clicks promote a slot to the main window.
+    match gesture_event {
+        GestureEvent::ReelWheel { delta, x, y } => {
+            let consumed = {
+                let mut state = ctx.state.lock().await;
+                state.handle_reel_wheel(delta, x, y)
+            };
+            if consumed {
+                let mut state = ctx.state.lock().await;
+                if state.is_animating() && !*ctx.animation_active {
+                    state.tick_animations(0);
+                    if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
+                        *ctx.animation_active = true;
+                        *ctx.last_frame_instant = Some(std::time::Instant::now());
+                    }
+                }
+            }
+            return false;
+        }
+        GestureEvent::ReelClick { x, y } => {
+            let promoted = {
+                let mut state = ctx.state.lock().await;
+                state.handle_reel_click(x, y)
+            };
+            if promoted {
+                let mut state = ctx.state.lock().await;
+                state.tick_animations(0);
+                if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
+                    *ctx.animation_active = true;
+                    *ctx.last_frame_instant = Some(std::time::Instant::now());
+                }
+            }
+            return false;
+        }
+        _ => {}
+    }
+
     // Map gesture to command from config
     let gesture_config = {
         let state = ctx.state.lock().await;
@@ -1917,6 +1980,8 @@ async fn handle_gesture_event(ctx: &mut EventLoopCtx<'_>, gesture_event: Gesture
         GestureEvent::SwipeDown => &gesture_config.swipe_down,
         GestureEvent::ScrollUp => &gesture_config.scroll_up,
         GestureEvent::ScrollDown => &gesture_config.scroll_down,
+        // Handled above.
+        GestureEvent::ReelWheel { .. } | GestureEvent::ReelClick { .. } => return false,
     };
 
     match classify_gesture_command(cmd_str) {
@@ -2566,6 +2631,13 @@ mod tab_action_tests {
     use leopardwm_platform_win32::{TabAction, Win32Error};
     use std::time::Instant;
 
+    /// Tab strips are a scroll-strip feature; Serval has its own tests in `reel.rs`.
+    fn scroll_config() -> Config {
+        let mut config = Config::default();
+        config.layout.mode = crate::config::LayoutModeConfig::Scroll;
+        config
+    }
+
     fn monitor(id: isize, primary: bool) -> MonitorInfo {
         MonitorInfo {
             id,
@@ -2579,7 +2651,7 @@ mod tab_action_tests {
 
     #[tokio::test]
     async fn tab_activation_drops_stale_captured_workspace() {
-        let mut app = AppState::new_with_config(Config::default(), vec![monitor(1, true)]);
+        let mut app = AppState::new_with_config(scroll_config(), vec![monitor(1, true)]);
         app.ensure_workspace_exists(1, 1);
         let state = Arc::new(Mutex::new(app));
 
@@ -2594,7 +2666,7 @@ mod tab_action_tests {
     #[tokio::test]
     async fn tab_activation_applies_valid_captured_monitor_and_column() {
         let mut app =
-            AppState::new_with_config(Config::default(), vec![monitor(1, true), monitor(2, false)]);
+            AppState::new_with_config(scroll_config(), vec![monitor(1, true), monitor(2, false)]);
         let workspace = app.workspaces.get_mut(&2).unwrap().first_mut().unwrap();
         workspace.insert_window(100, None).unwrap();
         workspace.insert_window_in_column(200, 0).unwrap();
@@ -2614,7 +2686,7 @@ mod tab_action_tests {
     #[tokio::test]
     async fn tab_activation_restore_failure_preserves_routing_state() {
         let mut app =
-            AppState::new_with_config(Config::default(), vec![monitor(1, true), monitor(2, false)]);
+            AppState::new_with_config(scroll_config(), vec![monitor(1, true), monitor(2, false)]);
         let workspace = app.workspaces.get_mut(&2).unwrap().first_mut().unwrap();
         workspace.insert_window(100, None).unwrap();
         workspace.insert_window_in_column(200, 0).unwrap();
@@ -2667,7 +2739,7 @@ mod tab_action_tests {
     #[tokio::test]
     async fn tab_activation_drops_invalid_captured_column() {
         let mut app =
-            AppState::new_with_config(Config::default(), vec![monitor(1, true), monitor(2, false)]);
+            AppState::new_with_config(scroll_config(), vec![monitor(1, true), monitor(2, false)]);
         let workspace = app.workspaces.get_mut(&2).unwrap().first_mut().unwrap();
         workspace.insert_window(100, None).unwrap();
         workspace.insert_window_in_column(200, 0).unwrap();
@@ -3210,7 +3282,7 @@ async fn main() -> Result<()> {
     install_panic_hook();
 
     info!("LeopardWM daemon starting...");
-    info!("Version: {}", env!("CARGO_PKG_VERSION"));
+    info!("Version: {}", crate::build_info::VERSION_LONG);
 
     // Register the toast AppUserModelID so notify::show_toast can surface
     // user-facing notices (e.g. "can't tile this elevated window"). Non-fatal.
@@ -3293,7 +3365,7 @@ async fn main() -> Result<()> {
     let mut mouse_hook_handle = setup_mouse_hook(&config, &event_tx, &mut thread_handles);
 
     // Register gesture detection (if enabled)
-    let _gesture_handle = setup_gestures(&config, &event_tx, &mut thread_handles);
+    sync_gesture_hook(&config, &event_tx);
 
     // Initialize overlay for snap hints and drag ghost preview.
     // Always created — snap_hints.enabled only gates resize-hint visibility,

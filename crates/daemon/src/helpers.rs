@@ -111,6 +111,28 @@ impl ScaledLayoutParams {
     }
 }
 
+/// Apply the configured layout model (scroll strip vs Focus + Reel) to a
+/// workspace. Enables the reel when configured, updates geometry on reload,
+/// and cleanly reverts to the column strip when the mode changes back.
+pub(crate) fn apply_layout_mode_to_workspace(
+    workspace: &mut Workspace,
+    layout: &config::LayoutConfig,
+) {
+    match layout.mode {
+        config::LayoutModeConfig::Serval => {
+            if workspace.is_focus_reel() {
+                workspace.set_reel_geometry(layout.reel_geometry());
+            } else {
+                workspace.enable_focus_reel(layout.reel_geometry());
+            }
+            workspace.reel_set_side(layout.reel_side.into());
+        }
+        config::LayoutModeConfig::Scroll => {
+            workspace.disable_focus_reel();
+        }
+    }
+}
+
 impl AppState {
     /// Look up window info for a given window handle.
     ///
@@ -202,6 +224,7 @@ impl AppState {
                 params.apply_to(workspace);
                 workspace.set_centering_mode(self.config.layout.centering_mode.into());
                 workspace.set_center_past_edges(self.config.layout.center_past_edges);
+                apply_layout_mode_to_workspace(workspace, &self.config.layout);
 
                 // Rescale column widths to preserve fractions under new gap values
                 workspace.rescale_column_widths(
@@ -614,6 +637,8 @@ impl AppState {
 
     /// Restore WS_MAXIMIZEBOX on a window when it leaves tiled management.
     pub(crate) fn restore_snap_for_window(&mut self, hwnd: u64) {
+        // Also undo Serval main-window decoration removal (no-op when untracked).
+        let _ = leopardwm_platform_win32::restore_squared_corners(hwnd);
         if !self.snap_disabled_hwnds.remove(&hwnd) {
             return;
         }
@@ -635,6 +660,9 @@ impl AppState {
             leopardwm_platform_win32::restore_maximizebox_all(&hwnds);
             info!("Restored WS_MAXIMIZEBOX for {} window(s)", hwnds.len());
         }
+        // Also undo Serval main-window decoration removal.
+        leopardwm_platform_win32::restore_squared_corners_all();
+        self.reel_last_squared_focus = None;
     }
 
     /// Apply snap layout suppression to all currently tiled (non-floating) windows.

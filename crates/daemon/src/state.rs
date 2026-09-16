@@ -610,6 +610,22 @@ pub(crate) struct AppState {
     /// them into the worker for crossfade). Each `GhostEntry::Drop` calls
     /// `thumbnail::unregister_raw`, so every removal path is leak-safe.
     pub(crate) ghost_handles: HashMap<u64, GhostEntry>,
+    /// Long-lived DWM thumbnails presenting Focus + Reel ring members.
+    /// Keyed by window; dropping a handle unregisters it. Unlike the ghost
+    /// path these persist across frames and are only revoked when the window
+    /// leaves the reel or is promoted to focus.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) reel_thumbnails: HashMap<u64, leopardwm_platform_win32::thumbnail::ThumbnailHandle>,
+    /// Active Serval promotion tween. While set, thumbnail destination rects
+    /// interpolate from the pre-promotion layout to the settled one.
+    pub(crate) reel_transition: Option<crate::reel::ReelTransition>,
+    /// Focus window whose windowed decorations (rounded corners + DWM outline)
+    /// were last removed. Cached so the DWM attribute calls only run when the
+    /// Serval main window changes.
+    pub(crate) reel_last_squared_focus: Option<u64>,
+    /// Most recent reel presentation plan (test-only observation hook).
+    #[cfg(test)]
+    pub(crate) last_reel_presentation: Option<crate::reel::ReelPresentationPlan>,
     /// Ghost sources kept cloaked after their thumbnail is revoked until a
     /// current synchronous physical landing proves their live HWND is safe.
     pub(crate) ghost_sources_pending_safe_landing: HashSet<u64>,
@@ -843,6 +859,7 @@ impl AppState {
             workspace.set_reduce_motion(initial_reduce_motion);
             workspace
                 .set_scroll_animation(config.animation.scroll_duration_ms, config.animation.easing);
+            crate::helpers::apply_layout_mode_to_workspace(&mut workspace, &config.layout);
 
             if monitor.is_primary {
                 focused_monitor = monitor.id;
@@ -958,6 +975,11 @@ impl AppState {
             high_contrast: leopardwm_platform_win32::is_high_contrast_enabled(),
             layout_transition: None,
             ghost_handles: HashMap::new(),
+            reel_thumbnails: HashMap::new(),
+            reel_transition: None,
+            reel_last_squared_focus: None,
+            #[cfg(test)]
+            last_reel_presentation: None,
             ghost_sources_pending_safe_landing: HashSet::new(),
             active_crossfade: None,
             crossfade_sources: std::collections::HashMap::new(),
@@ -1121,17 +1143,46 @@ impl AppState {
                     }
                 }
             }
+            // Serval: fold the reel focus/ring order and side so promotions
+            // and mirror flips emit a fresh LayoutChanged even though the
+            // column list itself is unchanged.
+            if let Some(reel) = ws.focus_reel() {
+                2u8.hash(&mut hasher);
+                reel.focus().hash(&mut hasher);
+                for window in reel.ring() {
+                    window.hash(&mut hasher);
+                }
+                (reel.side() == leopardwm_core_layout::ReelSide::Left).hash(&mut hasher);
+            }
         }
         hasher.finish()
     }
 
     /// Build the column summary list for a `LayoutChanged` event payload.
+    ///
+    /// Serval (Focus + Reel) workspaces report a single synthesized column in
+    /// display order `[focus, ring...]` so status bars still see the full
+    /// window order; scroll workspaces report their real columns.
     pub(crate) fn focused_layout_columns(&self) -> Vec<leopardwm_ipc::ColumnSummary> {
         let ws_idx = self.active_workspace_idx(self.focused_monitor);
         self.workspaces
             .get(&self.focused_monitor)
             .and_then(|list| list.get(ws_idx))
             .map(|ws| {
+                if let Some(reel) = ws.focus_reel() {
+                    let mut window_ids: Vec<u64> = Vec::new();
+                    if let Some(focus) = reel.focus() {
+                        window_ids.push(focus);
+                    }
+                    window_ids.extend(reel.ring());
+                    let viewport = self.layout_viewport(self.focused_monitor);
+                    return vec![leopardwm_ipc::ColumnSummary {
+                        width_px: reel.geometry().focus_width(viewport),
+                        height_weights: vec![1.0; window_ids.len()],
+                        window_ids,
+                        mode: leopardwm_ipc::ColumnSummaryMode::Vertical,
+                    }];
+                }
                 ws.columns()
                     .iter()
                     .map(|col| leopardwm_ipc::ColumnSummary {
@@ -1335,6 +1386,7 @@ impl AppState {
             ws.set_center_past_edges(config.layout.center_past_edges);
             ws.set_reduce_motion(self.reduce_motion);
             ws.set_scroll_animation(config.animation.scroll_duration_ms, config.animation.easing);
+            crate::helpers::apply_layout_mode_to_workspace(&mut ws, &config.layout);
             ws_vec.push(ws);
         }
         ws_vec.get_mut(idx)

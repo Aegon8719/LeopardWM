@@ -33,6 +33,8 @@ impl Workspace {
             self.focused_column = insert_pos;
         }
         self.focused_window_in_column = 0;
+        self.reel_note_added(window_id);
+        self.reel_sync_focus_from_columns();
 
         debug_assert!(
             self.focused_column < self.columns.len(),
@@ -66,6 +68,8 @@ impl Workspace {
         let clamped = index.min(self.columns.len().saturating_sub(1));
         self.focused_column = clamped;
         self.focused_window_in_column = 0;
+        self.reel_note_added(window_id);
+        self.reel_sync_focus_from_columns();
         Ok(())
     }
 
@@ -92,6 +96,9 @@ impl Workspace {
         if !was_empty {
             self.focused_column = saved_col;
             self.focused_window_in_column = saved_win;
+            // insert_window_at_column temporarily promoted the appended window
+            // in the reel; restore the reel focus to the saved window.
+            self.reel_sync_focus_from_columns();
         }
         Ok(())
     }
@@ -118,6 +125,7 @@ impl Workspace {
         // insert_column_at shifts focused_column right when inserting at or
         // before it, so the prior focus is preserved without an override.
         self.insert_column_at(Column::new(window_id, column_width), index);
+        self.reel_note_added(window_id);
         Ok(())
     }
 
@@ -148,6 +156,7 @@ impl Workspace {
             self.focused_column = saved_col;
             self.focused_window_in_column = saved_win;
         }
+        self.reel_note_added(window_id);
 
         Ok(())
     }
@@ -183,6 +192,7 @@ impl Workspace {
         }
 
         self.columns[column_index].add_window(window_id);
+        self.reel_note_added(window_id);
         Ok(())
     }
 
@@ -215,6 +225,7 @@ impl Workspace {
 
         let clamped = window_index.min(self.columns[column_index].len());
         self.columns[column_index].insert_at(clamped, window_id);
+        self.reel_note_added(window_id);
         Ok(())
     }
 
@@ -309,6 +320,7 @@ impl Workspace {
                     "Invariant violation: focused_window_in_column out of bounds after remove"
                 );
 
+                self.reel_note_removed(window_id);
                 return Ok(());
             }
         }
@@ -319,6 +331,10 @@ impl Workspace {
     /// windows are minimized. Within the target column, adjusts the
     /// focused window index to a non-minimized window.
     pub fn focus_left(&mut self) {
+        if self.focus_reel.is_some() {
+            self.reel_focus_prev();
+            return;
+        }
         let start = self.focused_column;
         while self.focused_column > 0 {
             self.focused_column -= 1;
@@ -353,6 +369,10 @@ impl Workspace {
     /// windows are minimized. Within the target column, adjusts the
     /// focused window index to a non-minimized window.
     pub fn focus_right(&mut self) {
+        if self.focus_reel.is_some() {
+            self.reel_focus_next();
+            return;
+        }
         let start = self.focused_column;
         while self.focused_column + 1 < self.columns.len() {
             self.focused_column += 1;
@@ -430,6 +450,10 @@ impl Workspace {
     /// minimized windows. In a Tabbed column, cycles to the previous tab
     /// (wrapping at the start) so a single keypress walks the tab list.
     pub fn focus_up(&mut self) {
+        if self.focus_reel.is_some() {
+            self.reel_focus_prev();
+            return;
+        }
         let Some(column) = self.columns.get(self.focused_column) else {
             return;
         };
@@ -461,6 +485,10 @@ impl Workspace {
     /// minimized windows. In a Tabbed column, cycles to the next tab
     /// (wrapping at the end) so a single keypress walks the tab list.
     pub fn focus_down(&mut self) {
+        if self.focus_reel.is_some() {
+            self.reel_focus_next();
+            return;
+        }
         let Some(column) = self.columns.get(self.focused_column) else {
             return;
         };
@@ -494,6 +522,10 @@ impl Workspace {
     /// When at the last window of the last column, wraps to the first window
     /// of the first column.
     pub fn focus_next(&mut self) {
+        if self.focus_reel.is_some() {
+            self.reel_focus_next();
+            return;
+        }
         if self.columns.is_empty() {
             return;
         }
@@ -540,6 +572,10 @@ impl Workspace {
     /// column. When at the first window of the first column, wraps to the
     /// last window of the last column.
     pub fn focus_prev(&mut self) {
+        if self.focus_reel.is_some() {
+            self.reel_focus_prev();
+            return;
+        }
         if self.columns.is_empty() {
             return;
         }
@@ -750,16 +786,21 @@ impl Workspace {
 
     /// Get the currently focused window ID.
     pub fn focused_window(&self) -> Option<WindowId> {
-        self.columns
-            .get(self.focused_column)
-            .and_then(|col| col.windows.get(self.focused_window_in_column))
-            .copied()
+        if let Some(reel) = &self.focus_reel {
+            return reel.focus();
+        }
+        self.column_focused_window()
     }
 
     /// Get the focused window ID, but only if it is not minimized.
     /// Falls back to the nearest non-minimized window in the focused column.
     /// Returns `None` if the workspace is empty or every window is minimized.
     pub fn focused_visible_window(&self) -> Option<WindowId> {
+        if let Some(reel) = &self.focus_reel {
+            return reel
+                .focus()
+                .filter(|window_id| !self.minimized_windows.contains(window_id));
+        }
         let col = self.columns.get(self.focused_column)?;
         let cur = self.focused_window_in_column;
 
@@ -855,6 +896,13 @@ impl Workspace {
     ///
     /// Returns `LayoutError::WindowNotFound` if the window is not in the workspace.
     pub fn focus_window(&mut self, window_id: WindowId) -> Result<(), LayoutError> {
+        if self.focus_reel.is_some() {
+            // Reel members go through the cyclic permutation so ring order
+            // stays coherent; unknown windows fall through to column lookup.
+            if self.reel_focus_window(window_id) {
+                return Ok(());
+            }
+        }
         for (col_idx, column) in self.columns.iter().enumerate() {
             if let Some(win_idx) = column.windows.iter().position(|&w| w == window_id) {
                 self.focused_column = col_idx;

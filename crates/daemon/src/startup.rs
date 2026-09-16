@@ -114,7 +114,7 @@ pub(crate) fn format_crash_report(info: &std::panic::PanicHookInfo<'_>) -> Strin
         .map(|d| d.as_secs())
         .unwrap_or(0);
     writeln!(report, "Timestamp (unix): {}", timestamp).unwrap();
-    writeln!(report, "Version: {}", env!("CARGO_PKG_VERSION")).unwrap();
+    writeln!(report, "Version: {}", crate::build_info::VERSION_LONG).unwrap();
     writeln!(report).unwrap();
 
     // Panic message

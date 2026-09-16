@@ -607,8 +607,11 @@ mod tests {
     use leopardwm_platform_win32::MonitorInfo;
 
     fn test_state() -> AppState {
+        let mut config = Config::default();
+        // Overview maps the scroll strip; Serval has its own reel presentation.
+        config.layout.mode = crate::config::LayoutModeConfig::Scroll;
         AppState::new_with_config(
-            Config::default(),
+            config,
             vec![MonitorInfo {
                 id: 1,
                 rect: Rect::new(0, 0, 1920, 1080),

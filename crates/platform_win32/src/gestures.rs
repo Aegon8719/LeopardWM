@@ -5,8 +5,9 @@ use std::sync::mpsc;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostThreadMessageW,
-    SetWindowsHookExW, UnhookWindowsHookEx, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, WH_MOUSE_LL,
+    CallNextHookEx, DispatchMessageW, GetAncestor, GetClassNameW, GetMessageW, PeekMessageW,
+    PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, MSG,
+    MSLLHOOKSTRUCT, PM_NOREMOVE, WH_MOUSE_LL,
 };
 
 /// Gesture events detected from touchpad/pointer input.
@@ -24,11 +25,36 @@ pub enum GestureEvent {
     ScrollUp,
     /// Modifier + mouse wheel scroll down
     ScrollDown,
+    /// Raw vertical wheel tick forwarded for Focus + Reel scrolling.
+    ///
+    /// Only emitted while [`set_reel_input_enabled`] is `true`. The event is
+    /// observational — the wheel message is NOT consumed, so windows under
+    /// the cursor still receive normal scrolling.
+    ReelWheel {
+        /// Wheel delta in WHEEL_DELTA units (positive = scroll up).
+        delta: i32,
+        /// Cursor X in screen coordinates.
+        x: i32,
+        /// Cursor Y in screen coordinates.
+        y: i32,
+    },
+    /// Left button press observed while Focus + Reel input is enabled and the
+    /// press landed inside the registered reel region.
+    ///
+    /// The click IS consumed by the hook so the desktop/window beneath the
+    /// click-through thumbnail host never sees it.
+    ReelClick {
+        /// Cursor X in screen coordinates.
+        x: i32,
+        /// Cursor Y in screen coordinates.
+        y: i32,
+    },
 }
 
 /// Wheel message constants (not all exposed by windows-rs).
 const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_MOUSEHWHEEL: u32 = 0x020E;
+const WM_LBUTTONDOWN: u32 = 0x0201;
 const LLMHF_INJECTED: u32 = 0x01;
 
 /// Threshold for accumulated wheel delta before firing a swipe gesture.
@@ -275,6 +301,77 @@ struct GestureAccumState {
 /// Bit 0 = Ctrl, Bit 1 = Alt, Bit 2 = Shift, Bit 3 = Win.
 static SCROLL_MODIFIER_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0x03); // default: Ctrl + Alt
 
+/// Whether raw Focus + Reel input (wheel ticks and clicks inside the reel
+/// region) should be forwarded to the daemon.
+static REEL_INPUT_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Screen-space reel region for the focused monitor. Clicks inside it are
+/// consumed and forwarded as [`GestureEvent::ReelClick`]. `None` disables
+/// click interception. Stored as `(x, y, width, height)`.
+static REEL_REGION: std::sync::Mutex<Option<(i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
+
+/// Enable or disable raw Focus + Reel input forwarding.
+pub fn set_reel_input_enabled(enabled: bool) {
+    REEL_INPUT_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    if !enabled {
+        let mut region = REEL_REGION.lock().unwrap_or_else(recover_poisoned_mutex);
+        *region = None;
+    }
+}
+
+/// Update the screen-space reel region used for click interception.
+/// Coordinates are physical pixels; pass `None` to clear.
+pub fn set_reel_region(region: Option<(i32, i32, i32, i32)>) {
+    let mut guard = REEL_REGION.lock().unwrap_or_else(recover_poisoned_mutex);
+    *guard = region;
+}
+
+/// Whether reel input forwarding is currently enabled.
+pub fn reel_input_enabled() -> bool {
+    REEL_INPUT_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn point_in_reel_region(x: i32, y: i32) -> bool {
+    let guard = REEL_REGION.lock().unwrap_or_else(recover_poisoned_mutex);
+    guard.is_some_and(|(rx, ry, rw, rh)| x >= rx && x < rx + rw && y >= ry && y < ry + rh)
+}
+
+/// Whether a root-window class means "the desktop background" rather than a
+/// real interactive window.
+fn is_desktop_root_class(class: Option<&str>) -> bool {
+    match class {
+        // No window at the point (or unreadable class): treat as empty desktop.
+        None => true,
+        Some("Progman") | Some("WorkerW") => true,
+        Some(_) => false,
+    }
+}
+
+/// True when the screen point lands on the desktop background rather than on
+/// a real window.
+///
+/// The reel column sits over empty desktop (thumbnails live on the
+/// click-through DWM host, which `WindowFromPoint` skips). Shell flyouts —
+/// notification toasts, focus assist, the taskbar overflow — and any floating
+/// or foreign window that overlaps the column must keep their own input, so
+/// reel click/wheel interception is only armed when this returns true.
+fn point_over_empty_desktop(point: windows::Win32::Foundation::POINT) -> bool {
+    let hwnd = unsafe { WindowFromPoint(point) };
+    if hwnd.is_invalid() {
+        return true;
+    }
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    let root = if root.is_invalid() { hwnd } else { root };
+    let mut buffer = [0u16; 64];
+    let len = unsafe { GetClassNameW(root, &mut buffer) };
+    if len <= 0 {
+        return true;
+    }
+    let class = String::from_utf16_lossy(&buffer[..len as usize]);
+    is_desktop_root_class(Some(&class))
+}
+
 /// Global sender for gesture events.
 static GESTURE_SENDER: std::sync::Mutex<Option<mpsc::Sender<GestureEvent>>> =
     std::sync::Mutex::new(None);
@@ -486,6 +583,44 @@ unsafe extern "system" fn gesture_mouse_hook_proc(
 ) -> windows::Win32::Foundation::LRESULT {
     if ncode >= 0 {
         let msg = wparam.0 as u32;
+
+        // Focus + Reel input runs ahead of gesture classification. Wheel
+        // ticks are forwarded raw (and left unconsumed so the app under the
+        // cursor still scrolls); clicks inside the registered reel region are
+        // consumed and forwarded for hit-testing. Both are only armed over
+        // empty desktop, so shell flyouts and floating windows in the column
+        // keep their own input.
+        if reel_input_enabled() {
+            match msg {
+                WM_MOUSEWHEEL => {
+                    let mouse_struct = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+                    if !point_over_empty_desktop(mouse_struct.pt) {
+                        return CallNextHookEx(None, ncode, wparam, lparam);
+                    }
+                    let delta = (mouse_struct.mouseData >> 16) as i16 as i32;
+                    send_gesture_event(GestureEvent::ReelWheel {
+                        delta,
+                        x: mouse_struct.pt.x,
+                        y: mouse_struct.pt.y,
+                    });
+                    return CallNextHookEx(None, ncode, wparam, lparam);
+                }
+                WM_LBUTTONDOWN => {
+                    let mouse_struct = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+                    if point_in_reel_region(mouse_struct.pt.x, mouse_struct.pt.y)
+                        && point_over_empty_desktop(mouse_struct.pt)
+                    {
+                        send_gesture_event(GestureEvent::ReelClick {
+                            x: mouse_struct.pt.x,
+                            y: mouse_struct.pt.y,
+                        });
+                        return windows::Win32::Foundation::LRESULT(1);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let axis = match msg {
             WM_MOUSEHWHEEL => Some(WheelAxis::Horizontal),
             WM_MOUSEWHEEL => Some(WheelAxis::Vertical),
@@ -570,6 +705,17 @@ unsafe extern "system" fn gesture_mouse_hook_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reel_capture_only_arms_over_empty_desktop() {
+        assert!(is_desktop_root_class(None));
+        assert!(is_desktop_root_class(Some("Progman")));
+        assert!(is_desktop_root_class(Some("WorkerW")));
+        // Shell flyouts / notifications / foreign windows keep their input.
+        assert!(!is_desktop_root_class(Some("Shell_TrayWnd")));
+        assert!(!is_desktop_root_class(Some("Windows.UI.Core.CoreWindow")));
+        assert!(!is_desktop_root_class(Some("Chrome_WidgetWin_1")));
+    }
 
     fn input(
         now_ms: u128,

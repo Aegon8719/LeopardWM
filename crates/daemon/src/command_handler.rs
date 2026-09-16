@@ -707,7 +707,8 @@ impl AppState {
             .map(|ws| ws.window_count() + ws.floating_count())
             .sum();
         IpcResponse::StatusInfo {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::build_info::VERSION.to_string(),
+            build_timestamp: crate::build_info::BUILD_TIMESTAMP.to_string(),
             monitors: self.monitors.len(),
             total_windows,
             uptime_seconds: uptime,
@@ -1736,8 +1737,11 @@ mod set_active_tab_tests {
     use std::time::{Duration, Instant};
 
     fn tabbed_state() -> AppState {
+        let mut config = Config::default();
+        // Tab-strip behavior is a scroll-strip feature; Serval has its own tests.
+        config.layout.mode = crate::config::LayoutModeConfig::Scroll;
         let mut state = AppState::new_with_config(
-            Config::default(),
+            config,
             vec![MonitorInfo {
                 id: 1,
                 rect: Rect::new(0, 0, 1920, 1080),

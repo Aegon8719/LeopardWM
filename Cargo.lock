@@ -1105,6 +1105,7 @@ dependencies = [
  "toml 1.1.5+spec-1.1.0",
  "windows 0.62.2",
  "winreg",
+ "winresource",
 ]
 
 [[package]]
@@ -1178,6 +1179,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "windows 0.62.2",
+ "winresource",
 ]
 
 [[package]]

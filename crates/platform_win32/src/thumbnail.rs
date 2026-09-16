@@ -21,7 +21,7 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
     DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY,
-    DWM_TNP_RECTDESTINATION, DWM_TNP_VISIBLE,
+    DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE, DWM_TNP_VISIBLE,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
@@ -242,6 +242,96 @@ pub fn update(
     if let Err(e) = result {
         return Err(Win32Error::SetPositionFailed(format!(
             "DwmUpdateThumbnailProperties: {}",
+            e
+        )));
+    }
+    Ok(())
+}
+
+/// Update a registered thumbnail using a SCREEN-space destination rect.
+///
+/// Convenience wrapper over [`update`] that converts through the host's
+/// virtual-screen origin. Used by the Focus + Reel presentation layer, where
+/// slot rects are computed in screen coordinates and change every frame.
+pub fn update_screen_rect(
+    handle: isize,
+    screen_rect: Rect,
+    opacity: u8,
+    visible: bool,
+) -> Result<(), Win32Error> {
+    let origin = host().origin();
+    update(
+        handle,
+        screen_to_host_client(screen_rect, origin),
+        opacity,
+        visible,
+    )
+}
+
+/// Update a registered thumbnail using a screen-space destination rect that
+/// is clipped to `clip` (also screen-space), preserving the scale of the full
+/// destination by adjusting `rcSource` proportionally.
+///
+/// Used by the Focus + Reel presentation so a partially scrolled slot slides
+/// under the widget strip / taskbar strip instead of stretching or popping.
+pub fn update_screen_rect_clipped(
+    handle: isize,
+    dest_screen: Rect,
+    clip_screen: Rect,
+) -> Result<(), Win32Error> {
+    if handle == 0 {
+        return Err(Win32Error::SetPositionFailed(
+            "thumbnail::update_screen_rect_clipped called with null handle".into(),
+        ));
+    }
+    let x0 = dest_screen.x.max(clip_screen.x);
+    let y0 = dest_screen.y.max(clip_screen.y);
+    let x1 = (dest_screen.x + dest_screen.width).min(clip_screen.x + clip_screen.width);
+    let y1 = (dest_screen.y + dest_screen.height).min(clip_screen.y + clip_screen.height);
+    if x1 <= x0 || y1 <= y0 {
+        return update_screen_rect(handle, dest_screen, 255, false);
+    }
+
+    let dest_w = dest_screen.width.max(1) as f64;
+    let dest_h = dest_screen.height.max(1) as f64;
+    let fx0 = ((x0 - dest_screen.x) as f64 / dest_w).clamp(0.0, 1.0);
+    let fx1 = ((x1 - dest_screen.x) as f64 / dest_w).clamp(0.0, 1.0);
+    let fy0 = ((y0 - dest_screen.y) as f64 / dest_h).clamp(0.0, 1.0);
+    let fy1 = ((y1 - dest_screen.y) as f64 / dest_h).clamp(0.0, 1.0);
+
+    let (src_w, src_h) = source_size(handle).unwrap_or((0, 0));
+    let origin = host().origin();
+    let dest = screen_to_host_client(Rect::new(x0, y0, x1 - x0, y1 - y0), origin);
+
+    let mut flags = DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE;
+    let rc_source = if src_w > 0 && src_h > 0 {
+        flags |= DWM_TNP_RECTSOURCE;
+        RECT {
+            left: (src_w as f64 * fx0).round() as i32,
+            top: (src_h as f64 * fy0).round() as i32,
+            right: (src_w as f64 * fx1).round() as i32,
+            bottom: (src_h as f64 * fy1).round() as i32,
+        }
+    } else {
+        RECT::default()
+    };
+
+    let props = DWM_THUMBNAIL_PROPERTIES {
+        dwFlags: flags,
+        rcDestination: RECT {
+            left: dest.x,
+            top: dest.y,
+            right: dest.x + dest.width,
+            bottom: dest.y + dest.height,
+        },
+        rcSource: rc_source,
+        opacity: 255,
+        fVisible: BOOL::from(true),
+        fSourceClientAreaOnly: BOOL::from(false),
+    };
+    if let Err(e) = unsafe { DwmUpdateThumbnailProperties(handle, &props) } {
+        return Err(Win32Error::SetPositionFailed(format!(
+            "DwmUpdateThumbnailProperties(clipped): {}",
             e
         )));
     }

@@ -1,6 +1,7 @@
 pub mod focus;
 pub mod layout;
 pub mod operations;
+pub mod reel;
 pub mod sizing;
 pub mod state;
 
@@ -144,6 +145,12 @@ pub struct Workspace {
     /// off-screen above the work area.
     #[serde(skip)]
     pub(crate) tab_strip_reserve_px: i32,
+    /// Focus + Reel state. `Some` switches this workspace from the horizontal
+    /// column strip to the main-window + slot-machine reel model. The columns
+    /// stay authoritative for window *membership*; the reel owns geometry,
+    /// focus and the continuous `reel_offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) focus_reel: Option<crate::focus_reel::FocusReelState>,
 }
 
 /// State saved when a column is maximized to fill the viewport width.
@@ -183,6 +190,7 @@ impl Default for Workspace {
             center_past_edges: false,
             maximized_column: None,
             tab_strip_reserve_px: 0,
+            focus_reel: None,
         }
     }
 }
@@ -459,12 +467,18 @@ impl Workspace {
     /// Set whether to skip scroll animations (snap instantly).
     pub fn set_reduce_motion(&mut self, reduce: bool) {
         self.reduce_motion = reduce;
+        if let Some(reel) = self.focus_reel.as_mut() {
+            reel.set_reduce_motion(reduce);
+        }
     }
 
     /// Set scroll animation duration and easing (from `[animation]` config).
     pub fn set_scroll_animation(&mut self, duration_ms: u64, easing: Easing) {
         self.scroll_duration_ms = duration_ms;
         self.scroll_easing = easing;
+        if let Some(reel) = self.focus_reel.as_mut() {
+            reel.set_animation(duration_ms, easing);
+        }
     }
 
     /// Set whether center-column can scroll past content edges.

@@ -94,7 +94,8 @@ pub use window_query::{
 };
 pub use window_style::{
     remove_maximizebox, reset_window_border_color, restore_maximizebox, restore_maximizebox_all,
-    restore_maximizebox_panic_recovery, set_window_border_color,
+    restore_maximizebox_panic_recovery, restore_squared_corners, restore_squared_corners_all,
+    restore_squared_corners_panic_recovery, set_window_border_color, square_window_corners,
 };
 
 use leopardwm_core_layout::WindowId;

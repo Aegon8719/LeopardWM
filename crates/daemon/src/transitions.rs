@@ -17,6 +17,7 @@ impl AppState {
     /// Check if any workspace has an active animation or layout transition.
     pub(crate) fn is_animating(&self) -> bool {
         self.layout_transition.is_some()
+            || self.reel_transition.is_some()
             || self
                 .workspaces
                 .values()
@@ -63,6 +64,15 @@ impl AppState {
             still_animating = true;
         } else if self.layout_transition.is_some() {
             still_animating = true;
+        }
+        // Serval promotion tween: thumbnail-only animation; when it completes
+        // the overlay handles are released on the next presentation sync.
+        if let Some(transition) = self.reel_transition.as_mut() {
+            if transition.tick(delta_ms) {
+                still_animating = true;
+            } else {
+                self.reel_transition = None;
+            }
         }
         still_animating
     }

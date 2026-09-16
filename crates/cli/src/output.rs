@@ -116,12 +116,16 @@ pub(crate) fn print_response(response: &IpcResponse) {
         }
         IpcResponse::StatusInfo {
             version,
+            build_timestamp,
             monitors,
             total_windows,
             uptime_seconds,
         } => {
             println!("LeopardWM Daemon Status:");
             println!("  Version: {}", version);
+            if !build_timestamp.is_empty() {
+                println!("  Built: {}", build_timestamp);
+            }
             println!("  Monitors: {}", monitors);
             println!("  Total windows: {}", total_windows);
             let hours = uptime_seconds / 3600;

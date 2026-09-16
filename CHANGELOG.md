@@ -2,6 +2,100 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## Unreleased
+
+### Features
+
+- **Serval (Focus + Reel) layout is the default** — one 2048-wide focus
+  window filling the work-area height (2048×1368 on the reference 2560×1368
+  screen) plus a vertical slot-machine reel of scaled thumbnails: four
+  512-wide slots splitting the height evenly (512×342 each), so the layout
+  tiles the screen with no padding. The reel scrolls continuously
+  (`reel_offset`), then snaps to the nearest slot; promoting a slot is a
+  cyclic permutation `[F, R0, R1, R2, R3] -> [R2, R3, F, R0, R1]` rather
+  than a tile-tree rebuild. Reel items are presented with long-lived DWM
+  thumbnails, so the live window keeps its full-size client area and never
+  sees a `WM_SIZE` when it enters or leaves the reel. `reel_side` selects
+  the initial side; `reel_flip_side_on_promote` (default on) flips it on
+  every promotion, so a promoted right-column item grows into the right-hand
+  main position while the reel mirrors to the left (and back on the next
+  promotion). Set `[layout] mode = "scroll"` to go back to the classic strip.
+- **Serval promotions animate through the thumbnail layer.** Clicking a reel
+  slot tweens every thumbnail from its previous rect to its new one — the
+  promoted item scales up into the main rect, the demoted main window scales
+  back into the reel — using the same DWM thumbnail host as the ghost
+  animation, so no per-frame `SetWindowPos` is issued. Reduced motion skips
+  the tween.
+- **Reel reorder hotkeys.** `move_window_up`/`move_window_down`/`move_window_left`/`move_window_right`
+  rotate the reel ring in Serval mode instead of moving columns.
+
+### Improvements
+
+- **The focused-window border is off by default.** The blue `4285F4` outline
+  no longer appears on the active window unless `appearance.active_border = true`
+  is set explicitly (or toggled from the tray). The border machinery and color
+  settings are unchanged for users who want it.
+- **`[layout] resolution` selects the Serval preset.** `2560x1440` (default)
+  enables the native layout for that screen (2048×1368 focus + four 512×342
+  slots); `2560x1600` enables the taller variant (2048×1528 focus + four
+  512×382 slots). Both fill the work-area height and tile it with no
+  padding. `custom` falls back to the individual `reel_*` geometry fields.
+- **Serval tiles the work area with no padding.** `reel_top_inset = 0`,
+  `reel_bottom_inset = 0`, `reel_gap = 0`, and `reel_main_height = 0` (fill)
+  produce a 2048×1368 focus window plus four 512×342 reel slots on the
+  reference 2560×1368 work area. The focus fills the height and the four
+  slots split it evenly, so taller or shorter work areas still tile tightly.
+- **Reel scrolling is animated.** Each wheel tick now eases the reel offset
+  from its current position toward the accumulated target using the
+  configured scroll duration/easing (rapid ticks retarget mid-flight), then
+  snaps to the nearest slot after the wheel stops — no more one-slot jumps.
+- **A reel with `reel_visible_slots` (4) or fewer small windows no longer
+  scrolls.** Wheel ticks over it are ignored and the offset stays at the top;
+  closing windows down to the visible count resets any offset to 0. Scrolling
+  resumes once there are more items than visible slots.
+- **`reel_gap` is configurable.** Defaults to `0` (tight tiling); a positive
+  value adds padding between the focus window and the reel (split evenly)
+  and between slots (each slot gives up the gap from its content height).
+- **The Serval main window no longer looks windowed.** The focused window
+  gets square corners (`DWMWCP_DONOTROUND`) and no 1px DWM outline
+  (`DWMWA_COLOR_NONE`) so it sits flush against the work-area edges. The
+  windowed decoration is restored when the window leaves management, tiling
+  is paused, the layout mode changes, or the daemon exits.
+- **Builds carry a UTC timestamp.** `leopardwm`, `leopardwm-cli`/`lwm`, and
+  `leopardwm-watchdog` embed the build time in `--version` (long form), the
+  startup banner, `lwm status`, and the Windows file properties
+  (FileVersion `x.y.z.<days-since-2020>`, Comments with the full ISO-8601
+  time). `tools/build_timestamped.ps1` builds into
+  `dist/LeopardWM-<version>-<stamp>/` with `<name>-<version>-<stamp>.exe`
+  filenames and a `checksums.txt`, so builds of the same version no longer
+  overwrite each other. Each folder also gets canonical-name hardlinks
+  (`lwm.exe`, `leopardwm.exe`, ...) so `lwm.exe run` resolves the daemon and
+  watchdog in place.
+
+### Fixes
+
+- **Reel wheel direction now matches standard scrolling.** Wheel down advances
+  the reel toward later items; wheel up returns toward the first item.
+- **Shell flyouts, notifications, and other UI over the reel column keep
+  their own input.** Reel click/wheel interception is now only armed when the
+  cursor is over the desktop background (`Progman`/`WorkerW`); focus assist,
+  toasts, the taskbar overflow, and floating or foreign windows in the column
+  receive clicks and wheel ticks normally instead of promoting a reel item.
+- **Promotion no longer jumps before the scale animation settles.** During a
+  Serval promotion the incoming focus window's live HWND stays parked and the
+  overlay thumbnail is its only representation; when the tween completes, the
+  landing pass moves the live window into place and drops the overlay in the
+  same frame.
+- **Clicking the blank part of a partially-filled reel column no longer
+  promotes a reel item.** Hit-testing now requires the point to land on a
+  rendered slot rect, and the gesture hook's click region shrinks to those
+  slots, so with a single small window the empty area below it passes clicks
+  through instead of wrapping around the ring.
+
+### Documentation
+
+- **Generated config documents the Serval settings** under `[layout]`.
+
 ## 0.2.9
 
 ### Features

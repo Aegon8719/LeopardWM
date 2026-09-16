@@ -30,7 +30,12 @@ pub(crate) fn parse_set_width_fraction(raw: &str) -> std::result::Result<f64, St
 
 #[derive(Parser)]
 #[command(name = "leopardwm-cli")]
-#[command(author, version, about = "Control the LeopardWM window manager")]
+#[command(
+    author,
+    version = crate::build_info::VERSION,
+    long_version = crate::build_info::VERSION_LONG,
+    about = "Control the LeopardWM window manager"
+)]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Commands,

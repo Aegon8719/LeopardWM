@@ -667,6 +667,10 @@ pub enum IpcResponse {
     StatusInfo {
         /// Daemon version.
         version: String,
+        /// Daemon build timestamp (UTC ISO-8601). Empty from pre-timestamp
+        /// daemons; `#[serde(default)]` keeps older clients compatible.
+        #[serde(default)]
+        build_timestamp: String,
         /// Number of monitors.
         monitors: usize,
         /// Total managed windows across all workspaces.
@@ -943,6 +947,7 @@ mod tests {
             IpcResponse::FocusedWindowInfo { window: None },
             IpcResponse::StatusInfo {
                 version: "0.1.0".to_string(),
+                build_timestamp: "2026-01-02T03:04:05Z".to_string(),
                 monitors: 2,
                 total_windows: 5,
                 uptime_seconds: 3600,

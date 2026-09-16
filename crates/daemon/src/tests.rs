@@ -3,7 +3,23 @@ use leopardwm_core_layout::{Rect, Workspace};
 use std::sync::atomic::Ordering;
 
 fn test_config() -> Config {
-    Config::default()
+    let mut config = Config::default();
+    // Most tests in this module exercise the classic scroll-strip layout;
+    // Serval (Focus + Reel) has dedicated coverage in `reel.rs`.
+    config.layout.mode = crate::config::LayoutModeConfig::Scroll;
+    config
+}
+
+#[test]
+fn test_build_info_stamp_is_populated() {
+    assert!(!crate::build_info::VERSION.is_empty());
+    assert!(
+        crate::build_info::BUILD_TIMESTAMP.ends_with('Z'),
+        "build stamp must be UTC ISO-8601: {}",
+        crate::build_info::BUILD_TIMESTAMP
+    );
+    assert!(crate::build_info::VERSION_LONG.contains(crate::build_info::VERSION));
+    assert!(crate::build_info::VERSION_LONG.contains(crate::build_info::BUILD_TIMESTAMP));
 }
 
 fn test_monitors() -> Vec<MonitorInfo> {
@@ -6832,11 +6848,14 @@ fn test_cmd_query_status() {
     match resp {
         IpcResponse::StatusInfo {
             version,
+            build_timestamp,
             monitors,
             total_windows,
             uptime_seconds: _,
         } => {
             assert!(!version.is_empty());
+            assert_eq!(build_timestamp, crate::build_info::BUILD_TIMESTAMP);
+            assert!(build_timestamp.ends_with('Z'));
             assert_eq!(monitors, 1);
             assert_eq!(total_windows, 0);
         }

@@ -154,6 +154,61 @@ pub struct LayoutConfig {
     #[serde(default = "default_height_presets")]
     pub height_presets: Vec<f64>,
 
+    /// Layout model used by workspaces. `serval` (default) is the Focus + Reel
+    /// main-window + slot-machine layout; `scroll` restores the classic
+    /// horizontal strip (see `leopardwm_core_layout::focus_reel`).
+    #[serde(default)]
+    pub mode: LayoutModeConfig,
+
+    /// Named Serval layout preset. `2560x1440` (default) enables the native
+    /// 2560×1440 layout — 2048-wide focus filling the work-area height plus
+    /// four 512-wide slots split evenly (512×342 each), tight with no padding.
+    /// Set `custom` to use the individual `reel_*` geometry fields instead.
+    #[serde(default)]
+    pub resolution: ReelResolution,
+
+    /// Focus + Reel: preferred focus-window width (`0` = fill viewport).
+    #[serde(default = "default_reel_main_width")]
+    pub reel_main_width: i32,
+    /// Focus + Reel: preferred focus-window height. `0` (default) fills the
+    /// work-area height so the focus window tiles the column exactly.
+    #[serde(default = "default_reel_main_height")]
+    pub reel_main_height: i32,
+    /// Focus + Reel: reel slot width.
+    #[serde(default = "default_reel_slot_width")]
+    pub reel_slot_width: i32,
+    /// Focus + Reel: reel slot height reference. In fill mode
+    /// (`reel_main_height = 0`) the visible span is split evenly across the
+    /// slots (e.g. 1368 / 4 = 342), so this value is only a fallback.
+    #[serde(default = "default_reel_slot_height")]
+    pub reel_slot_height: i32,
+    /// Focus + Reel: padding between adjacent windows in pixels. Defaults to
+    /// `0` so the focus window and the reel slots keep their exact 16:9
+    /// reference sizes (2048×1152 / 512×288). A positive value introduces a
+    /// gap and shrinks the windows slightly.
+    #[serde(default = "default_reel_gap")]
+    pub reel_gap: i32,
+    /// Focus + Reel: pixels reserved at the top. `0` (default) tiles from the
+    /// very top of the work area.
+    #[serde(default = "default_reel_top_inset")]
+    pub reel_top_inset: i32,
+    /// Focus + Reel: pixels reserved at the bottom. The layout viewport is
+    /// already the monitor work area (taskbar excluded), so the default is 0
+    /// and a positive value would leave a visible gap above the taskbar.
+    #[serde(default = "default_reel_bottom_inset")]
+    pub reel_bottom_inset: i32,
+    /// Focus + Reel: number of visible reel slots.
+    #[serde(default = "default_reel_visible_slots")]
+    pub reel_visible_slots: usize,
+    /// Focus + Reel: toggle the reel side on every promotion so a promoted
+    /// item grows into the mirrored main position (right reel -> main on the
+    /// right + reel on the left, and back). Default `true`.
+    #[serde(default = "default_true")]
+    pub reel_flip_side_on_promote: bool,
+    /// Focus + Reel: initial side of the reel column.
+    #[serde(default)]
+    pub reel_side: ReelSideConfig,
+
     // Legacy fields kept for backward-compatible deserialization; not used.
     #[serde(default, skip_serializing)]
     #[allow(dead_code)]
@@ -181,6 +236,112 @@ fn default_height_presets() -> Vec<f64> {
     vec![0.333, 0.5, 0.667]
 }
 
+fn default_reel_main_width() -> i32 {
+    leopardwm_core_layout::focus_reel::DEFAULT_MAIN_WIDTH
+}
+
+fn default_reel_main_height() -> i32 {
+    0
+}
+
+fn default_reel_slot_width() -> i32 {
+    leopardwm_core_layout::focus_reel::DEFAULT_SLOT_WIDTH
+}
+
+fn default_reel_slot_height() -> i32 {
+    342
+}
+
+fn default_reel_gap() -> i32 {
+    0
+}
+
+fn default_reel_top_inset() -> i32 {
+    0
+}
+
+fn default_reel_bottom_inset() -> i32 {
+    0
+}
+
+fn default_reel_visible_slots() -> usize {
+    leopardwm_core_layout::focus_reel::DEFAULT_VISIBLE_SLOTS
+}
+
+/// Active layout model for workspaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutModeConfig {
+    /// Classic horizontal scrolling strip.
+    Scroll,
+    /// Serval (Focus + Reel): one large focus window plus a slot-machine reel.
+    /// The historical `focus_reel` key is accepted as an alias.
+    #[default]
+    #[serde(rename = "serval", alias = "focus_reel")]
+    Serval,
+}
+
+/// Initial side of the Focus + Reel reel column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReelSideConfig {
+    /// Reel on the left, focus window on the right.
+    Left,
+    /// Reel on the right, focus window on the left.
+    #[default]
+    Right,
+}
+
+impl From<ReelSideConfig> for leopardwm_core_layout::ReelSide {
+    fn from(config: ReelSideConfig) -> Self {
+        match config {
+            ReelSideConfig::Left => leopardwm_core_layout::ReelSide::Left,
+            ReelSideConfig::Right => leopardwm_core_layout::ReelSide::Right,
+        }
+    }
+}
+
+/// Named Serval layout preset.
+///
+/// `2560x1440` (default) enables the native layout for a 2560×1440 display /
+/// 2560×1368 work area: a 2048-wide focus window filling the work-area height
+/// plus four 512-wide reel slots splitting that height evenly (512×342 each),
+/// tiling the screen with no padding. `custom` uses the individual `reel_*`
+/// geometry fields instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ReelResolution {
+    /// Native 2560×1440 layout (2048×1368 focus + four 512×342 slots, tight).
+    #[default]
+    #[serde(rename = "2560x1440", alias = "2560*1440", alias = "1440p")]
+    Res2560x1440,
+    /// Native 2560×1600 layout (2048×1528 focus + four 512×382 slots, tight).
+    #[serde(rename = "2560x1600", alias = "2560*1600", alias = "1600p")]
+    Res2560x1600,
+    /// Use the individual `reel_*` geometry fields.
+    #[serde(rename = "custom")]
+    Custom,
+}
+
+/// The native Serval layout shape shared by the resolution presets: a
+/// 2048-wide focus window filling the work-area height and four 512-wide
+/// slots splitting that height evenly, with no padding.
+fn native_serval_geometry(
+    slot_height: i32,
+    flip_side_on_promote: bool,
+) -> leopardwm_core_layout::focus_reel::ReelGeometry {
+    leopardwm_core_layout::focus_reel::ReelGeometry {
+        main_width: 2048,
+        main_height: 0,
+        slot_width: 512,
+        slot_height,
+        gap: 0,
+        top_inset: 0,
+        bottom_inset: 0,
+        visible_slots: 4,
+        flip_side_on_promote,
+    }
+}
+
 impl Default for LayoutConfig {
     fn default() -> Self {
         Self {
@@ -194,6 +355,18 @@ impl Default for LayoutConfig {
             width_presets: default_width_presets(),
             default_width_preset: default_width_preset(),
             height_presets: default_height_presets(),
+            mode: LayoutModeConfig::default(),
+            resolution: ReelResolution::default(),
+            reel_main_width: default_reel_main_width(),
+            reel_main_height: default_reel_main_height(),
+            reel_slot_width: default_reel_slot_width(),
+            reel_slot_height: default_reel_slot_height(),
+            reel_gap: default_reel_gap(),
+            reel_top_inset: default_reel_top_inset(),
+            reel_bottom_inset: default_reel_bottom_inset(),
+            reel_visible_slots: default_reel_visible_slots(),
+            reel_flip_side_on_promote: true,
+            reel_side: ReelSideConfig::default(),
             outer_gap: None,
             default_column_width: None,
             min_column_width: None,
@@ -226,6 +399,30 @@ impl LayoutConfig {
         let gap = self.gap.max(0);
         let frac = self.default_width_fraction();
         (base as f64 * frac - gap as f64).floor().max(100.0) as i32
+    }
+
+    /// Resolve the Focus + Reel geometry for the core layout engine.
+    pub fn reel_geometry(&self) -> leopardwm_core_layout::focus_reel::ReelGeometry {
+        let geometry = match self.resolution {
+            ReelResolution::Res2560x1440 => {
+                native_serval_geometry(342, self.reel_flip_side_on_promote)
+            }
+            ReelResolution::Res2560x1600 => {
+                native_serval_geometry(382, self.reel_flip_side_on_promote)
+            }
+            ReelResolution::Custom => leopardwm_core_layout::focus_reel::ReelGeometry {
+                main_width: self.reel_main_width,
+                main_height: self.reel_main_height,
+                slot_width: self.reel_slot_width,
+                slot_height: self.reel_slot_height,
+                gap: self.reel_gap,
+                top_inset: self.reel_top_inset,
+                bottom_inset: self.reel_bottom_inset,
+                visible_slots: self.reel_visible_slots,
+                flip_side_on_promote: self.reel_flip_side_on_promote,
+            },
+        };
+        geometry.sanitized()
     }
 
     /// Migrate legacy `outer_gap` field to per-side fields if present.
@@ -279,7 +476,9 @@ impl From<CenteringModeConfig> for CenteringMode {
 #[serde(default)]
 pub struct AppearanceConfig {
     /// Whether to highlight the active window border (Windows 11+).
-    #[serde(default = "default_true")]
+    /// Off by default; enable with `appearance.active_border = true` or the
+    /// tray toggle.
+    #[serde(default = "default_false")]
     pub active_border: bool,
 
     /// Active window border color as hex RGB (e.g., "4285F4").
@@ -341,7 +540,7 @@ fn default_tab_strip_opacity() -> u8 {
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
-            active_border: true,
+            active_border: false,
             active_border_color: default_active_border_color(),
             active_border_width: default_active_border_width(),
             active_border_position: default_active_border_position(),
@@ -1146,6 +1345,55 @@ impl Config {
             self.layout.height_presets = default_height_presets();
         }
 
+        // Focus + Reel geometry must be non-negative and usable.
+        for (field, val) in [
+            ("layout.reel_main_width", &mut self.layout.reel_main_width),
+            ("layout.reel_main_height", &mut self.layout.reel_main_height),
+            ("layout.reel_slot_width", &mut self.layout.reel_slot_width),
+            ("layout.reel_slot_height", &mut self.layout.reel_slot_height),
+            ("layout.reel_gap", &mut self.layout.reel_gap),
+            ("layout.reel_top_inset", &mut self.layout.reel_top_inset),
+            (
+                "layout.reel_bottom_inset",
+                &mut self.layout.reel_bottom_inset,
+            ),
+        ] {
+            if *val < 0 {
+                warnings.push(ConfigWarning {
+                    field: field.to_string(),
+                    message: format!("Negative {} ({}) clamped to 0", field, *val),
+                });
+                *val = 0;
+            }
+        }
+        if self.layout.reel_slot_width < 100 {
+            warnings.push(ConfigWarning {
+                field: "layout.reel_slot_width".to_string(),
+                message: format!(
+                    "reel_slot_width ({}) below minimum 100, clamped to 100",
+                    self.layout.reel_slot_width
+                ),
+            });
+            self.layout.reel_slot_width = 100;
+        }
+        if self.layout.reel_slot_height < 1 {
+            warnings.push(ConfigWarning {
+                field: "layout.reel_slot_height".to_string(),
+                message: format!(
+                    "reel_slot_height ({}) below minimum 1, clamped to 1",
+                    self.layout.reel_slot_height
+                ),
+            });
+            self.layout.reel_slot_height = 1;
+        }
+        if self.layout.reel_visible_slots == 0 {
+            warnings.push(ConfigWarning {
+                field: "layout.reel_visible_slots".to_string(),
+                message: "reel_visible_slots must be at least 1, clamped to 1".to_string(),
+            });
+            self.layout.reel_visible_slots = 1;
+        }
+
         // focus_follows_mouse_delay_ms must be >= 50 when enabled
         if self.behavior.focus_follows_mouse && self.behavior.focus_follows_mouse_delay_ms < 50 {
             warnings.push(ConfigWarning {
@@ -1521,7 +1769,161 @@ mod tests {
         assert_eq!(config.layout.outer_gap_bottom, 10);
         assert_eq!(config.layout.width_presets, vec![0.333, 0.5, 0.667]);
         assert_eq!(config.layout.centering_mode, CenteringModeConfig::Center);
+        assert_eq!(config.layout.mode, LayoutModeConfig::Serval);
+        assert_eq!(config.layout.resolution, ReelResolution::Res2560x1440);
+        assert_eq!(config.layout.reel_main_width, 2048);
+        assert_eq!(config.layout.reel_main_height, 0);
+        assert_eq!(config.layout.reel_slot_width, 512);
+        assert_eq!(config.layout.reel_slot_height, 342);
+        assert_eq!(config.layout.reel_gap, 0);
+        assert_eq!(config.layout.reel_top_inset, 0);
+        assert_eq!(config.layout.reel_bottom_inset, 0);
+        assert_eq!(config.layout.reel_visible_slots, 4);
+        assert!(config.layout.reel_flip_side_on_promote);
+        assert_eq!(config.layout.reel_side, ReelSideConfig::Right);
         assert!(config.behavior.focus_new_windows);
+        assert!(!config.appearance.active_border);
+    }
+
+    #[test]
+    fn serval_config_parses_and_clamps() {
+        let toml_str = r#"
+            [layout]
+            mode = "serval"
+            resolution = "custom"
+            reel_main_width = 1600
+            reel_slot_height = 200
+            reel_visible_slots = 3
+            reel_flip_side_on_promote = true
+            reel_side = "left"
+            reel_top_inset = -5
+        "#;
+        let mut config: Config = toml::from_str(toml_str).unwrap();
+        let warnings = config.validate();
+        assert_eq!(config.layout.mode, LayoutModeConfig::Serval);
+        assert_eq!(config.layout.reel_main_width, 1600);
+        assert_eq!(config.layout.reel_top_inset, 0, "negative inset clamped");
+        assert_eq!(config.layout.reel_side, ReelSideConfig::Left);
+        assert_eq!(
+            leopardwm_core_layout::ReelSide::from(config.layout.reel_side),
+            leopardwm_core_layout::ReelSide::Left
+        );
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.field == "layout.reel_top_inset"));
+
+        let geometry = config.layout.reel_geometry();
+        assert_eq!(geometry.main_width, 1600);
+        assert_eq!(geometry.main_height, 0);
+        assert_eq!(geometry.slot_width, 512);
+        assert_eq!(geometry.slot_height, 200);
+        assert_eq!(geometry.visible_slots, 3);
+        assert!(geometry.flip_side_on_promote);
+    }
+
+    #[test]
+    fn legacy_focus_reel_mode_key_still_parses() {
+        let toml_str = r#"
+            [layout]
+            mode = "focus_reel"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.layout.mode, LayoutModeConfig::Serval);
+    }
+
+    #[test]
+    fn resolution_preset_selects_the_native_geometry() {
+        let config: Config = toml::from_str(
+            r#"
+            [layout]
+            resolution = "2560x1440"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.layout.resolution, ReelResolution::Res2560x1440);
+        let geometry = config.layout.reel_geometry();
+        assert_eq!(geometry.main_width, 2048);
+        assert_eq!(geometry.main_height, 0, "fills the work-area height");
+        assert_eq!(geometry.slot_width, 512);
+        assert_eq!(geometry.slot_height, 342);
+        assert_eq!(geometry.visible_slots, 4);
+        assert_eq!(geometry.gap, 0);
+        assert_eq!(geometry.top_inset, 0);
+        assert_eq!(geometry.bottom_inset, 0);
+
+        // The literal asterisk spelling from the config docs is accepted too.
+        let alias: Config = toml::from_str(
+            r#"
+            [layout]
+            resolution = "2560*1440"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(alias.layout.resolution, ReelResolution::Res2560x1440);
+    }
+
+    #[test]
+    fn resolution_preset_2560x1600_selects_the_taller_native_geometry() {
+        let config: Config = toml::from_str(
+            r#"
+            [layout]
+            resolution = "2560x1600"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.layout.resolution, ReelResolution::Res2560x1600);
+        let geometry = config.layout.reel_geometry();
+        assert_eq!(geometry.main_width, 2048);
+        assert_eq!(geometry.main_height, 0, "fills the 1528px work area");
+        assert_eq!(geometry.slot_width, 512);
+        assert_eq!(geometry.slot_height, 382);
+        assert_eq!(
+            geometry.slot_height * 4,
+            1528,
+            "four slots fill the work area"
+        );
+        assert_eq!(geometry.visible_slots, 4);
+        assert_eq!(geometry.gap, 0);
+        assert_eq!(geometry.top_inset, 0);
+        assert_eq!(geometry.bottom_inset, 0);
+
+        let alias: Config = toml::from_str(
+            r#"
+            [layout]
+            resolution = "2560*1600"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(alias.layout.resolution, ReelResolution::Res2560x1600);
+    }
+
+    #[test]
+    fn custom_resolution_uses_the_individual_reel_fields() {
+        let config: Config = toml::from_str(
+            r#"
+            [layout]
+            resolution = "custom"
+            reel_main_width = 1600
+            reel_main_height = 900
+            reel_slot_width = 400
+            reel_slot_height = 225
+            reel_visible_slots = 3
+            reel_gap = 2
+            reel_top_inset = 10
+            reel_bottom_inset = 20
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.layout.resolution, ReelResolution::Custom);
+        let geometry = config.layout.reel_geometry();
+        assert_eq!(geometry.main_width, 1600);
+        assert_eq!(geometry.main_height, 900);
+        assert_eq!(geometry.slot_width, 400);
+        assert_eq!(geometry.slot_height, 225);
+        assert_eq!(geometry.visible_slots, 3);
+        assert_eq!(geometry.gap, 2);
+        assert_eq!(geometry.top_inset, 10);
+        assert_eq!(geometry.bottom_inset, 20);
     }
 
     #[test]

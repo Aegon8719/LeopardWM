@@ -232,6 +232,7 @@ impl AppState {
                     self.config.animation.scroll_duration_ms,
                     self.config.animation.easing,
                 );
+                crate::helpers::apply_layout_mode_to_workspace(&mut workspace, &self.config.layout);
                 self.workspaces.insert(monitor.id, vec![workspace]);
                 self.active_workspace.insert(monitor.id, 0);
                 info!("Created workspace for new monitor {}", monitor.id);

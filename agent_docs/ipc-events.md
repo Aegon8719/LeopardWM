@@ -143,6 +143,14 @@ Per-column fields:
 
 Sender-side dedup ensures only structurally-distinct layouts emit; mid-animation frames between two settled layouts are suppressed.
 
+**Serval workspaces (`[layout] mode = "serval"`, the default).** The
+`columns` array carries a single synthesized column in reel display order:
+`window_ids[0]` is the large focus window, the rest follow the ring from the
+top reel slot. `width_px` is the focus-window width and `height_weights` is an
+equal-split placeholder. `focused_column` is `0`. Promotions, ring reorders,
+and mirror flips change the signature and emit a fresh event; continuous
+`reel_offset` scrolling does not (it is not a structural change).
+
 ### `ConfigReloaded`
 
 ```json

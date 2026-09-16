@@ -30,6 +30,9 @@ directories = { workspace = true }
 windows = { workspace = true }
 winreg = "0.56"
 
+[build-dependencies]
+winresource = "0.1"
+
 [dev-dependencies]
 
 [lints]

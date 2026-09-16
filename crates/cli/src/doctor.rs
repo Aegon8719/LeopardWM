@@ -199,6 +199,7 @@ pub(crate) async fn handle_doctor() -> Result<()> {
             match send_command(IpcCommand::QueryStatus).await {
                 Ok(IpcResponse::StatusInfo {
                     version,
+                    build_timestamp,
                     monitors,
                     total_windows,
                     uptime_seconds,
@@ -206,9 +207,14 @@ pub(crate) async fn handle_doctor() -> Result<()> {
                 }) => {
                     let hours = uptime_seconds / 3600;
                     let mins = (uptime_seconds % 3600) / 60;
+                    let built = if build_timestamp.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", built {}", build_timestamp)
+                    };
                     CheckResult::Pass(format!(
-                        "Daemon is running (v{}, {} monitors, {} windows, uptime {}h{}m)",
-                        version, monitors, total_windows, hours, mins
+                        "Daemon is running (v{}{}, {} monitors, {} windows, uptime {}h{}m)",
+                        version, built, monitors, total_windows, hours, mins
                     ))
                 }
                 Ok(other) => CheckResult::Fail(format!(
@@ -305,7 +311,7 @@ pub(crate) fn handle_collect_logs() -> Result<()> {
 
     println!("## Environment");
     println!("OS: {}", get_windows_version());
-    println!("CLI Version: {}", env!("CARGO_PKG_VERSION"));
+    println!("CLI Version: {}", crate::build_info::VERSION_LONG);
     println!();
 
     let (found_path, display_path) = doctor_config_path();

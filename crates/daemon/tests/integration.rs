@@ -129,6 +129,7 @@ fn test_all_responses_roundtrip() {
         IpcResponse::FocusedWindowInfo { window: None },
         IpcResponse::StatusInfo {
             version: "0.1.0-test".to_string(),
+            build_timestamp: "2026-01-02T03:04:05Z".to_string(),
             monitors: 2,
             total_windows: 7,
             uptime_seconds: 3600,

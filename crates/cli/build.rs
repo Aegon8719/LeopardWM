@@ -9,25 +9,10 @@ fn main() {
     println!("cargo:rerun-if-changed=../../build_support/build_stamp.rs");
     println!("cargo:rerun-if-env-changed=LEOPARDWM_BUILD_STAMP_EPOCH");
 
-    // Fourth VERSIONINFO component is the 16-bit day counter, so two binaries
-    // built on different days are distinguishable in Explorer / `--version`,
-    // and the exact UTC time lives in Comments.
     let version = format!("{}.{}", env!("CARGO_PKG_VERSION"), stamp.number);
-
     let mut res = winresource::WindowsResource::new();
     res.set_icon("../../assets/leopardwm.ico");
-    res.set_manifest(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
-    <security>
-      <requestedPrivileges>
-        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
-      </requestedPrivileges>
-    </security>
-  </trustInfo>
-</assembly>"#,
-    );
+    res.set("FileDescription", "LeopardWM command-line interface");
     res.set("FileVersion", &version);
     res.set("ProductVersion", &version);
     res.set("Comments", &format!("Built {}", stamp.timestamp));

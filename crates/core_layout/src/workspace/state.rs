@@ -42,7 +42,11 @@ impl Workspace {
                 // Cancel active animation — its target is now stale after minimize
                 self.active_animation = None;
             }
-            self.minimized_windows.insert(window_id)
+            let was_new = self.minimized_windows.insert(window_id);
+            if was_new && is_tiled {
+                self.reel_note_removed(window_id);
+            }
+            was_new
         } else {
             false
         }
@@ -57,7 +61,11 @@ impl Workspace {
         // enforced.
         self.window_min_widths.remove(&window_id);
         self.window_min_heights.remove(&window_id);
-        self.minimized_windows.remove(&window_id)
+        let restored = self.minimized_windows.remove(&window_id);
+        if restored {
+            self.reel_note_added(window_id);
+        }
+        restored
     }
 
     /// Check if a window is currently minimized.
@@ -218,6 +226,8 @@ impl Workspace {
                 self.insert_column_at(column, target);
                 self.focused_column = target;
                 self.focused_window_in_column = 0;
+                self.reel_note_added(window_id);
+                self.reel_sync_focus_from_columns();
             } else {
                 // No origin recorded — insert after focused column
                 let _ = self.insert_window(window_id, None);

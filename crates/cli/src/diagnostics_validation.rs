@@ -492,6 +492,7 @@ fn required_health_and_status_are_not_optional() {
     assert!(require_health_info(&health).is_ok());
     assert!(require_status_info(&IpcResponse::StatusInfo {
         version: "0".into(),
+        build_timestamp: "1970-01-01T00:00:00Z".into(),
         monitors: 1,
         total_windows: 0,
         uptime_seconds: 1,

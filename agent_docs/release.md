@@ -48,6 +48,36 @@ Use Conventional Commits-style sections in `CHANGELOG.md`:
 
 The section header is `## X.Y.Z` without a `v` prefix; brackets are also accepted by the extraction script.
 
+## Timestamped Local Builds
+
+`tools/build_timestamped.ps1` is a local/CI convenience wrapper around
+`cargo build --release`. It exports `LEOPARDWM_BUILD_STAMP_EPOCH` so the same
+UTC stamp is embedded in the binaries and used for the output layout:
+
+```
+dist/LeopardWM-<version>-<yyyyMMdd-HHmmss>/
+  leopardwm-<version>-<stamp>.exe
+  leopardwm-cli-<version>-<stamp>.exe
+  lwm-<version>-<stamp>.exe
+  leopardwm-watchdog-<version>-<stamp>.exe
+  leopardwm.exe
+  leopardwm-cli.exe
+  lwm.exe
+  leopardwm-watchdog.exe        <- canonical-name hardlinks so `lwm run`
+                                   finds its siblings via current_exe()
+  checksums.txt
+```
+
+The canonical-name entries are NTFS hardlinks to the timestamped files
+(copied only if the volume cannot hardlink), so the folder is self-contained
+and `\lwm.exe run` works in place without touching the suffixed artifacts.
+
+The tag-triggered release workflow does not use this script; it keeps its
+own archive naming contract described above. The script exists so repeated
+local builds of the same version never overwrite each other and can be
+identified after the fact via `--version`, `lwm status`, or Windows file
+properties.
+
 ## Pre-Release Checklist
 
 1. Update `CHANGELOG.md` with all notable user-facing changes.

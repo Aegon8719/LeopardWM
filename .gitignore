@@ -6,6 +6,9 @@ Thumbs.db
 /target
 **/*.rs.bk
 
+# Timestamped local builds (tools/build_timestamped.ps1)
+/dist/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -33,6 +36,9 @@ bash.exe.stackdump
 # Claude Code
 .claude/
 CLAUDE.local.md
+
+# CodeGraph index
+.codegraph/
 
 # Local recording / launch-footage working folder (scripts + captured media)
 recording/

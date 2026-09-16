@@ -8,6 +8,8 @@
 //! invoked transparently by `lwm run`; can also be run directly by users
 //! who want the supervision layer.
 
+mod build_info;
+
 use anyhow::{Context, Result};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -124,6 +126,7 @@ fn main() -> ExitCode {
 fn run(log_paths: &WatchdogLogPaths) -> Result<()> {
     fs::File::create(&log_paths.daemon_error).context("Failed to reset daemon error log")?;
     init_tracing(&log_paths.dir)?;
+    info!("Version: {}", build_info::VERSION_LONG);
 
     info!("leopardwm-watchdog starting");
 

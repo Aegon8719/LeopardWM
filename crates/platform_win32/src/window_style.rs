@@ -75,6 +75,143 @@ fn is_border_color_unsupported_hresult(code: windows::core::HRESULT) -> bool {
 }
 
 // ============================================================================
+// Windowed-decoration removal (edge-to-edge tiled windows)
+// ============================================================================
+
+/// `DWMWA_WINDOW_CORNER_PREFERENCE` (Windows 11).
+const DWMWA_WINDOW_CORNER_PREFERENCE_ATTR: i32 = 33;
+/// `DWMWA_BORDER_COLOR`.
+const DWMWA_BORDER_COLOR_ATTR: i32 = 34;
+/// `DWMWCP_DONOTROUND`.
+const DWMWCP_DONOTROUND: u32 = 1;
+/// `DWMWCP_DEFAULT`.
+const DWMWCP_DEFAULT: u32 = 0;
+/// `DWMWA_COLOR_NONE` — hides the 1px DWM outline.
+const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+/// `DWMWA_COLOR_DEFAULT` — restores the system outline color.
+const DWMWA_COLOR_DEFAULT: u32 = 0xFFFF_FFFF;
+
+/// Window IDs whose corners we squared and whose DWM outline we hid. Used to
+/// restore the windowed look when a window leaves tiled management, tiling is
+/// paused, or the daemon shuts down.
+static SQUARED_CORNER_WINDOWS: Mutex<Option<HashSet<WindowId>>> = Mutex::new(None);
+
+fn lock_squared_corner_windows() -> std::sync::MutexGuard<'static, Option<HashSet<WindowId>>> {
+    SQUARED_CORNER_WINDOWS
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex)
+}
+
+/// Remove the windowed-mode decorations (rounded corners + 1px DWM outline)
+/// from a window tiled flush to the screen edges.
+///
+/// Returns `Ok(true)` when at least one attribute was accepted (Windows 11),
+/// `Ok(false)` on systems where the attributes are unsupported (Windows 10).
+/// Idempotent; tracked so [`restore_squared_corners`] can undo it.
+pub fn square_window_corners(window_id: WindowId) -> Result<bool, Win32Error> {
+    let hwnd = window_id_to_hwnd(window_id)?;
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return Err(Win32Error::WindowNotFound(window_id));
+        }
+        let corner_pref = DWMWCP_DONOTROUND;
+        let corner_result = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_WINDOW_CORNER_PREFERENCE_ATTR),
+            &corner_pref as *const u32 as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        let border_color = DWMWA_COLOR_NONE;
+        let border_result = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_BORDER_COLOR_ATTR),
+            &border_color as *const u32 as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        if corner_result.is_err() && border_result.is_err() {
+            // Pre-Win11: the attributes are unknown; nothing was changed.
+            return Ok(false);
+        }
+        lock_squared_corner_windows()
+            .get_or_insert_with(HashSet::new)
+            .insert(window_id);
+        Ok(true)
+    }
+}
+
+/// Restore the default rounded corners and DWM outline for a window.
+/// No-op (`Ok(false)`) when the window was never squared by this process.
+pub fn restore_squared_corners(window_id: WindowId) -> Result<bool, Win32Error> {
+    let tracked = {
+        let mut guard = lock_squared_corner_windows();
+        match guard.as_mut() {
+            Some(set) => set.remove(&window_id),
+            None => false,
+        }
+    };
+    if !tracked {
+        return Ok(false);
+    }
+    let hwnd = window_id_to_hwnd(window_id)?;
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return Err(Win32Error::WindowNotFound(window_id));
+        }
+        let corner_pref = DWMWCP_DEFAULT;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_WINDOW_CORNER_PREFERENCE_ATTR),
+            &corner_pref as *const u32 as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        let border_color = DWMWA_COLOR_DEFAULT;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_BORDER_COLOR_ATTR),
+            &border_color as *const u32 as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+    Ok(true)
+}
+
+/// Restore every squared window. Bulk undo for pause, config changes, and
+/// graceful shutdown.
+pub fn restore_squared_corners_all() {
+    let window_ids: Vec<WindowId> = {
+        let mut guard = lock_squared_corner_windows();
+        match guard.as_mut() {
+            Some(set) => set.iter().copied().collect(),
+            None => Vec::new(),
+        }
+    };
+    for window_id in window_ids {
+        let _ = restore_squared_corners(window_id);
+    }
+}
+
+/// Panic-hook variant: best-effort bulk restore, never surfaces errors.
+pub fn restore_squared_corners_panic_recovery() {
+    restore_squared_corners_all();
+}
+
+#[cfg(test)]
+mod squared_corner_tests {
+    use super::*;
+
+    #[test]
+    fn test_square_window_corners_invalid_hwnd_fails() {
+        assert!(square_window_corners(0).is_err());
+    }
+
+    #[test]
+    fn test_restore_squared_corners_untracked_is_noop() {
+        // Never squared in this process: no DWM call, no error.
+        assert!(matches!(restore_squared_corners(0xDEAD_BEEF), Ok(false)));
+    }
+}
+
+// ============================================================================
 // Snap layout suppression (WS_MAXIMIZEBOX removal)
 // ============================================================================
 

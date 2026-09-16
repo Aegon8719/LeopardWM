@@ -9,11 +9,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../build_support/build_stamp.rs");
     println!("cargo:rerun-if-env-changed=LEOPARDWM_BUILD_STAMP_EPOCH");
 
-    // Fourth VERSIONINFO component is the 16-bit day counter, so two binaries
-    // built on different days are distinguishable in Explorer / `--version`,
-    // and the exact UTC time lives in Comments.
     let version = format!("{}.{}", env!("CARGO_PKG_VERSION"), stamp.number);
-
     let mut res = winresource::WindowsResource::new();
     res.set_icon("../../assets/leopardwm.ico");
     res.set_manifest(
@@ -28,6 +24,7 @@ fn main() {
   </trustInfo>
 </assembly>"#,
     );
+    res.set("FileDescription", "LeopardWM watchdog");
     res.set("FileVersion", &version);
     res.set("ProductVersion", &version);
     res.set("Comments", &format!("Built {}", stamp.timestamp));

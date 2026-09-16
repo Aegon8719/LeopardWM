@@ -1,5 +1,6 @@
 use crate::*;
 
+use crate::focus_reel::FocusReelState;
 use crate::workspace::Workspace;
 
 impl Workspace {
@@ -36,6 +37,12 @@ impl Workspace {
         viewport: Rect,
         viewport_left: i32,
     ) -> Vec<WindowPlacement> {
+        // Focus + Reel workspaces ignore the horizontal strip entirely: the
+        // reel ring owns geometry and the continuous `reel_offset`.
+        if let Some(reel) = &self.focus_reel {
+            return self.compute_reel_placements(reel, viewport);
+        }
+
         let mut placements = Vec::new();
 
         // Defensively clamp gaps to >= 0 in case fields were set directly
@@ -272,6 +279,75 @@ impl Workspace {
                 rect: floating.rect,
                 visibility: Visibility::Visible,
                 column_index: usize::MAX, // Sentinel for floating windows
+            });
+        }
+
+        placements
+    }
+
+    /// Compute placements for a Focus + Reel workspace.
+    ///
+    /// The focus window is the only *live* placement; every ring member is
+    /// emitted off-screen (the platform layer parks the live HWND without
+    /// resizing it) because the daemon presents it as a DWM thumbnail at the
+    /// slot rects from [`FocusReelState::layout`].
+    fn compute_reel_placements(
+        &self,
+        reel: &FocusReelState,
+        viewport: Rect,
+    ) -> Vec<WindowPlacement> {
+        let mut placements = Vec::new();
+        let offscreen_x = viewport.x.saturating_sub(viewport.width.max(1));
+
+        let layout = reel.layout(viewport);
+        if let Some((focus_id, main_rect)) = layout.focus {
+            if !self.minimized_windows.contains(&focus_id) {
+                let column_index = self
+                    .find_window_location(focus_id)
+                    .map(|(column, _)| column)
+                    .unwrap_or(0);
+                placements.push(WindowPlacement {
+                    window_id: focus_id,
+                    rect: main_rect,
+                    visibility: Visibility::Visible,
+                    column_index,
+                });
+            }
+        }
+
+        for window_id in reel.ring() {
+            if self.minimized_windows.contains(&window_id) {
+                continue;
+            }
+            let column_index = self
+                .find_window_location(window_id)
+                .map(|(column, _)| column)
+                .unwrap_or(0);
+            // Ring members keep the focus window's size while parked
+            // off-screen, so promoting/demoting never delivers a WM_SIZE to
+            // the app — the small presentation is a pure DWM-thumbnail scale.
+            let (park_y, park_w, park_h) = layout
+                .focus
+                .map(|(_, rect)| (rect.y, rect.width, rect.height))
+                .unwrap_or((viewport.y, 0, 0));
+            placements.push(WindowPlacement {
+                window_id,
+                rect: Rect::new(offscreen_x, park_y, park_w, park_h),
+                visibility: Visibility::OffScreenLeft,
+                column_index,
+            });
+        }
+
+        // Floating windows keep their absolute rects (visible unless minimized).
+        for floating in &self.floating_windows {
+            if self.minimized_windows.contains(&floating.id) {
+                continue;
+            }
+            placements.push(WindowPlacement {
+                window_id: floating.id,
+                rect: floating.rect,
+                visibility: Visibility::Visible,
+                column_index: usize::MAX,
             });
         }
 

@@ -1,6 +1,7 @@
 //! Unit tests for the CLI modules.
 
 use crate::args::*;
+use crate::build_info;
 use crate::command_map::*;
 use crate::config_cmds::*;
 use crate::daemon_cmds::*;
@@ -1187,4 +1188,16 @@ fn test_all_profile_configs_are_valid_toml() {
             result.err()
         );
     }
+}
+
+#[test]
+fn test_build_info_stamp_is_populated() {
+    assert!(!build_info::VERSION.is_empty());
+    assert!(
+        build_info::BUILD_TIMESTAMP.ends_with('Z'),
+        "build stamp must be UTC ISO-8601: {}",
+        build_info::BUILD_TIMESTAMP
+    );
+    assert!(build_info::VERSION_LONG.contains(build_info::VERSION));
+    assert!(build_info::VERSION_LONG.contains(build_info::BUILD_TIMESTAMP));
 }
